@@ -54,12 +54,15 @@ def _origin_allowed(origin: str, request_host: str) -> bool:
         return _LAN_ORIGIN_RE.fullmatch(origin) is not None
     try:
         u = urlparse(origin)
-    except Exception:
+        port = u.port
+        oh = (u.hostname or "").lower()
+    except (ValueError, TypeError):
         return False
     if u.scheme not in ("http", "https"):
         return False
-    oh = (u.hostname or "").lower()
-    if u.port not in _CORS_PORTS:
+    if not oh or u.username is not None or u.password is not None or u.path or u.query or u.fragment:
+        return False
+    if port not in _CORS_PORTS:
         return False
     req = (request_host or "").strip().lower()
     if req.startswith("[") and "]" in req:
@@ -100,7 +103,9 @@ class SameHostCORSMiddleware(BaseHTTPMiddleware):
             resp.headers["Access-Control-Allow-Headers"] = _CORS_HEADERS
             resp.headers["Access-Control-Allow-Methods"] = _CORS_METHODS
             resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Vary"] = "Origin"
+            # Preserve existing cache dimensions (for example Accept-Encoding).
+            # Starlette adds this header without replacing previous dimensions.
+            resp.headers.add_vary_header("Origin")
         return resp
 
 
@@ -110,17 +115,22 @@ def trust_proxy() -> bool:
     }
 
 
+def is_trusted_proxy(request: Request) -> bool:
+    peer = (request.client.host or "") if request.client else ""
+    trusted = {
+        x.strip()
+        for x in (os.environ.get("FORENSIC_TRUSTED_PROXIES") or "127.0.0.1,::1").split(",")
+        if x.strip()
+    }
+    return trust_proxy() and peer in trusted
+
+
 def client_ip(request: Request | None) -> str:
     if not request:
         return ""
     try:
         peer = (request.client.host or "") if request.client else ""
-        trusted = {
-            x.strip()
-            for x in (os.environ.get("FORENSIC_TRUSTED_PROXIES") or "127.0.0.1,::1").split(",")
-            if x.strip()
-        }
-        if trust_proxy() and peer in trusted:
+        if is_trusted_proxy(request):
             xf = request.headers.get("x-forwarded-for") or ""
             if xf:
                 return xf.split(",")[0].strip()[:64]
@@ -129,6 +139,31 @@ def client_ip(request: Request | None) -> str:
     except Exception:
         pass
     return ""
+
+
+class RequireHttpsMiddleware(BaseHTTPMiddleware):
+    """生产门禁：EDR_REQUIRE_HTTPS=1 时拒绝非 HTTPS 业务请求（健康检查除外）。"""
+
+    _EXEMPT_PREFIXES = ("/health", "/api/health")
+
+    async def dispatch(self, request: Request, call_next):
+        enabled = (os.environ.get("EDR_REQUIRE_HTTPS") or "").strip().lower() in ("1", "true", "yes", "on")
+        if not enabled:
+            return await call_next(request)
+        path = request.url.path or ""
+        if any(path == p or path.startswith(p + "/") for p in self._EXEMPT_PREFIXES):
+            return await call_next(request)
+        scheme = request.url.scheme
+        xf_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+        if xf_proto in ("http", "https") and is_trusted_proxy(request):
+            scheme = xf_proto
+        if scheme != "https":
+            return JSONResponse(
+                {"detail": "生产环境要求 HTTPS（设置 EDR_REQUIRE_HTTPS=1）"},
+                status_code=403,
+                headers={"Cache-Control": "no-store"},
+            )
+        return await call_next(request)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -147,7 +182,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         scheme = request.url.scheme
         # 反代 HTTPS 时仍发 http 进进程；用 X-Forwarded-Proto 写对 HSTS / CSP
         xf_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
-        if xf_proto in ("http", "https"):
+        if xf_proto in ("http", "https") and is_trusted_proxy(request):
             scheme = xf_proto
         # 管理后台(:8001) 跨源调主站(:8000)。localhost 与 127.0.0.1 在浏览器是不同源，
         # CSP connect-src 必须同时放行，否则登录 fetch 会被静默拦截。

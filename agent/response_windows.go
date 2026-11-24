@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,6 +12,9 @@ import (
 	"strings"
 	"time"
 )
+
+// 单次远程样本上限 64MB（超限请终端本地取证；base64 回传仍受平台 body 上限约束）
+const pullFileMaxBytes = 64 << 20
 
 func execCommand(cfg Config, cmd agentCommand) (map[string]any, error) {
 	switch strings.ToLower(cmd.Action) {
@@ -38,17 +42,27 @@ func execCommand(cfg Config, cmd agentCommand) (map[string]any, error) {
 		return uninstallAgentRemote(cfg, cmd.Params)
 	case "collect_diagnostics":
 		return collectDiagnosticsBundle(cfg)
+	case "pull_file", "sample_pull", "collect_sample":
+		// 兼容别名，避免旧前端/脚本用不同动作名
+		return pullFileSample(cfg, cmd.Params)
 	case "live_query":
 		return liveQueryExec(cmd.Params)
 	case "reg_read", "fs_list", "fs_stat", "fs_read", "fs_volumes", "run_cmd",
 		"shell_open", "shell_write", "shell_poll", "shell_close":
 		return remoteOpsExec(cmd.Params, cmd.Action)
+	case "disable_service", "enable_service", "stop_service",
+		"delete_task", "delete_scheduled_task", "disable_task", "disable_scheduled_task",
+		"enable_task", "enable_scheduled_task",
+		"reg_delete_value", "reg_set_value", "reg_rollback",
+		"clear_persistence", "recheck_persistence", "verify_response":
+		return execPersistResponse(cfg, cmd.Action, cmd.Params)
 	default:
 		return nil, fmt.Errorf("未知动作: %s", cmd.Action)
 	}
 }
 
-// uninstallAgentRemote：先返回成功，再延时卸载服务并可选删除文件（避免指令通道被自己掐断）。
+// uninstallAgentRemote：先返回成功，再延时完整卸载（避免指令通道被自己掐断）。
+// 默认 remove_files=true：停服务、删 SCM 项、删 keepalive 计划任务、清理安装目录，避免残留导致重装异常。
 func uninstallAgentRemote(cfg Config, params map[string]any) (map[string]any, error) {
 	self, err := os.Executable()
 	if err != nil {
@@ -64,25 +78,56 @@ func uninstallAgentRemote(cfg Config, params map[string]any) (map[string]any, er
 			removeFiles = t != "0" && !strings.EqualFold(t, "false")
 		}
 	}
-	dir := filepath.Join(cfg.StateDir, "upgrade")
-	_ = os.MkdirAll(dir, 0700)
-	script := filepath.Join(dir, "remote_uninstall.bat")
-	// 等几秒让 ACK 上报完成，再 stop/delete 服务；可选删 exe
-	bat := fmt.Sprintf("@echo off\r\n"+
-		"timeout /t 3 /nobreak >nul\r\n"+
-		"net stop %s >nul 2>&1\r\n"+
-		"sc delete %s >nul 2>&1\r\n"+
-		"timeout /t 2 /nobreak >nul\r\n", serviceName, serviceName)
-	if removeFiles {
-		bat += fmt.Sprintf("del /f /q \"%s\" >nul 2>&1\r\n", self)
-		bat += fmt.Sprintf("del /f /q \"%s.bak\" >nul 2>&1\r\n", self)
+	installRoot := filepath.Dir(self)
+	stateDir := strings.TrimSpace(cfg.StateDir)
+	if stateDir == "" {
+		stateDir = installRoot
 	}
-	if err := os.WriteFile(script, []byte(bat), 0700); err != nil {
+	if abs, e := filepath.Abs(stateDir); e == nil {
+		stateDir = abs
+	}
+	// 脚本放到 TEMP，避免稍后删安装目录时把自己删掉导致半截执行
+	script := filepath.Join(os.TempDir(), "forensic_agent_remote_uninstall.bat")
+	var b strings.Builder
+	b.WriteString("@echo off\r\n")
+	b.WriteString("timeout /t 4 /nobreak >nul\r\n")
+	// 先停服务，再删保活任务，避免任务在卸载中途把服务又拉起
+	fmt.Fprintf(&b, "net stop %s >nul 2>&1\r\n", serviceName)
+	fmt.Fprintf(&b, "sc stop %s >nul 2>&1\r\n", serviceName)
+	b.WriteString("timeout /t 2 /nobreak >nul\r\n")
+	fmt.Fprintf(&b, "schtasks /Delete /TN \"%s\" /F >nul 2>&1\r\n", keepaliveTaskName)
+	fmt.Fprintf(&b, "schtasks /Delete /TN \"%s\" /F >nul 2>&1\r\n", bootKeepaliveTaskName)
+	fmt.Fprintf(&b, "sc delete %s >nul 2>&1\r\n", serviceName)
+	b.WriteString("sc stop FaKmon >nul 2>&1\r\n")
+	b.WriteString("sc delete FaKmon >nul 2>&1\r\n")
+	b.WriteString("timeout /t 2 /nobreak >nul\r\n")
+	if removeFiles {
+		fmt.Fprintf(&b, "del /f /q \"%s\" >nul 2>&1\r\n", self)
+		fmt.Fprintf(&b, "del /f /q \"%s.bak\" >nul 2>&1\r\n", self)
+		fmt.Fprintf(&b, "del /f /q \"%s\\config.json\" >nul 2>&1\r\n", installRoot)
+		fmt.Fprintf(&b, "del /f /q \"%s\\agent.json\" >nul 2>&1\r\n", installRoot)
+		// 状态目录与安装根（含 quarantine/upgrade/日志）；失败则尽量清空子项
+		fmt.Fprintf(&b, "rmdir /s /q \"%s\" >nul 2>&1\r\n", stateDir)
+		if !strings.EqualFold(stateDir, installRoot) {
+			fmt.Fprintf(&b, "rmdir /s /q \"%s\" >nul 2>&1\r\n", installRoot)
+		}
+		// ProgramData 默认安装路径兜底
+		b.WriteString("rmdir /s /q \"%ProgramData%\\ForensicAgent\" >nul 2>&1\r\n")
+	}
+	b.WriteString("del /f /q \"%~f0\" >nul 2>&1\r\n")
+	if err := os.WriteFile(script, []byte(b.String()), 0700); err != nil {
 		return nil, err
 	}
-	_, _ = runCmd(5*time.Second, "cmd", "/c", "start", "", script)
+	_, _ = runCmd(5*time.Second, "cmd", "/c", "start", "", "/min", script)
 	return map[string]any{
-		"ok": true, "scheduled": true, "remove_files": removeFiles, "script": script,
+		"ok":            true,
+		"scheduled":     true,
+		"remove_files":  removeFiles,
+		"cleans_dir":    removeFiles,
+		"install_root":  installRoot,
+		"state_dir":     stateDir,
+		"script":        script,
+		"removes_tasks": true,
 	}, nil
 }
 
@@ -211,6 +256,60 @@ func killProcess(params map[string]any) (map[string]any, error) {
 		return map[string]any{"pid": pid, "output": out}, fmt.Errorf("taskkill: %v %s", err, out)
 	}
 	return map[string]any{"pid": pid, "output": out, "killed": true}, nil
+}
+
+// pullFileSample：只读提取样本字节回传控制台，不改动原文件。
+func pullFileSample(cfg Config, params map[string]any) (map[string]any, error) {
+	path := strings.TrimSpace(fmt.Sprint(params["path"]))
+	path = strings.Trim(path, `"'`)
+	if path == "" || (!strings.Contains(path, `\`) && !strings.Contains(path, `/`)) {
+		return nil, fmt.Errorf("缺少有效 path")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("无效路径: %v", err)
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("文件不存在: %v", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("仅支持普通文件")
+	}
+	if fi.Size() <= 0 {
+		return nil, fmt.Errorf("空文件无法采集")
+	}
+	maxBytes := int64(pullFileMaxBytes)
+	if n, ok := numberOf(params["max_bytes"]); ok && n > 0 && n < float64(pullFileMaxBytes) {
+		maxBytes = int64(n)
+	}
+	if fi.Size() > maxBytes {
+		return map[string]any{
+			"path": abs, "size": fi.Size(), "refused": true, "max_bytes": maxBytes,
+		}, fmt.Errorf("文件过大（%d > %d），请在终端本地取证", fi.Size(), maxBytes)
+	}
+	curHash := fileSHA256(abs)
+	if want, ok := params["sha256"].(string); ok && strings.TrimSpace(want) != "" && curHash != "" &&
+		!strings.EqualFold(strings.TrimSpace(want), curHash) {
+		return map[string]any{"path": abs, "refused": true, "sha256": curHash},
+			fmt.Errorf("SHA256 不一致（期望 %s…，实际 %s…），文件可能已被替换", truncate(want, 12), truncate(curHash, 12))
+	}
+	raw, err := os.ReadFile(abs)
+	if err != nil {
+		return nil, fmt.Errorf("读取失败: %v", err)
+	}
+	if curHash == "" {
+		curHash = fileSHA256(abs)
+	}
+	fn := filepath.Base(abs)
+	return map[string]any{
+		"ok":             true,
+		"path":           abs,
+		"filename":       fn,
+		"size":           len(raw),
+		"sha256":         curHash,
+		"content_base64": base64.StdEncoding.EncodeToString(raw),
+	}, nil
 }
 
 func quarantineFile(cfg Config, params map[string]any) (map[string]any, error) {

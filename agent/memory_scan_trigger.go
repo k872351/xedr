@@ -17,8 +17,9 @@ func memoryScanTriggeredByEvent(ev map[string]any) (pid int, reason string) {
 	if !triggered && strings.Contains(et, "remote_thread") {
 		triggered = cfg.Triggers["remote_thread_kernel"]
 	}
-	if !triggered && (et == "process_access" || strings.Contains(strings.ToLower(asString(ev["summary"])), "lsass")) {
-		triggered = cfg.Triggers["process_access"]
+	if !triggered && (et == "process_access" || et == "credential_access" ||
+		strings.Contains(strings.ToLower(asString(ev["summary"])), "lsass")) {
+		triggered = cfg.Triggers["process_access"] || cfg.Triggers["credential_access"]
 	}
 	if !triggered && (et == "api_amsi" || et == "amsi_hit" || et == "api_call" || et == "api_hit") {
 		if cfg.Triggers["api_amsi"] || cfg.Triggers["api_call"] {
@@ -82,9 +83,17 @@ func runTriggeredMemoryScan(ev map[string]any) map[string]any {
 	if pid <= 0 {
 		return nil
 	}
+	return runTriggeredMemoryScanJob(pid, reason)
+}
+
+func runTriggeredMemoryScanJob(pid int, reason string) map[string]any {
 	res, err := scanMemory(map[string]any{"pid": pid, "trigger": reason, "mode": "triggered"})
 	if err != nil {
-		return map[string]any{"ok": false, "error": err.Error()}
+		if res == nil {
+			res = map[string]any{}
+		}
+		res["ok"], res["error"] = false, err.Error()
+		return res
 	}
 	return res
 }

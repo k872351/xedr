@@ -19,9 +19,19 @@ type fakeServer struct {
 	fail     int                    // 返回 500 的次数
 	v2Status int                    // 非 0 则 v2 端点返回该状态
 	legacy   int                    // v1 端点收到次数
+	handler  http.Handler
+	URL      string
 }
 
-func newFake() (*fakeServer, *httptest.Server) {
+func (f *fakeServer) RoundTrip(r *http.Request) (*http.Response, error) {
+	recorder := httptest.NewRecorder()
+	f.handler.ServeHTTP(recorder, r)
+	return recorder.Result(), nil
+}
+
+func (f *fakeServer) Close() {}
+
+func newFake() (*fakeServer, *fakeServer) {
 	f := &fakeServer{seen: map[string]int{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/agent/v2/events/batch", func(w http.ResponseWriter, r *http.Request) {
@@ -66,14 +76,17 @@ func newFake() (*fakeServer, *httptest.Server) {
 	for _, p := range []string{"/api/agent/timeline", "/api/agent/snapshot", "/api/agent/event", "/api/agent/commands/ack"} {
 		mux.HandleFunc(p, legacy)
 	}
-	return f, httptest.NewServer(mux)
+	f.handler = mux
+	f.URL = "http://outbox.test"
+	return f, f
 }
 
-func testBox(t *testing.T, dir string, srvURL string) (*outbox, *APIClient) {
+func testBox(t *testing.T, dir string, srv *fakeServer) (*outbox, *APIClient) {
 	t.Helper()
 	box := newOutbox(dir)
 	t.Cleanup(func() { box.st.close() })
-	api := newClient(Config{ServerURL: srvURL, Token: "tok"})
+	api := newClient(Config{ServerURL: srv.URL, Token: "tok"})
+	api.client.Transport = srv
 	api.setCredential("fa_secret", "aid")
 	return box, api
 }
@@ -98,7 +111,7 @@ func TestOutboxPersistsAcrossRestart(t *testing.T) {
 func TestOutboxV2AckAndPoisonDropped(t *testing.T) {
 	f, srv := newFake()
 	defer srv.Close()
-	box, api := testBox(t, t.TempDir(), srv.URL)
+	box, api := testBox(t, t.TempDir(), srv)
 	box.useV2.Store(true)
 	box.enqueue(outEvent, 90, map[string]any{"title": "good"})
 	box.enqueue(outEvent, 80, map[string]any{"title": "poison"})
@@ -122,7 +135,7 @@ func TestOutboxV2AckAndPoisonDropped(t *testing.T) {
 func TestOutboxPartialAckKeepsUUIDStable(t *testing.T) {
 	f, srv := newFake()
 	defer srv.Close()
-	box, api := testBox(t, t.TempDir(), srv.URL)
+	box, api := testBox(t, t.TempDir(), srv)
 	box.useV2.Store(true)
 	box.enqueue(outEvent, 90, map[string]any{"title": "a"})
 	box.enqueue(outEvent, 90, map[string]any{"title": "b"})
@@ -149,7 +162,7 @@ func TestOutboxPartialAckKeepsUUIDStable(t *testing.T) {
 func TestOutboxNetworkFailureBacksOffAndRecovers(t *testing.T) {
 	f, srv := newFake()
 	defer srv.Close()
-	box, api := testBox(t, t.TempDir(), srv.URL)
+	box, api := testBox(t, t.TempDir(), srv)
 	box.useV2.Store(true)
 	box.enqueue(outEvent, 90, map[string]any{"title": "x"})
 	f.fail = 1
@@ -213,10 +226,32 @@ func TestBudgetDropsLowestPriorityFirst(t *testing.T) {
 	}
 }
 
+func TestBudgetEvictionInvalidatesInventory(t *testing.T) {
+	oldRows := outboxMaxRows
+	outboxMaxRows = 2
+	defer func() { outboxMaxRows = oldRows }()
+	box := newOutbox(t.TempDir())
+	defer box.st.close()
+	iv := newInventory(nil)
+	box.onReject = func(kind outboxKind, payload map[string]any, msg string) {
+		if kind == outSnapshot {
+			iv.invalidate(asString(payload["module"]), 0)
+		}
+	}
+	items := invItems("synthetic")
+	p := iv.plan("service", "synthetic", items, true)
+	iv.enqueuePlan("service", p, box.enqueue)
+	box.enqueue(outEvent, 90, map[string]any{"summary": "synthetic"})
+	box.enqueue(outEvent, 90, map[string]any{"summary": "synthetic"})
+	if p := iv.plan("service", "synthetic", items, true); p.skip || p.kind != outSnapshot {
+		t.Fatal("evicted snapshot must be replaced by a full snapshot")
+	}
+}
+
 func TestFallsBackToV1WhenServerLacksV2(t *testing.T) {
 	f, srv := newFake()
 	defer srv.Close()
-	box, api := testBox(t, t.TempDir(), srv.URL)
+	box, api := testBox(t, t.TempDir(), srv)
 	box.useV2.Store(true)
 	f.v2Status = 404
 	box.enqueue(outEvent, 90, map[string]any{"agent_id": "aid", "module": "m", "severity": "high", "title": "t", "detail": "d"})
@@ -251,7 +286,7 @@ func TestCommandReceipts(t *testing.T) {
 	if box.cmdReceipt("c1") != nil {
 		t.Fatal("未执行不应有回执")
 	}
-	box.cmdBegin("c1", "kill_process")
+	box.cmdBegin("c1", "test")
 	if rc := box.cmdReceipt("c1"); rc == nil || rc.Status != "started" {
 		t.Fatalf("started 回执缺失: %+v", rc)
 	}
@@ -260,11 +295,30 @@ func TestCommandReceipts(t *testing.T) {
 	if rc.Status != "done" || !rc.OK || rc.Result["killed"] != true {
 		t.Fatalf("done 回执错误: %+v", rc)
 	}
-	if !nonIdempotentAction("upgrade") || nonIdempotentAction("kill_process") {
+	if !nonIdempotentAction("upgrade") || !nonIdempotentAction("kill_process") {
 		t.Fatal("幂等性分类错误")
 	}
 	if !commandExpired("2000-01-01T00:00:00") || commandExpired("") || commandExpired("2999-01-01T00:00:00") {
 		t.Fatal("deadline 判断错误")
+	}
+}
+
+// Use a synthetic result; no remote command is executed in this test.
+func TestReceiptSurvivesStateReopen(t *testing.T) {
+	dir := t.TempDir()
+	box := newOutbox(dir)
+	if box.st.path == ":memory:" {
+		box.st.close()
+		t.Fatal("persistent test state unavailable")
+	}
+	box.cmdBegin("synthetic-result", "test")
+	box.cmdFinish("synthetic-result", true, map[string]any{"verified": true})
+	box.st.close()
+	reopened := newOutbox(dir)
+	defer reopened.st.close()
+	rc := reopened.cmdReceipt("synthetic-result")
+	if reopened.st.path == ":memory:" || rc == nil || rc.Status != "done" || !rc.OK || rc.Result["verified"] != true {
+		t.Fatal("durable result missing after reopening state")
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"strings"
 )
 
@@ -62,6 +63,11 @@ func runActiveResponse(ev map[string]any, cfg Config, responseEnabled bool) {
 				_, _ = scanMemory(map[string]any{"pid": p, "trigger": "active_response"})
 			}(pid)
 		default:
+			// 高危动作必须走带回执的显式命令通道，禁止 AR 旁路重复隔离/卸载/升级
+			if nonIdempotentAction(r.Action) {
+				log.Printf("active_response: skip high-risk action %s (require explicit command + receipt)", r.Action)
+				continue
+			}
 			if !cmdSchedulerTry(r.Action) {
 				continue
 			}

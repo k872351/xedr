@@ -553,25 +553,55 @@ def _enrich_dns_ioc(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         return meta
     meta["ok"] = True
 
+    # 良性域名（microsoft.com / python.org 等）禁止因应答 IP 撞库误标
+    try:
+        from . import ioc_db as _ioc_db
+    except Exception:
+        _ioc_db = None  # type: ignore
+
     matched_n = 0
     for it in items:
         hits: List[Dict[str, Any]] = []
         dom = str(it.get("domain") or "").strip().lower().rstrip(".")
-        for h in (dom_map.get(dom) or [])[:3]:
-            hits.append({**h, "via": "domain"})
-        for raw in it.get("answers") or []:
-            a = str(raw or "").strip().lower().strip("[]")
-            if not _looks_ipv4(a):
-                continue
-            for h in (ip_map.get(a) or [])[:2]:
-                hits.append({**h, "via": "answer"})
+        benign_dom = bool(dom and _ioc_db and _ioc_db.is_benign_host(dom))
+        # 域名精确命中（良性域名本身已在 lookup 侧跳过，这里再兜底）
+        if not benign_dom:
+            for h in (dom_map.get(dom) or [])[:3]:
+                hits.append({**h, "via": "domain"})
+            for raw in it.get("answers") or []:
+                a = str(raw or "").strip().lower().strip("[]")
+                if not _looks_ipv4(a):
+                    continue
+                for h in (ip_map.get(a) or [])[:2]:
+                    hits.append({**h, "via": "answer", "answer_ip": a})
         uniq, seen_k = [], set()
         for h in hits:
-            key = f"{h.get('type')}|{h.get('matched')}|{h.get('malware')}"
+            key = f"{h.get('type')}|{h.get('matched')}|{h.get('malware')}|{h.get('via')}"
             if key in seen_k:
                 continue
             seen_k.add(key)
-            uniq.append(h)
+            malware = str(h.get("malware") or "")
+            source = str(h.get("source") or "")
+            matched = str(h.get("matched") or "")
+            kind = str(h.get("type") or "")
+            if _ioc_db is not None:
+                label = _ioc_db._ioc_hit_title(malware, matched, kind, source)
+                fam = _ioc_db._ioc_family_label(malware)
+            else:
+                label = (malware.split(",")[0].strip() if malware else "") or matched or "情报"
+                fam = ""
+            tags = [t.strip() for t in malware.replace(";", ",").split(",") if t.strip()][:8]
+            if not tags and fam:
+                tags = [fam]
+            via = str(h.get("via") or "")
+            via_lab = {"domain": "域名", "answer": "应答IP"}.get(via, via)
+            uniq.append({
+                **h,
+                "label": (label or "情报")[:80],
+                "family": fam,
+                "tags": tags,
+                "via_label": via_lab,
+            })
         it["ioc_hit"] = bool(uniq)
         it["ioc_hits"] = uniq[:5]
         if uniq:
@@ -581,6 +611,28 @@ def _enrich_dns_ioc(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     return meta
 
 
+def _dns_range_cut(range_key: str = "24h") -> str:
+    """DNS 狩猎时间窗：按 last_seen 截断，避免默认灌满全历史。"""
+    now = time.time()
+    rk = str(range_key or "24h").strip().lower()
+    if rk in ("1h", "hour"):
+        delta = 3600
+    elif rk in ("24h", "today", "day"):
+        # today：当天 0 点；24h：滚动 24 小时
+        if rk in ("today", "day"):
+            return time.strftime("%Y-%m-%dT00:00:00", time.localtime(now))
+        delta = 86400
+    elif rk in ("7d", "week"):
+        delta = 7 * 86400
+    elif rk in ("30d", "month"):
+        delta = 30 * 86400
+    elif rk in ("all", "*", "0"):
+        return ""
+    else:
+        delta = 86400
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - delta))
+
+
 def list_dns(
     agent_id: str = "",
     *,
@@ -588,6 +640,9 @@ def list_dns(
     nx_only: bool = False,
     limit: int = 200,
     match_ioc: bool = True,
+    range_key: str = "24h",
+    online_only: bool = True,
+    online_within_sec: int = 120,
 ) -> Dict[str, Any]:
     from . import agent_edr
     agent_edr.ensure()
@@ -596,6 +651,17 @@ def list_dns(
     if agent_id:
         clauses.append("d.agent_id=?")
         args.append(agent_id)
+    cut = _dns_range_cut(range_key)
+    if cut:
+        # 统一空格/T，避免 last_seen 格式不一致导致时间窗失效
+        clauses.append("REPLACE(IFNULL(d.last_seen,''), ' ', 'T') >= ?")
+        args.append(cut.replace(" ", "T"))
+    if online_only and not agent_id:
+        # 默认只看「当前在线」终端：必须仍在 agents 表，且心跳在窗口内。
+        # 重装后旧 agent_id 的 DNS 会变孤儿（hostname 空，界面显示短 ID），一律剔除。
+        clauses.append("a.agent_id IS NOT NULL")
+        clauses.append("COALESCE(a.revoked,0)=0")
+        clauses.append("ROUND((julianday('now','localtime')-julianday(a.last_heartbeat_at))*86400) BETWEEN 0 AND MAX(45, 2 * CASE WHEN a.heartbeat_period_sec BETWEEN 3 AND 120 THEN a.heartbeat_period_sec ELSE 3 END + 15)")
     if q:
         clauses.append("(d.domain LIKE ? OR d.answers_json LIKE ? OR d.processes_json LIKE ?)")
         like = f"%{q.lower()}%"
@@ -607,7 +673,7 @@ def list_dns(
         conn = agent_edr._connect()
         try:
             items = _rows(conn, f"SELECT d.*, a.hostname FROM agent_dns d LEFT JOIN agents a ON a.agent_id=d.agent_id"
-                                f"{where} ORDER BY d.last_seen DESC LIMIT ?", (*args, limit))
+                                f"{where} ORDER BY REPLACE(IFNULL(d.last_seen,''), ' ', 'T') DESC LIMIT ?", (*args, limit))
         finally:
             conn.close()
     for it in items:
@@ -621,4 +687,11 @@ def list_dns(
     ioc_meta: Dict[str, Any] = {"lib": "ioc_data", "matched": 0, "ok": False}
     if match_ioc and items:
         ioc_meta = _enrich_dns_ioc(items)
-    return {"ok": True, "items": items, "ioc": ioc_meta}
+    return {
+        "ok": True,
+        "items": items,
+        "ioc": ioc_meta,
+        "range": str(range_key or "24h"),
+        "cut": cut,
+        "online_only": bool(online_only and not agent_id),
+    }

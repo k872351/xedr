@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.13.1"
+const agentVersion = "0.13.10"
 
 type Config struct {
 	ServerURL string `json:"server_url"`
@@ -29,6 +29,8 @@ type Config struct {
 
 	// UpgradePubKey：Ed25519 升级公钥（base64 或 hex:…）；优先于编译期 upgradePubKeyB64。
 	UpgradePubKey string `json:"upgrade_pubkey,omitempty"`
+	// PolicyPubKey：策略 Ed25519 公钥；钉扎后拒绝未签名/验签失败的策略。
+	PolicyPubKey string `json:"policy_pubkey,omitempty"`
 }
 
 // loadSecret 解出运行期明文凭据；解不开（换机/损坏）则丢弃，退回共享密钥重新注册换取新凭据。
@@ -47,24 +49,36 @@ func (c *Config) loadSecret() {
 func defaultModules() []string {
 	return []string{
 		"sysinfo", "service", "task", "startup", "network", "process", "file", "user",
-		"software", "hotfix", "listen", "driver", "browser",
+		"software", "hotfix", "listen", "driver", "netif", "groups",
+		"firewall", "shares", "certs", "usb",
 	}
 }
 
 // addedModules 新版本新增的模块：旧 agent.json 里写死了模块列表时自动补上。
-var addedModules = []string{"driver", "browser"}
+var addedModules = []string{"driver", "netif", "groups", "firewall", "shares", "certs", "usb"}
 
 func withAddedModules(mods []string) []string {
 	have := map[string]bool{}
 	for _, m := range mods {
 		have[m] = true
 	}
+	// 浏览器记录 / 浏览器扩展已下线：旧配置残留直接剔除
+	cleaned := make([]string, 0, len(mods)+len(addedModules))
+	for _, m := range mods {
+		if m == "browser" || m == "browser_ext" {
+			continue
+		}
+		cleaned = append(cleaned, m)
+	}
+	have["browser"] = false
+	have["browser_ext"] = false
 	for _, m := range addedModules {
 		if !have[m] {
-			mods = append(mods, m)
+			cleaned = append(cleaned, m)
+			have[m] = true
 		}
 	}
-	return mods
+	return cleaned
 }
 
 func defaultIntervals() map[string]int {
@@ -81,7 +95,12 @@ func defaultIntervals() map[string]int {
 		"hotfix":   7200,
 		"listen":   300,
 		"driver":   1800,
-		"browser":  900,
+		"netif":       600,
+		"groups":      900,
+		"firewall":    900,
+		"shares":      900,
+		"certs": 1800,
+		"usb":   600,
 	}
 }
 

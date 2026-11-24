@@ -114,6 +114,16 @@ def load_manifest(exe: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def windows_agent_path(goarch: str = "amd64") -> Path:
+    arch = str(goarch or "amd64").strip().lower()
+    if arch not in {"amd64", "386", "arm64"}:
+        raise ValueError("Windows architecture must be amd64, 386, or arm64")
+    base = agent_src_dir()
+    if arch == "amd64":
+        return base / "forensic-agent.exe"
+    return base / "releases" / "windows" / arch / "forensic-agent.exe"
+
+
 def release_status(exe: Optional[Path] = None) -> Dict[str, Any]:
     """返回当前可下发 Agent 产物的发布状态。status ∈ latest|stale|mismatch|unverified|missing"""
     if exe is None:
@@ -125,6 +135,7 @@ def release_status(exe: Optional[Path] = None) -> Dict[str, Any]:
         "ok": True,
         "status": "missing",
         "is_latest": False,
+        "integrity_verified": False,
         "reasons": [],
         "source_rev": cur_rev,
         "source_version": cur_ver,
@@ -132,7 +143,7 @@ def release_status(exe: Optional[Path] = None) -> Dict[str, Any]:
         "last_build": _build_state.get("last"),
         "go_available": bool(_find_go()),
     }
-    if not exe:
+    if not exe or not exe.is_file():
         out["reasons"].append("缺少 forensic-agent.exe，请先构建")
         return out
 
@@ -167,6 +178,7 @@ def release_status(exe: Optional[Path] = None) -> Dict[str, Any]:
         out["status"] = "mismatch"
         out["reasons"].append("EXE 与清单 SHA256 不一致（被替换或构建不完整）")
         return out
+    out["integrity_verified"] = True
     if man.get("source_rev") != cur_rev:
         out["status"] = "stale"
         out["reasons"].append("agent/ 源码已变化，当前 EXE 不是最新构建")
@@ -197,39 +209,58 @@ def _find_go() -> str:
     return ""
 
 
-def run_build(timeout_sec: int = 900) -> Dict[str, Any]:
-    """同步调用 scripts/build_agent.py（内含可选驱动编译）；同一时间只允许一个构建。"""
+def run_build(timeout_sec: int = 900, goarch: str = "amd64") -> Dict[str, Any]:
+    """Build the selected Windows Agent architecture and retain failures for the UI."""
+    arch = str(goarch or "amd64").strip().lower()
+    if arch not in {"amd64", "386", "arm64"}:
+        return {"ok": False, "error": f"Unsupported Windows architecture: {arch}"}
     if not _build_lock.acquire(blocking=False):
-        return {"ok": False, "error": "已有构建正在进行"}
+        return {"ok": False, "error": "Agent build is already running"}
     _build_state["running"] = True
     t0 = time.time()
     try:
         script = Path(config.ROOT) / "scripts" / "build_agent.py"
         if not script.is_file():
-            return {"ok": False, "error": "缺少 scripts/build_agent.py"}
-        if not _find_go():
-            return {"ok": False, "error": "服务器未安装 Go，无法构建；请在有 Go 的机器上运行 scripts/build_agent.py"}
-        try:
-            cp = subprocess.run(
-                [sys.executable, str(script)], cwd=str(config.ROOT),
-                capture_output=True, timeout=timeout_sec,
-            )
-            out = (cp.stdout or b"").decode("utf-8", "replace") + (cp.stderr or b"").decode("utf-8", "replace")
-            res = {"ok": cp.returncode == 0, "code": cp.returncode, "log": out[-4000:],
-                   "seconds": round(time.time() - t0, 1)}
-            if cp.returncode != 0:
-                res["error"] = "Agent 构建失败"
-            else:
-                try:
-                    from .agent_protocol import clear_install_package_cache
-
-                    res["install_cache_cleared"] = clear_install_package_cache()
-                except Exception:
-                    pass
-        except subprocess.TimeoutExpired:
-            res = {"ok": False, "error": f"构建超时 {timeout_sec}s", "seconds": round(time.time() - t0, 1)}
-        _build_state["last"] = {**res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-        return res
+            res = {"ok": False, "error": "Missing scripts/build_agent.py", "goarch": arch}
+        elif not _find_go():
+            res = {"ok": False, "error": "Go toolchain was not found on the backend", "goarch": arch}
+        else:
+            out_path = windows_agent_path(arch)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                cp = subprocess.run(
+                    [sys.executable, str(script), "--goarch", arch, "--out", str(out_path)],
+                    cwd=str(config.ROOT), capture_output=True, timeout=timeout_sec,
+                )
+                log = (cp.stdout or b"").decode("utf-8", "replace") + (cp.stderr or b"").decode("utf-8", "replace")
+                res = {
+                    "ok": cp.returncode == 0, "code": cp.returncode, "log": log[-4000:],
+                    "seconds": round(time.time() - t0, 1), "goarch": arch,
+                    "release": release_status(out_path) if cp.returncode == 0 else None,
+                }
+                if cp.returncode != 0:
+                    res["error"] = "Agent build failed"
+                else:
+                    try:
+                        from .agent_protocol import clear_install_package_cache
+                        res["install_cache_cleared"] = clear_install_package_cache()
+                    except Exception as exc:
+                        res["cache_warning"] = str(exc)[:300]
+            except subprocess.TimeoutExpired as exc:
+                stdout = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
+                stderr = (exc.stderr or b"").decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
+                res = {
+                    "ok": False, "error": f"Agent build timed out after {timeout_sec}s",
+                    "log": (stdout + stderr)[-4000:], "seconds": round(time.time() - t0, 1),
+                    "goarch": arch,
+                }
+    except Exception as exc:
+        res = {
+            "ok": False, "error": f"Agent build failed: {type(exc).__name__}: {exc}",
+            "seconds": round(time.time() - t0, 1), "goarch": arch,
+        }
     finally:
         _build_state["running"] = False
         _build_lock.release()
+    _build_state["last"] = {**res, "at": time.strftime("%Y-%m-%dT%H:%M:%S"), "goarch": arch}
+    return res

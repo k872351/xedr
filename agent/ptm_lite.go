@@ -106,7 +106,7 @@ func ptmEventEvidence(ev map[string]any) map[string]any {
 	for _, k := range []string{
 		"path", "key", "reg_key", "hive", "value", "value_name", "name", "process_name",
 		"command_line", "remote", "remote_ip", "domain", "local", "proto", "pid", "parent_name",
-		"operation", "image", "module_name",
+		"operation", "image", "module_name", "source", "channel", "event_id", "target_path",
 	} {
 		if v := asString(d[k]); v != "" {
 			out[k] = v

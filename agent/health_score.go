@@ -10,8 +10,15 @@ func computeCaptureHealthScore(sensors map[string]any) map[string]any {
 	if cs == nil {
 		cs = map[string]any{}
 	}
+	if asString(cs["platform"]) == "non-windows" {
+		return map[string]any{
+			"score": nil, "level": "unsupported", "advise": []string{},
+			"etw_mode": "unsupported", "cmd_fill_hint": false,
+		}
+	}
 	pipe, _ := sensors["sensor_pipeline"].(map[string]any)
 	tele, _ := sensors["telemetry"].(map[string]any)
+	hasCmdSamples := false
 
 	etwOK, _ := cs["etw_session_ok"].(bool)
 	mode := asString(cs["etw_mode"])
@@ -33,10 +40,14 @@ func computeCaptureHealthScore(sensors map[string]any) map[string]any {
 		advises = append(advises, "未检测到 Sysmon（可选增强）")
 	}
 	if tele != nil {
-		if pct, ok := tele["proc_cmd_fill_pct"].(float64); ok && pct < 40 {
+		// 启动后尚无进程事件时，0% 代表没有样本，而非采集质量差。
+		withCmd, _ := tele["proc_with_cmd"].(uint64)
+		noCmd, _ := tele["proc_no_cmd"].(uint64)
+		hasCmdSamples = withCmd > 0 || noCmd > 0
+		if pct, ok := tele["proc_cmd_fill_pct"].(float64); ok && hasCmdSamples && pct < 40 {
 			score -= 20
 			advises = append(advises, "进程命令行填充率偏低，检查 4688/WMI/ETW")
-		} else if pct, ok := tele["proc_cmd_fill_pct"].(float64); ok && pct < 70 {
+		} else if pct, ok := tele["proc_cmd_fill_pct"].(float64); ok && hasCmdSamples && pct < 70 {
 			score -= 8
 			advises = append(advises, "进程命令行填充率一般")
 		}
@@ -56,12 +67,14 @@ func computeCaptureHealthScore(sensors map[string]any) map[string]any {
 	}
 	return map[string]any{
 		"score": score, "level": level, "advise": advises,
-		"etw_mode": mode, "cmd_fill_hint": tele != nil,
+		"etw_mode": mode, "cmd_fill_hint": hasCmdSamples,
 	}
 }
 
 func healthScoreLevelColor(level string) string {
 	switch strings.ToLower(level) {
+	case "unsupported":
+		return "gray"
 	case "poor":
 		return "red"
 	case "fair":

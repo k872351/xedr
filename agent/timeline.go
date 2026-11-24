@@ -10,14 +10,14 @@ import (
 
 // 轻量「类 ETW」：进程/文件/网络差分，推入时间线（无需驱动）。
 type timelineWatcher struct {
-	mu         sync.Mutex
-	prevPID    map[int]string
-	prevProc   map[int]map[string]any // 上一轮进程元数据（退出事件补 guid）
-	prevFile   map[string]string      // path -> modified
-	prevNet    map[string]bool        // remote key
-	enabled    bool
-	netOn      bool
-	fileOn     bool
+	mu       sync.Mutex
+	prevPID  map[int]string
+	prevProc map[int]map[string]any // 上一轮进程元数据（退出事件补 guid）
+	prevFile map[string]string      // path -> modified
+	prevNet  map[string]bool        // remote key
+	enabled  bool
+	netOn    bool
+	fileOn   bool
 }
 
 func newTimelineWatcher() *timelineWatcher {
@@ -130,7 +130,7 @@ func (w *timelineWatcher) diffProcesses() []map[string]any {
 			"pid": pid, "name": name, "path": path,
 			"ppid": m["ppid"], "parent_name": m["parent_name"],
 			"command_line": m["command_line"], "user": m["user"],
-			"signed": m["signed"],
+			"signed":      m["signed"],
 			"create_time": m["create_time"], "process_guid": m["process_guid"],
 			"parent_guid": m["parent_guid"], "elevated": m["elevated"], "integrity": m["integrity"],
 		}
@@ -260,7 +260,10 @@ func pathLooksHot(p string) bool {
 			return false
 		}
 	}
-	for _, k := range []string{`\temp\`, `\tmp\`, `\users\public\`, `\downloads\`} {
+	for _, k := range []string{
+		`\temp\`, `\tmp\`, `\users\public\`, `\downloads\`, `\desktop\`,
+		`\inetpub\wwwroot\`, `\inetpub\wwwroot`, `\inetpub\`,
+	} {
 		if strings.Contains(l, k) {
 			return true
 		}
@@ -328,6 +331,7 @@ func filterTimelineEvents(events []map[string]any) []map[string]any {
 	out := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		if isTimelineNoiseEvent(ev) {
+			captureFiltered(ev)
 			continue
 		}
 		out = append(out, ev)

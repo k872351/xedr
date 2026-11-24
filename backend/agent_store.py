@@ -13,6 +13,8 @@ _tables_ready = False
 
 TIMELINE_TABLE = "agent_timeline_hot"
 EVENTS_TABLE = "agent_events_hot"
+AGENTS_TABLE = "agents_hot"
+COMMANDS_TABLE = "agent_commands_hot"
 
 _SCHEMA = [
     f"""CREATE TABLE IF NOT EXISTS {TIMELINE_TABLE} (
@@ -45,6 +47,40 @@ _SCHEMA = [
     KEY idx_ev_sev (severity),
     KEY idx_ev_created (created_at),
     KEY idx_ev_local (local_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    # 多实例起步：agents / commands 双写热表（SQLite 仍为主路径，MySQL 供其他节点可见）
+    f"""CREATE TABLE IF NOT EXISTS {AGENTS_TABLE} (
+    agent_id VARCHAR(64) NOT NULL PRIMARY KEY,
+    hostname VARCHAR(128) DEFAULT '',
+    os_family VARCHAR(32) DEFAULT '',
+    ip VARCHAR(64) DEFAULT '',
+    version VARCHAR(64) DEFAULT '',
+    status VARCHAR(16) DEFAULT 'offline',
+    last_seen VARCHAR(32) DEFAULT '',
+    health_json MEDIUMTEXT,
+    health_at VARCHAR(32) DEFAULT '',
+    capabilities_json TEXT,
+    meta_json TEXT,
+    updated_at VARCHAR(32) DEFAULT '',
+    KEY idx_agents_seen (last_seen),
+    KEY idx_agents_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    f"""CREATE TABLE IF NOT EXISTS {COMMANDS_TABLE} (
+    id VARCHAR(64) NOT NULL PRIMARY KEY,
+    agent_id VARCHAR(64) NOT NULL,
+    action VARCHAR(64) DEFAULT '',
+    params_json MEDIUMTEXT,
+    status VARCHAR(16) DEFAULT 'pending',
+    result_json MEDIUMTEXT,
+    created_by VARCHAR(64) DEFAULT '',
+    created_at VARCHAR(32) DEFAULT '',
+    updated_at VARCHAR(32) DEFAULT '',
+    acked_at VARCHAR(32) DEFAULT '',
+    deadline VARCHAR(32) DEFAULT '',
+    idempotency_key VARCHAR(96) DEFAULT '',
+    KEY idx_cmd_agent (agent_id),
+    KEY idx_cmd_status (status),
+    KEY idx_cmd_updated (updated_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 ]
 
@@ -149,6 +185,133 @@ def write_event(row: Dict[str, Any]) -> bool:
         return True
     except Exception:
         return False
+
+
+def write_agent(row: Dict[str, Any]) -> bool:
+    """双写 Agent 注册/心跳状态到 MySQL（多实例可见起步）。失败不阻断 SQLite 主路径。"""
+    if not row or not retention_config().get("mysql_dual_write") or not ensure_mysql_tables():
+        return False
+    aid = str(row.get("agent_id") or "").strip()[:64]
+    if not aid:
+        return False
+    now = str(row.get("updated_at") or row.get("last_seen") or time.strftime("%Y-%m-%dT%H:%M:%S"))[:32]
+    health = row.get("health_json")
+    if isinstance(health, (dict, list)):
+        health = json.dumps(health, ensure_ascii=False)
+    caps = row.get("capabilities_json")
+    if isinstance(caps, (dict, list)):
+        caps = json.dumps(caps, ensure_ascii=False)
+    meta = row.get("meta_json")
+    if isinstance(meta, (dict, list)):
+        meta = json.dumps(meta, ensure_ascii=False)
+    try:
+        with _mysql() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""INSERT INTO {AGENTS_TABLE}
+                    (agent_id, hostname, os_family, ip, version, status, last_seen,
+                     health_json, health_at, capabilities_json, meta_json, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                      hostname=VALUES(hostname),
+                      os_family=VALUES(os_family),
+                      ip=IFNULL(NULLIF(VALUES(ip), ''), ip),
+                      version=VALUES(version),
+                      status=VALUES(status),
+                      last_seen=VALUES(last_seen),
+                      health_json=IFNULL(VALUES(health_json), health_json),
+                      health_at=IFNULL(NULLIF(VALUES(health_at), ''), health_at),
+                      capabilities_json=IFNULL(VALUES(capabilities_json), capabilities_json),
+                      meta_json=IFNULL(VALUES(meta_json), meta_json),
+                      updated_at=VALUES(updated_at)""",
+                (
+                    aid,
+                    str(row.get("hostname") or "")[:128],
+                    str(row.get("os_family") or "")[:32],
+                    str(row.get("ip") or "")[:64],
+                    str(row.get("version") or "")[:64],
+                    str(row.get("status") or "online")[:16],
+                    str(row.get("last_seen") or now)[:32],
+                    str(health or "")[:60000] or None,
+                    str(row.get("health_at") or "")[:32] or None,
+                    str(caps or "")[:8000] or None,
+                    str(meta or "")[:8000] or None,
+                    now,
+                ),
+            )
+            conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def write_command(row: Dict[str, Any]) -> bool:
+    """双写命令/回执到 MySQL。"""
+    if not row or not retention_config().get("mysql_dual_write") or not ensure_mysql_tables():
+        return False
+    cid = str(row.get("id") or "").strip()[:64]
+    if not cid:
+        return False
+    try:
+        with _mysql() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""INSERT INTO {COMMANDS_TABLE}
+                    (id, agent_id, action, params_json, status, result_json, created_by,
+                     created_at, updated_at, acked_at, deadline, idempotency_key)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                      status=VALUES(status),
+                      result_json=IFNULL(VALUES(result_json), result_json),
+                      updated_at=VALUES(updated_at),
+                      acked_at=IFNULL(NULLIF(VALUES(acked_at), ''), acked_at),
+                      params_json=IFNULL(VALUES(params_json), params_json)""",
+                (
+                    cid,
+                    str(row.get("agent_id") or "")[:64],
+                    str(row.get("action") or "")[:64],
+                    str(row.get("params_json") or "")[:60000] or None,
+                    str(row.get("status") or "pending")[:16],
+                    str(row.get("result_json") or "")[:60000] or None,
+                    str(row.get("created_by") or "")[:64],
+                    str(row.get("created_at") or "")[:32],
+                    str(row.get("updated_at") or "")[:32],
+                    str(row.get("acked_at") or "")[:32] or None,
+                    str(row.get("deadline") or "")[:32] or None,
+                    str(row.get("idempotency_key") or "")[:96] or None,
+                ),
+            )
+            conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def shared_state_status() -> Dict[str, Any]:
+    """管理台/健康检查：共享 Agent 状态表是否就绪。"""
+    out = {
+        "mysql_available": _mysql_ok(),
+        "dual_write": bool(retention_config().get("mysql_dual_write")),
+        "agents_table": AGENTS_TABLE,
+        "commands_table": COMMANDS_TABLE,
+        "tables_ready": False,
+        "agents": None,
+        "commands": None,
+        "note": "SQLite 仍为节点主路径；启用 mysql_dual_write 后 agents/commands 双写 MySQL，供多实例可见起步。",
+    }
+    if not ensure_mysql_tables():
+        return out
+    out["tables_ready"] = True
+    try:
+        with _mysql() as conn:
+            cur = conn.cursor()
+            cur.execute(f"SELECT COUNT(*) AS c FROM {AGENTS_TABLE}")
+            out["agents"] = int(cur.fetchone()["c"])
+            cur.execute(f"SELECT COUNT(*) AS c FROM {COMMANDS_TABLE}")
+            out["commands"] = int(cur.fetchone()["c"])
+    except Exception as e:
+        out["error"] = str(e)[:160]
+    return out
 
 
 def search_mysql_timeline(q: str, *, agent_id: str = "", limit: int = 200) -> List[Dict[str, Any]]:
@@ -282,8 +445,17 @@ def store_stats() -> Dict[str, Any]:
                 stats["mysql"]["timeline"] = int(cur.fetchone()["c"])
                 cur.execute(f"SELECT COUNT(*) AS c FROM {EVENTS_TABLE}")
                 stats["mysql"]["events"] = int(cur.fetchone()["c"])
+                try:
+                    cur.execute(f"SELECT COUNT(*) AS c FROM {AGENTS_TABLE}")
+                    stats["mysql"]["agents"] = int(cur.fetchone()["c"])
+                    cur.execute(f"SELECT COUNT(*) AS c FROM {COMMANDS_TABLE}")
+                    stats["mysql"]["commands"] = int(cur.fetchone()["c"])
+                except Exception:
+                    stats["mysql"]["agents"] = None
+                    stats["mysql"]["commands"] = None
         except Exception as e:
             stats["mysql"]["error"] = str(e)[:160]
+    stats["shared_agent_state"] = shared_state_status()
     return stats
 
 

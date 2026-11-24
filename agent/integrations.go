@@ -5,11 +5,11 @@ import (
 )
 
 var (
-	intMu      sync.RWMutex
+	intMu        sync.RWMutex
 	integrations = map[string]bool{
 		"etw": true, "winevent": true, "wmi_process": false, "fim": true, "registry": true, "persist": true, "device": true,
 		"memory_scan": true, "evm": true, "ptm": true, "amsi": true, "api_etw": true,
-		"rootcheck": true, "sca": true,
+		"rootcheck": true, "sca": true, "linux_journal": true,
 	}
 )
 

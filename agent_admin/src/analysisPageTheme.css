@@ -1,0 +1,70 @@
+/* Visual details shared by the three passive analysis views. */
+.af-top, .lr-top, .na-hero {
+  background: linear-gradient(120deg, #ffffff 48%, #eef7fb);
+  border: 1px solid #d8e3ed;
+  border-left: 4px solid #0891b2;
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+}
+.af-title h1, .lr-title h1, .na-hero h1 { font-size: 23px; color: #17344b; font-weight: 750; }
+.eyebrow { color: #087d9b; letter-spacing: .05em; }
+.af-toolbar label, .lr-toolbar label, .na-toolbar .na-f > span { color: #4d6a80; font-weight: 600; }
+.field { border-color: #cddce8; border-radius: 7px; color: var(--ink); }
+.field:focus { border-color: #1695b0; outline: 2px solid #b4e3ec; outline-offset: 0; }
+.af-toolbar, .lr-toolbar, .na-toolbar { gap: 10px; }
+.af-toolbar label, .lr-toolbar label { display: grid; align-content: start; gap: 5px; }
+.af-list table, .lr-list table, .na-table table { border-collapse: separate; border-spacing: 0; }
+.af-list th, .lr-list th, .na-table th { position: sticky; top: 0; z-index: 2; }
+.lr-list tbody tr:nth-child(even) td, .na-table tbody tr:nth-child(even) td { background: #f8fbfd; }
+.af-detail, .lr-detail, .na-card { min-width: 0; }
+.af-detail :is(dd, code), .lr-detail :is(code, pre), .na-card :is(code, pre) { overflow-wrap: anywhere; }
+.af-empty, .lr-empty, .na-empty { padding: clamp(24px, 5vw, 52px); }
+.btn.primary { background: #087d9b; border-color: #087d9b; color: #fff; }
+.btn.primary:hover:not(:disabled) { background: #066d88; }
+.af-kpis, .lr-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(115px, 1fr)); gap: 9px; }
+.af-kpis .kpi, .lr-kpis .kpi {
+  min-width: 0; justify-content: space-between; align-items: center;
+  border: 1px solid var(--line); border-left: 3px solid #7ba8bb;
+  border-radius: 9px; padding: 12px 14px;
+  box-shadow: var(--shadow);
+}
+.af-kpis .kpi.hot, .lr-kpis .kpi[data-s="critical"], .lr-kpis .kpi[data-s="high"] { border-left-color: #d94841; }
+.af-kpis .kpi b, .lr-kpis .kpi b { font-size: 22px; }
+.kpi em, .kpi-lab { color: #64778b; }
+.lr-kpis .kpi.on { box-shadow: 0 0 0 2px #a6d8e5; }
+.af-list, .af-detail, .lr-list, .lr-detail, .na-card, .na-kpis .kpi {
+  border-color: var(--line); border-radius: 10px; box-shadow: var(--shadow);
+}
+.af-list th { background: #e9f1f7; color: #3f5b71; border-bottom-color: #cbdce9; }
+.af-list tr:nth-child(even) td { background: #f8fbfd; }
+.af-list td { border-bottom-color: #e4edf3; }
+.af-list tr.on td { background: #e9f6fa; }
+.af-list tr:focus-visible td { background: #edf7fa; }
+.af-list tbody tr:focus-visible { outline: 2px solid #0891b2; outline-offset: -2px; }
+.af-detail .detail-hd { border-bottom-color: #dbe6ee; }
+.af-detail { background: #fff; }
+.af-detail dl > div { padding: 7px 8px; border-radius: 5px; }
+.af-detail dl > div:nth-child(odd) { background: #f5f8fb; }
+.af-detail dt { color: #62798e; }
+.af-detail dd { color: var(--ink); }
+.af-empty, .lr-empty, .na-empty { background: #fff; border-color: var(--line); border-radius: 10px; }
+.lr-card.on { border-color: #70b4c7; background: #edf8fb; }
+.lr-card { border-radius: 9px; }
+.lr-card:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+.lr-detail .detail-hd { padding: 12px; border: 1px solid #dbe6ee; border-radius: 8px; background: #f7fafc; }
+.lr-detail .pane-hd { padding: 8px 10px; border-radius: 6px; background: #edf4f8; }
+.lr-detail .pane-hd h4 { color: #26465f; }
+.lr-readonly-note { margin: 0; padding: 10px 12px; border: 1px solid #d8e5ef; background: #f4f9fc; color: #36546d; font-size: 12px; border-radius: 8px; line-height: 1.5; }
+.recs-hint { flex-basis: 100%; color: #526a80; font-size: 11px; line-height: 1.5; padding-left: 2px; }
+.lr-detail .score-box { font-variant-numeric: tabular-nums; }
+.na-kpis .kpi { border-top: 3px solid #7ba8bb; }
+.na-kpis .kpi.risk { border-top-color: #d94841; }
+.na-kpis .kpi.overseas { border-top-color: #d29b46; }
+.na-kpis .kpi strong { font-variant-numeric: tabular-nums; }
+.banner.err { border: 1px solid #f2b6b3; background: #fff3f2; }
+@media (max-width: 700px) {
+  .af-kpis, .lr-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .af-title h1, .lr-title h1, .na-hero h1 { font-size: 20px; }
+  .af-toolbar, .lr-toolbar, .na-toolbar { max-width: 100%; }
+  .af-toolbar .field.search { min-width: 100%; }
+}

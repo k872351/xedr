@@ -9,9 +9,32 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
-from . import agent_protocol
+from . import agent_protocol, risk_scoring
 
 _lock = threading.RLock()
+
+# 关联规则 → 评分信号名；规则未显式声明 risk_signal 时按 id 关键字推断。
+_SIGNAL_HINTS: Tuple[Tuple[str, str], ...] = (
+    ("lsass", "lsass_access"),
+    ("office", "office_spawn"),
+    ("script", "script_interpreter"),
+    ("lolbin", "lolbin_exec"),
+    ("c2", "c2_outbound"),
+    ("task", "task_persist"),
+    ("first_seen", "first_seen_unsigned"),
+)
+
+
+def _signal_name_of(rule: Dict[str, Any]) -> str:
+    explicit = str(rule.get("risk_signal") or "").strip()
+    if explicit:
+        return explicit
+    rid = str(rule.get("id") or "").lower()
+    for needle, name in _SIGNAL_HINTS:
+        if needle in rid:
+            return name
+    return "default"
+
 # (agent_id, rule_id, group_key) -> deque[(ts_float, event_ref)]
 _freq_state: Dict[Tuple[str, str, str], Deque[float]] = defaultdict(deque)
 _RULES_CACHE: Optional[List[Dict[str, Any]]] = None
@@ -191,6 +214,7 @@ def _first_seen_hit(agent_id: str, rule: Dict[str, Any], ev: Dict[str, Any], hos
     return True
 
 
+
 def _emit(
     agent_id: str,
     host: str,
@@ -209,7 +233,7 @@ def _emit(
         "correlation": True,
     }
     d = _detail_of(ev)
-    for k in ("path", "name", "parent_name", "user", "ip", "command_line", "pid"):
+    for k in ("path", "name", "parent_name", "user", "ip", "command_line", "pid", "ppid", "entity_id", "parent_entity_id"):
         if d.get(k) is not None:
             detail[k] = d[k]
     if rule.get("mitre"):
@@ -226,7 +250,16 @@ def _emit(
             sev = "medium"
     risk = rule.get("risk_score")
     if risk is not None:
-        detail["risk_score"] = int(risk)
+        try:
+            detail["risk_score"] = int(risk)
+        except (TypeError, ValueError):
+            pass
+    # 多信号风险评分：把本条规则命中作为一个信号累计到进程级风险模型，
+    # 评分字段就地写回 detail（静态 risk_score 作为下限）。
+    risk_scoring.report(
+        agent_id, detail, _signal_name_of(rule),
+        weight=int(risk) if isinstance(risk, (int, float)) else None,
+    )
     mod = "building_block" if bb else "correlation"
     r = agent_protocol.report_event({
         "agent_id": agent_id,
@@ -267,9 +300,13 @@ def _apply_frequency(agent_id: str, host: str, rule: Dict[str, Any], events: Lis
 
 
 def _step_match(ev: Dict[str, Any], step: Dict[str, Any]) -> bool:
-    if step.get("etype") and str(ev.get("etype") or "") != step["etype"]:
+    et = str(ev.get("etype") or "")
+    if step.get("etype") and et != step["etype"]:
         return False
-    if step.get("etype_contains") and str(step["etype_contains"]).lower() not in str(ev.get("etype") or "").lower():
+    want = str(step.get("etype_contains") or "").lower()
+    if want and want not in et.lower():
+        return False
+    if want == "process" and "exit" in et.lower():
         return False
     if step.get("summary_contains"):
         if str(step["summary_contains"]).lower() not in str(ev.get("summary") or "").lower():
@@ -355,8 +392,11 @@ def _apply_login_correlation(agent_id: str, host: str, events: List[Dict[str, An
             "evidence": h.get("evidence"),
             "event_id": h.get("event_id"),
             "channel": h.get("channel"),
-            "risk_score": 65 if sev == "critical" else (55 if sev == "high" else 40),
         }
+        rule_id = str(h.get("rule_id") or "")
+        sig = "login_impossible_travel" if "travel" in rule_id.lower() else "login_bruteforce"
+        static_risk = 65 if sev == "critical" else (55 if sev == "high" else 40)
+        risk_scoring.report(agent_id, detail, sig, weight=static_risk)
         r = agent_protocol.report_event({
             "agent_id": agent_id,
             "hostname": host,

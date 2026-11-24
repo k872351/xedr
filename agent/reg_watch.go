@@ -23,6 +23,28 @@ type regSpec struct {
 	Label       string
 	Severity    string
 	MinInterval time.Duration // 高频变更键的最小重读间隔
+	// KeyLeaf 非空时只记录末级键名在其中的键的值（小写），用于 CLSID 这类大子树
+	KeyLeaf []string
+	// RecordSubkeys：子键本身就是配置项（如 BHO 以 CLSID 为子键名、可无值）
+	RecordSubkeys bool
+	// PayloadCheck：把值解析成落地文件（CLSID→DLL / 路径），按签名与路径重新定级
+	PayloadCheck bool
+}
+
+func (s regSpec) keyWanted(display string) bool {
+	if len(s.KeyLeaf) == 0 {
+		return true
+	}
+	leaf := strings.ToLower(display)
+	if i := strings.LastIndex(leaf, `\`); i >= 0 {
+		leaf = leaf[i+1:]
+	}
+	for _, k := range s.KeyLeaf {
+		if leaf == k {
+			return true
+		}
+	}
+	return false
 }
 
 type regValue struct {
@@ -161,6 +183,11 @@ func regEvent(spec regSpec, kind, full string, cur, old regValue, offline bool) 
 		"category": spec.Category, "label": spec.Label, "hive": spec.Hive, "watch": spec.ID,
 		"change": kind,
 	}
+	if spec.PayloadCheck && kind != "delete" {
+		if payload := regPayloadPath(spec, key, name, cur.Data); payload != "" {
+			sev = regPayloadSeverity(payload, sev, detail)
+		}
+	}
 	if spec.SID != "" {
 		detail["user_sid"] = spec.SID
 	}
@@ -184,6 +211,25 @@ func regEvent(spec regSpec, kind, full string, cur, old regValue, offline bool) 
 
 func enrichRegActor(detail map[string]any) {
 	if detail == nil {
+		return
+	}
+	if a, ok := regETW.attribute(asString(detail["reg_key"]), asString(detail["value_name"]), asString(detail["change"])); ok {
+		detail["actor_confidence"] = a.confidence
+		detail["actor_source"] = "kernel_registry_etw"
+		detail["pid"] = int(a.pid)
+		detail["tid"] = int(a.tid)
+		if e := procEntities.resolve(a.pid, filetimeOf(a.at)); e != nil {
+			if e.Name != "" {
+				detail["process_name"] = e.Name
+			}
+			if e.Image != "" {
+				detail["image"] = e.Image
+				detail["process_path"] = e.Image
+			}
+			mergeInto(detail, procEntities.fieldsOf(e))
+		} else if p, ok := queryProc(a.pid); ok {
+			detail["process_name"] = p.name
+		}
 		return
 	}
 	e := procEntities.bestRecentUserProcess(4 * time.Second)
@@ -265,6 +311,23 @@ func machineRegSpecs() []regSpec {
 		{ID: "office_vsto_addins", Hive: "HKLM", Path: `SOFTWARE\Microsoft\VSTO\Security\Inclusion`, Subtree: true, Depth: 1, Category: p, Label: "VSTO信任加载项", Severity: "medium"},
 		{ID: "office_excel_xlstart", Hive: "HKLM", Path: `SOFTWARE\Microsoft\Office\16.0\Excel\Options`, Values: lowerAll("OPEN", "OPEN1", "OPEN2"), Category: p, Label: "Excel自动打开", Severity: "medium"},
 		{ID: "office_word_startup", Hive: "HKLM", Path: `SOFTWARE\Microsoft\Office\16.0\Word\Options`, Values: lowerAll("STARTUP-PATH"), Category: p, Label: "Word Startup路径", Severity: "medium"},
+		// 安全模式：AlternateShell 与 Minimal/Network 白名单（勒索常把自身服务加入后重启进安全模式）
+		{ID: "safeboot_shell", Hive: "HKLM", Path: `SYSTEM\CurrentControlSet\Control\SafeBoot`, Values: lowerAll("AlternateShell"), Category: p, Label: "SafeBoot AlternateShell"},
+		{ID: "safeboot_minimal", Hive: "HKLM", Path: `SYSTEM\CurrentControlSet\Control\SafeBoot\Minimal`, Subtree: true, Depth: 1, RecordSubkeys: true, Category: de, Label: "SafeBoot(Minimal)", MinInterval: 5 * time.Second},
+		{ID: "safeboot_network", Hive: "HKLM", Path: `SYSTEM\CurrentControlSet\Control\SafeBoot\Network`, Subtree: true, Depth: 1, RecordSubkeys: true, Category: de, Label: "SafeBoot(Network)", MinInterval: 5 * time.Second},
+		// Winsock LSP / 命名空间提供者
+		{ID: "winsock_proto", Hive: "HKLM", Path: `SYSTEM\CurrentControlSet\Services\WinSock2\Parameters\Protocol_Catalog9\Catalog_Entries`, Subtree: true, Depth: 1, Values: lowerAll("PackedCatalogItem"), Category: p, Label: "Winsock LSP", PayloadCheck: true, MinInterval: 5 * time.Second},
+		{ID: "winsock_proto64", Hive: "HKLM", Path: `SYSTEM\CurrentControlSet\Services\WinSock2\Parameters\Protocol_Catalog9\Catalog_Entries64`, Subtree: true, Depth: 1, Values: lowerAll("PackedCatalogItem"), Category: p, Label: "Winsock LSP(64)", PayloadCheck: true, MinInterval: 5 * time.Second},
+		{ID: "winsock_ns", Hive: "HKLM", Path: `SYSTEM\CurrentControlSet\Services\WinSock2\Parameters\NameSpace_Catalog5\Catalog_Entries`, Subtree: true, Depth: 1, Values: lowerAll("LibraryPath"), Category: p, Label: "Winsock NameSpace", PayloadCheck: true, MinInterval: 5 * time.Second},
+		{ID: "winsock_ns64", Hive: "HKLM", Path: `SYSTEM\CurrentControlSet\Services\WinSock2\Parameters\NameSpace_Catalog5\Catalog_Entries64`, Subtree: true, Depth: 1, Values: lowerAll("LibraryPath"), Category: p, Label: "Winsock NameSpace(64)", PayloadCheck: true, MinInterval: 5 * time.Second},
+		{ID: "appcertdlls", Hive: "HKLM", Path: `SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls`, Category: p, Label: "AppCertDlls", PayloadCheck: true},
+		// Explorer / Shell 扩展
+		{ID: "shell_delayload", Hive: "HKLM", Path: cv + `\ShellServiceObjectDelayLoad`, Category: p, Label: "ShellServiceObjectDelayLoad", PayloadCheck: true},
+		{ID: "shell_service_objects", Hive: "HKLM", Path: cv + `\Explorer\ShellServiceObjects`, Subtree: true, Depth: 1, RecordSubkeys: true, Category: p, Label: "ShellServiceObjects", PayloadCheck: true},
+		{ID: "shell_exec_hooks", Hive: "HKLM", Path: cv + `\Explorer\ShellExecuteHooks`, Category: p, Label: "ShellExecuteHooks", PayloadCheck: true},
+		{ID: "shell_bho", Hive: "HKLM", Path: cv + `\Explorer\Browser Helper Objects`, Subtree: true, Depth: 1, RecordSubkeys: true, Category: p, Label: "BHO", PayloadCheck: true},
+		{ID: "shell_overlay", Hive: "HKLM", Path: cv + `\Explorer\ShellIconOverlayIdentifiers`, Subtree: true, Depth: 1, Values: []string{""}, Category: p, Label: "Shell图标覆盖", Severity: "medium", PayloadCheck: true, MinInterval: 5 * time.Second},
+		{ID: "shell_ctx_all", Hive: "HKLM", Path: `SOFTWARE\Classes\*\ShellEx\ContextMenuHandlers`, Subtree: true, Depth: 1, Values: []string{""}, Category: p, Label: "右键菜单扩展(*)", Severity: "medium", PayloadCheck: true, MinInterval: 5 * time.Second},
 	}
 }
 
@@ -293,5 +356,24 @@ func userRegSpecs(sid string) []regSpec {
 		mk("hkcu_ppt_addins", `Software\Microsoft\Office\PowerPoint\Addins`, `PPT加载项(HKCU)`, p, nil, true, 1),
 		mk("hkcu_com_scriptlet", `Software\Classes\CLSID\{64AB4BB7-111E-11D1-8F79-00C04FC2FBE1}\InprocServer32`, `COM Inproc(Scriptlet HKCU)`, p, nil, false, 0),
 		mk("hkcu_excel_options", `Software\Microsoft\Office\16.0\Excel\Options`, `Excel自动打开(HKCU)`, p, lowerAll("OPEN", "OPEN1"), false, 0),
+		hkcuCLSID(sid),
+		withPayload(mk("hkcu_delayload", cv+`\ShellServiceObjectDelayLoad`, `HKCU ShellServiceObjectDelayLoad`, p, nil, false, 0)),
 	}
+}
+
+// hkcuCLSID 用户级 COM 劫持（T1546.015）：任意 CLSID 的 InprocServer32/LocalServer32/TreatAs。
+// 用户级注册优先于 HKLM，攻击者无需管理员权限即可让系统进程加载其 DLL。
+func hkcuCLSID(sid string) regSpec {
+	return regSpec{
+		ID: "hkcu_clsid:" + sid, Hive: "HKU", SID: sid, Path: `Software\Classes\CLSID`,
+		Subtree: true, Depth: 2, Values: []string{""},
+		KeyLeaf:      []string{"inprocserver32", "localserver32", "treatas"},
+		Category:     "persistence", Label: "HKCU COM劫持",
+		PayloadCheck: true, MinInterval: 3 * time.Second,
+	}
+}
+
+func withPayload(s regSpec) regSpec {
+	s.PayloadCheck = true
+	return s
 }

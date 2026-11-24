@@ -355,6 +355,42 @@ def _normalize_model(model: str, base_url: str = "") -> str:
     return "gpt-4o-mini"
 
 
+def test_ai_connection(creds: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """向 OpenAI 兼容接口发一条极短请求，验证 Base URL / Key / 模型是否可用。"""
+    import time
+    creds = creds or {}
+    api_key = str(creds.get("api_key") or config.AI_API_KEY or "").strip()
+    base_url = str(creds.get("base_url") or config.AI_BASE_URL or "").strip()
+    model = _normalize_model(creds.get("model") or config.AI_MODEL or "", base_url)
+    try:
+        timeout = float(creds.get("timeout") or 30)
+    except (TypeError, ValueError):
+        timeout = 30.0
+    timeout = max(8.0, min(timeout, 60.0))
+    if not base_url:
+        raise RuntimeError("请填写 Base URL")
+    if not model:
+        raise RuntimeError("请填写模型名")
+    url = _chat_completions_url(base_url)
+    send = _chat_sender(url, api_key or "local", model, timeout, max_tokens=24)
+    t0 = time.time()
+    text = send([
+        {"role": "user", "content": "Reply with exactly one word: OK"},
+    ])
+    ms = int((time.time() - t0) * 1000)
+    reply = str(text or "").strip()[:160]
+    if not reply:
+        raise RuntimeError("模型返回空内容")
+    return {
+        "ok": True,
+        "latency_ms": ms,
+        "reply": reply,
+        "model": model,
+        "base_url": base_url,
+        "request_url": url,
+    }
+
+
 def _chat_sender(
     url: str,
     api_key: str,
@@ -760,7 +796,13 @@ _SECTION_LABELS: Dict[str, str] = {
     "network": "网络连接",
     "exec": "执行痕迹",
     "remote": "远程凭据",
-    "browser": "浏览器",
+    "netif": "网卡",
+    "groups": "用户组",
+    "firewall": "防火墙",
+    "shares": "共享",
+    "certs": "证书",
+    "usb": "USB",
+    "browser_ext": "浏览器扩展",
     "driver": "驱动",
     "security": "安全策略",
     "disk": "磁盘变更",

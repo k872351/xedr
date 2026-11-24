@@ -15,6 +15,7 @@ from .cache_config import es_config
 
 _lock = threading.RLock()
 _index_ok = False
+_last_queue_probe = 0.0
 _rule_cursor = 0
 _last_run: Dict[str, Any] = {}
 
@@ -208,7 +209,52 @@ def index_timeline_event(
 
 
 def index_event_async(**kwargs: Any) -> None:
-    threading.Thread(target=index_timeline_event, kwargs=kwargs, daemon=True).start()
+    """入持久队列后由后台 worker 批量写入；ES 中断恢复后可补齐且按 event_key 去重。"""
+    from . import es_event_queue as _eq
+    _eq.enqueue_timeline_event(**kwargs)
+
+
+def index_timeline_batch(items: List[Any]) -> Dict[str, bool]:
+    """A failed or partially rejected bulk response leaves unconfirmed jobs pending."""
+    if not items or not detection_enabled():
+        return {}
+    global _last_queue_probe, _index_ok
+    from . import es_client
+    if not es_client.is_available():
+        with _lock:
+            now = time.monotonic()
+            if now - _last_queue_probe >= 15:
+                _last_queue_probe = now
+                es_client.reset()
+                _index_ok = False
+        if not es_client.is_available():
+            return {}
+    if not ensure_edr_indices():
+        return {}
+    es = es_client.get_client()
+    if es is None:
+        return {}
+    index = str(_cfg()["index_edr_events"])
+    operations = []
+    keys = []
+    for key, payload in items:
+        try:
+            doc = timeline_to_ecs(**payload)
+        except (TypeError, ValueError):
+            continue
+        operations.extend([{"index": {"_index": index, "_id": key}}, doc])
+        keys.append(key)
+    if not operations:
+        return {}
+    try:
+        reply = es.bulk(operations=operations)
+    except Exception:
+        _index_ok = False
+        raise
+    rows = reply.get("items", [])
+    return {key: item.get("index", {}).get("status") in (200, 201)
+            for key, item in zip(keys, rows)
+            if item.get("index", {}).get("_id") == key}
 
 
 def _load_eql_rules(limit: int = 500) -> List[Dict[str, Any]]:
@@ -390,13 +436,19 @@ def _hj_stack_hint() -> Dict[str, str]:
 
 def status() -> Dict[str, Any]:
     from . import es_client
+    from . import es_event_queue
 
     c = _cfg()
     probe = es_client.probe_status(reprobe=False)
+    try:
+        queue = es_event_queue.queue_stats(transactional=True)
+    except Exception:
+        queue = {"ok": False, "error": "index queue unavailable"}
     return {
         "ok": True,
         "es_connected": es_client.is_available(),
         "es_probe": probe,
+        "index_queue": queue,
         "detection_enabled": detection_enabled(),
         "index_edr_events": c.get("index_edr_events"),
         "index_edr_detection_rules": c.get("index_edr_detection_rules"),
@@ -405,6 +457,56 @@ def status() -> Dict[str, Any]:
         "hj_stack": _hj_stack_hint(),
         "note": "ES 安装目录见 config/hj_stack.json；启动 scripts/start_hj_elasticsearch.ps1 后重启 8100 或跑 setup_elasticsearch_edr.py。",
     }
+
+
+def search_archived_events(
+    *,
+    q: str = "",
+    agent_id: str = "",
+    etype: str = "",
+    hours: int = 24,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """查询已写入 ES 的原始遥测归档（长期存储）。"""
+    from . import es_client
+
+    if not es_client.is_available():
+        return {"ok": False, "error": "ES 不可用", "items": []}
+    c = _cfg()
+    idx = str(c.get("index_edr_events") or "edr-events")
+    lim = max(1, min(int(limit or 50), 200))
+    must: List[Dict[str, Any]] = []
+    if agent_id:
+        must.append({"term": {"agent.id": agent_id}})
+    if etype:
+        must.append({"term": {"edr.etype": etype}})
+    if q:
+        must.append({"query_string": {"query": q, "fields": ["message", "edr.summary", "process.command_line", "file.path"]}})
+    if hours and hours > 0:
+        must.append({"range": {"@timestamp": {"gte": f"now-{int(hours)}h"}}})
+    body: Dict[str, Any] = {
+        "size": lim,
+        "sort": [{"@timestamp": "desc"}],
+        "query": {"bool": {"must": must}} if must else {"match_all": {}},
+    }
+    try:
+        es = es_client.get_client()
+        res = es.search(index=idx, body=body)
+        hits = []
+        for h in ((res or {}).get("hits") or {}).get("hits") or []:
+            src = h.get("_source") or {}
+            hits.append({
+                "id": h.get("_id"),
+                "ts": src.get("@timestamp"),
+                "agent_id": ((src.get("agent") or {}).get("id")),
+                "hostname": ((src.get("host") or {}).get("name")),
+                "etype": ((src.get("edr") or {}).get("etype")),
+                "summary": ((src.get("edr") or {}).get("summary")) or src.get("message"),
+                "source": src,
+            })
+        return {"ok": True, "index": idx, "total": ((res.get("hits") or {}).get("total") or {}), "items": hits}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "items": []}
 
 
 def start_background_loop() -> None:

@@ -88,6 +88,40 @@ func (r fimRoot) wants(path string) bool {
 	return r.Exts[strings.ToLower(filepath.Ext(path))]
 }
 
+// Polling roots must honor non-recursive scope when deciding whether absence
+// is evidence of deletion. Use filesystem-native separators and relative paths.
+func fimRootCoversPath(root fimRoot, path string) bool {
+	rel, err := filepath.Rel(root.Path, path)
+	if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return (root.Recursive || !strings.Contains(rel, string(filepath.Separator))) && root.wants(path)
+}
+
+func retainIncompleteFIMBaseline(previous, current map[string]fimEntry, attempted []fimRoot, completed map[string]fimRoot) {
+	for path, old := range previous {
+		if _, ok := current[path]; ok {
+			continue
+		}
+		covered, complete := false, false
+		for _, root := range attempted {
+			if fimRootCoversPath(root, path) {
+				covered = true
+				break
+			}
+		}
+		for _, root := range completed {
+			if fimRootCoversPath(root, path) {
+				complete = true
+				break
+			}
+		}
+		if covered && !complete {
+			current[path] = old
+		}
+	}
+}
+
 func (r fimRoot) contains(path string) bool {
 	lp, lr := strings.ToLower(path), strings.ToLower(strings.TrimRight(r.Path, `\`))
 	if !strings.HasPrefix(lp, lr+`\`) {

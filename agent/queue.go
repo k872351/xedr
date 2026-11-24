@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -60,6 +61,11 @@ type outbox struct {
 
 	enq, sent, rejected, dropped atomic.Int64
 	useV2                        atomic.Bool
+	snapshotParts                atomic.Bool
+	softwareExtended             atomic.Bool
+	softwarePaged                atomic.Bool
+	assetsPaged                  atomic.Bool
+	usersPaged                   atomic.Bool
 	// onReject 服务端永久拒绝某条事件时回调（增量清单据此回退全量）
 	onReject func(kind outboxKind, payload map[string]any, msg string)
 }
@@ -101,6 +107,10 @@ func (o *outbox) resync() {
 
 // importLegacy 一次性导入旧版 JSON 队列，导入后改名防止重复导入。
 func (o *outbox) importLegacy(path string) {
+	if o.st == nil || o.st.path == ":memory:" {
+		log.Printf("outbox: persistent state DB unavailable; leaving legacy queue in place: %s", path)
+		return
+	}
 	b, err := os.ReadFile(path)
 	if err != nil || len(b) == 0 {
 		return
@@ -110,13 +120,40 @@ func (o *outbox) importLegacy(path string) {
 		Priority int            `json:"priority"`
 		Payload  map[string]any `json:"payload"`
 	}
-	if json.Unmarshal(b, &items) == nil {
-		for _, it := range items {
-			o.enqueue(it.Kind, it.Priority, it.Payload)
-		}
-		log.Printf("outbox: 已导入旧队列 %d 条", len(items))
+	if err := json.Unmarshal(b, &items); err != nil {
+		// Keep the original file for manual recovery. Renaming malformed data
+		// would hide the only remaining copy of queued telemetry.
+		log.Printf("outbox: legacy queue is invalid; keeping %s: %v", path, err)
+		return
 	}
-	_ = os.Rename(path, path+".migrated")
+	imported := 0
+	for i, it := range items {
+		identity, _ := json.Marshal([]any{i, it.Kind, it.Priority, it.Payload})
+		sum := sha256.Sum256(identity)
+		uuid := hex.EncodeToString(sum[:])
+		var exists int
+		err := o.st.db.QueryRow("SELECT 1 FROM outbox WHERE uuid=?", uuid).Scan(&exists)
+		if err == nil {
+			imported++ // deterministic ID: this legacy row was already imported
+			continue
+		}
+		if err != sql.ErrNoRows {
+			log.Printf("outbox: could not check legacy entry %d; keeping %s: %v", i, path, err)
+			return
+		}
+		before := o.enq.Load()
+		o.enqueueWithUUID(uuid, it.Kind, it.Priority, it.Payload)
+		if o.enq.Load() == before {
+			log.Printf("outbox: could not persist legacy entry %d; keeping %s", i, path)
+			return
+		}
+		imported++
+	}
+	if err := os.Rename(path, path+".migrated"); err != nil {
+		log.Printf("outbox: imported legacy queue but could not archive %s: %v", path, err)
+		return
+	}
+	log.Printf("outbox: imported legacy queue %d entries", imported)
 }
 
 func coalesceKey(kind outboxKind, payload map[string]any) string {
@@ -133,17 +170,21 @@ func coalesceKey(kind outboxKind, payload map[string]any) string {
 	return ""
 }
 
-func (o *outbox) enqueue(kind outboxKind, priority int, payload map[string]any) {
+func (o *outbox) enqueue(kind outboxKind, priority int, payload map[string]any) bool {
+	return o.enqueueWithUUID(newUUID(), kind, priority, payload)
+}
+
+func (o *outbox) enqueueWithUUID(uuid string, kind outboxKind, priority int, payload map[string]any) bool {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return false
 	}
 	now := time.Now().UnixMilli()
 	ck := coalesceKey(kind, payload)
 	tx, err := o.st.db.Begin()
 	if err != nil {
 		log.Printf("outbox enqueue: %v", err)
-		return
+		return false
 	}
 	var delRows, delBytes int64
 	if ck != "" {
@@ -161,15 +202,15 @@ func (o *outbox) enqueue(kind outboxKind, priority int, payload map[string]any) 
 	if _, err := tx.Exec(
 		`INSERT INTO outbox(uuid, stream, kind, priority, coalesce_key, payload, bytes, available_at, created_at)
 		 VALUES(?,?,?,?,?,?,?,?,?)`,
-		newUUID(), outboxStream, string(kind), priority, ck, raw, len(raw), now, now,
+		uuid, outboxStream, string(kind), priority, ck, raw, len(raw), now, now,
 	); err != nil {
 		_ = tx.Rollback()
 		log.Printf("outbox enqueue: %v", err)
-		return
+		return false
 	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("outbox enqueue commit: %v", err)
-		return
+		return false
 	}
 	o.enq.Add(1)
 	o.mu.Lock()
@@ -181,6 +222,7 @@ func (o *outbox) enqueue(kind outboxKind, priority int, payload map[string]any) 
 		o.enforceBudget()
 	}
 	o.kick()
+	return true
 }
 
 // enforceBudget 丢弃最低优先级、最旧的事件直到回到预算的 90%。
@@ -198,17 +240,42 @@ func (o *outbox) enforceBudget() {
 		if overRows > 0 {
 			chunk = min(overRows, 500)
 		}
-		res, err := o.st.db.Exec(
-			`DELETE FROM outbox WHERE seq IN (SELECT seq FROM outbox ORDER BY priority ASC, seq ASC LIMIT ?)`, chunk)
+		rows, err := o.st.db.Query(
+			`DELETE FROM outbox WHERE seq IN (SELECT seq FROM outbox ORDER BY priority ASC, seq ASC LIMIT ?) RETURNING kind, CASE WHEN kind IN ('snapshot', 'snapshot_delta') THEN payload ELSE NULL END`, chunk)
 		if err != nil {
 			return
 		}
-		n, _ := res.RowsAffected()
+		type evictedSnapshot struct {
+			kind    outboxKind
+			payload map[string]any
+		}
+		var snapshots []evictedSnapshot
+		var n int64
+		for rows.Next() {
+			var kind outboxKind
+			var raw []byte
+			if err := rows.Scan(&kind, &raw); err != nil {
+				continue
+			}
+			n++
+			if kind == outSnapshot || kind == outSnapshotDelta {
+				var payload map[string]any
+				if json.Unmarshal(raw, &payload) == nil {
+					snapshots = append(snapshots, evictedSnapshot{kind, payload})
+				}
+			}
+		}
+		_ = rows.Close()
 		if n == 0 {
 			return
 		}
 		o.dropped.Add(n)
 		o.resync()
+		if o.onReject != nil {
+			for _, snapshot := range snapshots {
+				o.onReject(snapshot.kind, snapshot.payload, "local queue budget eviction")
+			}
+		}
 	}
 }
 
@@ -367,6 +434,17 @@ func (o *outbox) flush(api *APIClient) int {
 }
 
 func (o *outbox) sendV2(api *APIClient, rows []readyRow) (int, error) {
+	if o.snapshotParts.Load() {
+		for i, r := range rows {
+			if r.kind == outSnapshot && (len(r.payload) > snapshotPartBytes || snapshotRequiresPaging(r.payload)) && len(r.payload) <= snapshotPartsMaxBytes {
+				if i == 0 {
+					return o.sendSnapshotParts(api, r)
+				}
+				rows = rows[:i]
+				break
+			}
+		}
+	}
 	events := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
 		var payload map[string]any
@@ -380,10 +458,11 @@ func (o *outbox) sendV2(api *APIClient, rows []readyRow) (int, error) {
 	}
 	resp, err := api.SendBatch(outboxStream, events)
 	if err != nil {
-		if isV2Unsupported(err) { // 老服务端：回落 v1，不当作网络故障
+		log.Printf("outbox v2 batch failed: %v", err)
+		if isV2Unsupported(err) || isV2BatchRejected(err) { // 老服务端：回落 v1，不当作网络故障
 			log.Printf("服务端不支持 v2 批量上报，回落 v1: %v", err)
 			o.useV2.Store(false)
-			return 0, nil
+			return o.sendLegacy(api, rows)
 		}
 		return 0, err
 	}
@@ -428,6 +507,16 @@ func (o *outbox) sendLegacy(api *APIClient, rows []readyRow) (int, error) {
 	for _, r := range rows {
 		var payload map[string]any
 		_ = json.Unmarshal(r.payload, &payload)
+		if r.kind == outSnapshot && (payload["module"] == "software" || payload["paged_inventory"] == true) {
+			if items, ok := payload["items"].([]any); ok && len(items) > maxItems {
+				if o.onReject != nil {
+					o.onReject(r.kind, payload, "extended inventory requires negotiated v2 support")
+				}
+				o.rejected.Add(1)
+				o.deleteSeqs([]int64{r.seq})
+				continue
+			}
+		}
 		if r.kind == outSnapshotDelta {
 			// v1 不支持增量：丢弃并让清单下一轮发全量
 			if o.onReject != nil {
@@ -491,18 +580,19 @@ func (o *outbox) pending() int {
 
 // outboxStats 供心跳健康上报。
 type outboxStats struct {
-	Depth     int64   `json:"depth"`
-	Bytes     int64   `json:"bytes"`
-	OldestSec float64 `json:"oldest_age_sec"`
-	Dropped   int64   `json:"dropped"`
-	Rejected  int64   `json:"rejected"`
-	Enqueued  int64   `json:"enqueued"`
-	Sent      int64   `json:"sent"`
-	LastError string  `json:"last_error,omitempty"`
-	LastOKAge float64 `json:"last_ok_age_sec"`
-	V2        bool    `json:"v2"`
-	MaxRows   int64   `json:"max_rows"`
-	MaxBytes  int64   `json:"max_bytes"`
+	Depth     int64            `json:"depth"`
+	Durable   bool             `json:"durable"`
+	Bytes     int64            `json:"bytes"`
+	OldestSec float64          `json:"oldest_age_sec"`
+	Dropped   int64            `json:"dropped"`
+	Rejected  int64            `json:"rejected"`
+	Enqueued  int64            `json:"enqueued"`
+	Sent      int64            `json:"sent"`
+	LastError string           `json:"last_error,omitempty"`
+	LastOKAge float64          `json:"last_ok_age_sec"`
+	V2        bool             `json:"v2"`
+	MaxRows   int64            `json:"max_rows"`
+	MaxBytes  int64            `json:"max_bytes"`
 	ByKind    map[string]int64 `json:"by_kind,omitempty"`
 }
 
@@ -512,7 +602,8 @@ func (o *outbox) stats() outboxStats {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	s := outboxStats{
-		Depth: o.rows, Bytes: o.bytes, Dropped: o.dropped.Load(), Rejected: o.rejected.Load(),
+		Depth: o.rows, Durable: o.st != nil && o.st.path != ":memory:", Bytes: o.bytes,
+		Dropped: o.dropped.Load(), Rejected: o.rejected.Load(),
 		Enqueued: o.enq.Load(), Sent: o.sent.Load(), LastError: o.lastErr, V2: o.useV2.Load(),
 		MaxRows: outboxMaxRows, MaxBytes: outboxMaxBytes,
 	}

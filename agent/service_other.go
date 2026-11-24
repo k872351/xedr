@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package main
 
@@ -32,4 +32,10 @@ func stopServiceCmd() error {
 func serviceStatus() error {
 	fmt.Fprintln(os.Stderr, "非 Windows 平台无服务状态")
 	return nil
+}
+
+func ensureAgentKeepalive() {}
+
+func ensureServiceRunning() error {
+	return fmt.Errorf("仅 Windows 支持")
 }

@@ -14,7 +14,27 @@ var (
 	teleEventsOther    atomic.Uint64
 	teleProcWithCmd    atomic.Uint64
 	teleProcNoCmd      atomic.Uint64
+	// AG-02: stage loss counters (enqueue / buffer / send)
+	teleDropEnqueue atomic.Uint64
+	teleDropBuffer  atomic.Uint64
+	teleDropSend    atomic.Uint64
 )
+
+func teleIncDrop(stage string, n uint64) {
+	if n == 0 {
+		return
+	}
+	switch stage {
+	case "enqueue", "queue_full", "rejected":
+		teleDropEnqueue.Add(n)
+	case "buffer", "buffer_dropped":
+		teleDropBuffer.Add(n)
+	case "send", "dropped":
+		teleDropSend.Add(n)
+	default:
+		teleDropBuffer.Add(n)
+	}
+}
 
 func teleIncSource(ev map[string]any) {
 	if ev == nil {
@@ -66,14 +86,22 @@ func telemetryMetricsSnapshot() map[string]any {
 	if total > 0 {
 		fillPct = float64(withCmd) * 100 / float64(total)
 	}
+	enq := teleDropEnqueue.Load()
+	buf := teleDropBuffer.Load()
+	send := teleDropSend.Load()
 	return map[string]any{
-		"events_etw":       teleEventsETW.Load(),
-		"events_winevent":  teleEventsWinevent.Load(),
-		"events_sysmon":  teleEventsSysmon.Load(),
-		"events_other":   teleEventsOther.Load(),
+		"events_etw":        teleEventsETW.Load(),
+		"events_winevent":   teleEventsWinevent.Load(),
+		"events_sysmon":     teleEventsSysmon.Load(),
+		"events_other":      teleEventsOther.Load(),
 		"proc_cmd_fill_pct": round1(fillPct),
-		"proc_with_cmd":  withCmd,
-		"proc_no_cmd":    noCmd,
+		"proc_with_cmd":     withCmd,
+		"proc_no_cmd":       noCmd,
+		// AG-02 stage loss summary
+		"drop_enqueue": enq,
+		"drop_buffer":  buf,
+		"drop_send":    send,
+		"drop_total":   enq + buf + send,
 	}
 }
 

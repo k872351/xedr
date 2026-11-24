@@ -19,6 +19,11 @@ RISK_BANDS = {
     "critical": (74, 100),
 }
 MITRE_RE = re.compile(r"^T\d{4}(?:\.\d{3})?$", re.I)
+# SCA / 规则中允许的合规框架键（对齐 wazuh cases_compliance_format.yaml）
+ALLOWED_COMPLIANCE_KEYS = frozenset({
+    "cmmc", "fedramp", "gdpr", "hipaa", "iso_27001", "nis2",
+    "nist_800_171", "nist_800_53", "pci_dss", "tsc",
+})
 
 
 def err(msg: str) -> None:
@@ -109,8 +114,69 @@ def validate_correlation() -> int:
     return n
 
 
+def _walk_compliance(obj, ctx: str, found: list) -> int:
+    """递归查找 compliance 字典，校验键名白名单。"""
+    n = 0
+    if isinstance(obj, dict):
+        comp = obj.get("compliance")
+        if isinstance(comp, dict):
+            for k in comp:
+                if str(k) not in ALLOWED_COMPLIANCE_KEYS:
+                    err(f"{ctx}: 非法 compliance 键 {k}（允许: {sorted(ALLOWED_COMPLIANCE_KEYS)}）")
+                    n += 1
+                else:
+                    found.append(str(k))
+        for v in obj.values():
+            n += _walk_compliance(v, ctx, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            n += _walk_compliance(v, ctx, found)
+    return n
+
+
+def validate_compliance_keys() -> int:
+    """扫描 rules/ 下含 compliance 字段的 JSON（含已生成的 SCA catalog）。"""
+    n = 0
+    found: list = []
+    for p in sorted(RULES_DIR.rglob("*.json")):
+        if p.name.startswith("."):
+            continue
+        data = load_json(p)
+        if data is None:
+            continue
+        n += _walk_compliance(data, str(p.relative_to(ROOT)), found)
+    if found:
+        print(f"合规框架键: {sorted(set(found))}")
+    return n
+
+
+def validate_mitre_versioning() -> int:
+    """校验 ATT&CK 版本登记文件的闭集字段（非法 tid / 非法数据源不得静默生效）。"""
+    p = ROOT / "backend" / "data" / "mitre_versioning.json"
+    if not p.is_file():
+        return 0  # 文件可选，缺省即空模型
+    data = load_json(p)
+    if data is None:
+        return 1
+    try:
+        # 本脚本既可能从项目根以 `python scripts/validate_rules.py` 运行，
+        # 也可能被 CI 以模块方式导入；把项目根显式加入 sys.path 以稳定导入包。
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from backend.mitre import validate_versioning
+        problems = validate_versioning(data)
+    except Exception as e:
+        err(f"mitre_versioning 校验器导入失败: {e}")
+        return 1
+    for msg in problems:
+        err(f"mitre_versioning.json: {msg}")
+    return len(problems)
+
+
 def main() -> int:
     errors = validate_correlation()
+    errors += validate_compliance_keys()
+    errors += validate_mitre_versioning()
     for p in sorted(RULES_DIR.glob("*.json")):
         if p.name.startswith("."):
             continue

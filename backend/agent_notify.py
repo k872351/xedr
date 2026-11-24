@@ -129,9 +129,12 @@ def _dispatch(cfg: Dict[str, Any], event: Dict[str, Any]) -> List[Dict[str, Any]
 
 def _post_json(url: str, payload: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     try:
+        from .ssrf_guard import validate_outbound_url
+        # 通知渠道常见为公网 HTTPS；兼容场景可通过 EDR_SSRF_ALLOW_HTTP=1 放行 http
+        safe_url = validate_outbound_url(url, allow_http=True)
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
-            url,
+            safe_url,
             data=data,
             headers={"Content-Type": "application/json; charset=utf-8"},
             method="POST",

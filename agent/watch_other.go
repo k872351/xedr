@@ -6,7 +6,8 @@ import "context"
 
 type processWatcher struct{}
 
-func newProcessWatcher() *processWatcher { return &processWatcher{} }
+func newProcessWatcher() *processWatcher            { return &processWatcher{} }
 func (w *processWatcher) start(ctx context.Context) {}
 func (w *processWatcher) stop()                     {}
+func (w *processWatcher) activeNow() bool           { return false }
 func (w *processWatcher) drain() []map[string]any   { return nil }

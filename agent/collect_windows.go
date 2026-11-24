@@ -58,6 +58,10 @@ Get-CimInstance Win32_OperatingSystem | ForEach-Object {
 }
 
 func collectServices() ([]any, error) {
+	return collectServicesLimited(maxItems)
+}
+
+func collectServicesLimited(limit int) ([]any, error) {
 	// 优先 CIM（经 UTF-8 落盘），失败再用 SCM API（UTF-16，无乱码）
 	ps := `
 Get-CimInstance Win32_Service | ForEach-Object {
@@ -95,14 +99,14 @@ Get-CimInstance Win32_Service | ForEach-Object {
 	}
 	if len(out) > 0 {
 		enrichPEMeta(out, "path", 40)
-		return applyRiskAndSort(out, "service"), nil
+		return applyRiskAndSortLimited(out, "service", limit), nil
 	}
 	out, err := collectServicesSCM()
 	if err != nil {
 		return out, err
 	}
 	enrichPEMeta(out, "path", 40)
-	return applyRiskAndSort(out, "service"), nil
+	return applyRiskAndSortLimited(out, "service", limit), nil
 }
 
 func collectServicesSCM() ([]any, error) {
@@ -337,14 +341,57 @@ func startupFolders() []startupDir {
 			user:  "AllUsers",
 		})
 	}
+	// Agent 以 SYSTEM 运行，%APPDATA% 指向系统配置文件；要遍历每个真实用户
+	seen := map[string]bool{}
+	for _, up := range userProfiles() {
+		p := filepath.Join(up.dir, `AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup`)
+		seen[strings.ToLower(p)] = true
+		dirs = append(dirs, startupDir{path: p, label: "UserStartup\\" + up.name, user: up.name})
+	}
 	if app := os.Getenv("APPDATA"); app != "" {
-		dirs = append(dirs, startupDir{
-			path:  filepath.Join(app, `Microsoft\Windows\Start Menu\Programs\Startup`),
-			label: "UserStartup",
-			user:  os.Getenv("USERNAME"),
-		})
+		p := filepath.Join(app, `Microsoft\Windows\Start Menu\Programs\Startup`)
+		if !seen[strings.ToLower(p)] {
+			dirs = append(dirs, startupDir{path: p, label: "UserStartup", user: os.Getenv("USERNAME")})
+		}
 	}
 	return dirs
+}
+
+type userProfile struct {
+	sid  string
+	name string
+	dir  string
+}
+
+// userProfiles 本机交互用户的配置文件目录（ProfileList 中 S-1-5-21-*）。
+func userProfiles() []userProfile {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`, registry.ENUMERATE_SUB_KEYS)
+	if err != nil {
+		return nil
+	}
+	defer k.Close()
+	sids, _ := k.ReadSubKeyNames(0)
+	var out []userProfile
+	for _, sid := range sids {
+		if !strings.HasPrefix(sid, "S-1-5-21-") {
+			continue
+		}
+		sk, err := registry.OpenKey(k, sid, registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		dir, _, err := sk.GetStringValue("ProfileImagePath")
+		sk.Close()
+		if err != nil || dir == "" {
+			continue
+		}
+		dir = expandRegPath(dir)
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			continue
+		}
+		out = append(out, userProfile{sid: sid, name: filepath.Base(dir), dir: dir})
+	}
+	return out
 }
 
 func extractExe(cmd string) string {
@@ -643,6 +690,10 @@ $__rows | Select-Object -First 400
 }
 
 func collectUsers() ([]any, error) {
+	return collectUsersLimited(maxItems)
+}
+
+func collectUsersLimited(limit int) ([]any, error) {
 	ps := `
 $__rows = @()
 try {
@@ -692,5 +743,5 @@ $__rows
 		}
 		out = append(out, item)
 	}
-	return truncateItems(out), nil
+	return truncateItemsAt(out, limit), nil
 }

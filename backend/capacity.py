@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import shutil
+import stat
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -21,39 +23,58 @@ def _bytes_h(n: int) -> str:
     return f"{int(n)} B"
 
 
-_DIR_SIZE_CACHE: Dict[str, Any] = {}
+_DIR_SIZE_CACHE: Dict[tuple[str, int], Any] = {}
 _DIR_SIZE_CACHE_TTL = 60.0
+_DIR_SIZE_CACHE_MAX = 32
+_DIR_SIZE_CACHE_LOCK = threading.Lock()
+
+
+def _cache_dir_size(key, result):
+    now = time.monotonic()
+    with _DIR_SIZE_CACHE_LOCK:
+        expired = [k for k, value in _DIR_SIZE_CACHE.items()
+                   if now - value["_at"] >= _DIR_SIZE_CACHE_TTL]
+        for k in expired:
+            _DIR_SIZE_CACHE.pop(k, None)
+        if key not in _DIR_SIZE_CACHE and len(_DIR_SIZE_CACHE) >= _DIR_SIZE_CACHE_MAX:
+            oldest = min(_DIR_SIZE_CACHE, key=lambda k: _DIR_SIZE_CACHE[k]["_at"])
+            _DIR_SIZE_CACHE.pop(oldest, None)
+        _DIR_SIZE_CACHE[key] = {**result, "_at": now}
 
 
 def _dir_size(path: Path, *, limit_files: int = 80_000) -> Dict[str, Any]:
-    key = str(path)
-    now = time.time()
-    hit = _DIR_SIZE_CACHE.get(key)
+    key = (str(path), limit_files)
+    now = time.monotonic()
+    with _DIR_SIZE_CACHE_LOCK:
+        hit = _DIR_SIZE_CACHE.get(key)
     if isinstance(hit, dict) and (now - float(hit.get("_at") or 0)) < _DIR_SIZE_CACHE_TTL:
         out = {k: v for k, v in hit.items() if k != "_at"}
         out["cached"] = True
         return out
     total = 0
     files = 0
+    unreadable = 0
     if not path.exists():
         return {"bytes": 0, "files": 0, "truncated": False}
     try:
         for p in path.rglob("*"):
-            if not p.is_file():
-                continue
             try:
-                total += p.stat().st_size
-                files += 1
+                info = p.stat()
             except OSError:
+                unreadable += 1
+                continue
+            if not stat.S_ISREG(info.st_mode):
                 continue
             if files >= limit_files:
-                result = {"bytes": total, "files": files, "truncated": True}
-                _DIR_SIZE_CACHE[key] = {**result, "_at": now}
+                result = {"bytes": total, "files": files, "truncated": True, "unreadable": unreadable}
+                _cache_dir_size(key, result)
                 return result
+            total += info.st_size
+            files += 1
     except Exception as e:
-        return {"bytes": total, "files": files, "truncated": False, "error": str(e)}
-    result = {"bytes": total, "files": files, "truncated": False}
-    _DIR_SIZE_CACHE[key] = {**result, "_at": now}
+        return {"bytes": total, "files": files, "truncated": False, "unreadable": unreadable, "error": str(e)}
+    result = {"bytes": total, "files": files, "truncated": False, "unreadable": unreadable}
+    _cache_dir_size(key, result)
     return result
 
 
@@ -78,8 +99,8 @@ def _report_counts() -> Dict[str, Any]:
     try:
         ids = P.iter_report_ids(5000)
     except Exception:
-        ids = []
-    return {"reports": len(ids), "sample_cap": 5000}
+        return {"reports": 0, "sample_cap": 5000, "status": "error"}
+    return {"reports": len(ids), "sample_cap": 5000, "status": "partial" if len(ids) >= 5000 else "complete"}
 
 
 def capacity_snapshot(*, with_reports_size: bool = True) -> Dict[str, Any]:
@@ -123,6 +144,13 @@ def capacity_snapshot(*, with_reports_size: bool = True) -> Dict[str, Any]:
     hard = int(cfg.get("job_queue_hard_limit") or 150)
     qdepth = int(qs.get("queued") or 0) + int(qs.get("running") or 0)
     warn: List[str] = []
+    coordination = qs.get("coordination") if isinstance(qs.get("coordination"), dict) else {}
+    if coordination.get("mode") == "degraded_local":
+        warn.append(
+            "Shared MySQL is unavailable; analysis tasks are not safely coordinated across instances."
+        )
+    elif coordination.get("mode") == "single_instance":
+        warn.append("Analysis queue uses local SQLite and supports single-instance coordination only.")
     if qdepth >= hard:
         warn.append("分析队列已达硬限，新上传会被拒绝")
     elif qdepth >= soft:
@@ -153,7 +181,12 @@ def capacity_snapshot(*, with_reports_size: bool = True) -> Dict[str, Any]:
             "size_h": _bytes_h(int(size.get("bytes") or 0)),
             "files": int(size.get("files") or 0),
             "truncated": bool(size.get("truncated")),
+            "skipped": bool(size.get("skipped")),
+            "unreadable": int(size.get("unreadable") or 0),
+            "size_status": "error" if size.get("error") else "skipped" if size.get("skipped") else "partial" if size.get("truncated") or size.get("unreadable") else "complete",
             "report_count": int(counts.get("reports") or 0),
+            "report_count_status": counts["status"],
+            "report_count_sample_cap": counts["sample_cap"],
         },
         "backends": {
             "mysql": mysql_ok,

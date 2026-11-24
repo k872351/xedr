@@ -11,9 +11,6 @@ from typing import Any, Dict, List, Optional
 
 from . import config
 
-_lock = threading.RLock()
-_sync_rev = 1
-
 _CONFIG = Path(__file__).resolve().parent.parent / "config"
 _PTM = _CONFIG / "agent_ptm_rules.json"
 _AR = _CONFIG / "agent_active_response.json"
@@ -35,10 +32,16 @@ def _read_json(path: Path) -> Any:
 
 
 def bump_sync(part: str = "content") -> int:
-    global _sync_rev
-    with _lock:
-        _sync_rev += 1
-        rev = _sync_rev
+    from . import agent_protocol
+    conn = agent_protocol._connect()
+    try:
+        conn.execute("INSERT INTO agent_meta(key,value) VALUES('sync_revision',?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
+                     (str(int(time.time() // 60)),))
+        rev = int(conn.execute("SELECT value FROM agent_meta WHERE key='sync_revision'").fetchone()[0])
+        conn.commit()
+    finally:
+        conn.close()
     try:
         from . import agent_protocol
         agent_protocol.bump_live("sync", part=part, rev=rev)
@@ -48,14 +51,19 @@ def bump_sync(part: str = "content") -> int:
 
 
 def sync_revision() -> int:
-    with _lock:
-        return int(_sync_rev)
+    from . import agent_protocol
+    conn = agent_protocol._connect()
+    try:
+        row = conn.execute("SELECT value FROM agent_meta WHERE key='sync_revision'").fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
 
 
 # 管理台可开关的 Agent 集成项（写入 config/agent_integrations.json → 同步包 integrations）
 INTEGRATION_KEYS = (
     "evm", "ptm", "amsi", "api_etw", "memory_scan", "wmi_process",
-    "etw", "winevent", "fim", "registry", "sca", "rootcheck",
+    "etw", "winevent", "fim", "registry", "sca", "rootcheck", "linux_journal",
 )
 # 仅服务端时间线入库路径使用，不下发 Agent
 SERVER_DETECTION_KEYS = (
@@ -82,6 +90,7 @@ def get_integrations_document() -> Dict[str, Any]:
         "etw": True, "winevent": True, "wmi_process": False, "fim": True, "registry": True,
         "persist": True, "kernel_user": True, "memory_scan": True, "inventory": True,
         "rootcheck": True, "sca": True, "evm": True, "ptm": True, "amsi": True, "api_etw": True,
+        "linux_journal": True,
     }
     for k, v in defs.items():
         if isinstance(v, bool):
@@ -108,6 +117,7 @@ def get_integrations_document() -> Dict[str, Any]:
             "wmi_process": "WMI 进程创建订阅",
             "etw": "原生 ETW 采集",
             "winevent": "Windows 事件日志回退",
+            "linux_journal": "Linux Journald 安全日志",
             "fim": "文件完整性监控",
             "registry": "注册表监控",
             "sca": "SCA 合规扫描",
@@ -256,10 +266,11 @@ def manifest() -> Dict[str, Any]:
         "active_response": _part_static("ar", _AR),
         "integrations": _part_static("integrations", _INT),
     }
-    agg = _sha({"sync_rev": _sync_rev, "parts": parts})[:16]
+    revision = sync_revision()
+    agg = _sha({"sync_rev": revision, "parts": parts})[:16]
     return {
         "ok": True,
-        "sync_rev": sync_revision(),
+        "sync_rev": revision,
         "aggregate_hash": agg,
         "server_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
         "parts": parts,
@@ -312,8 +323,15 @@ def bundle(agent_id: str, since_rev: int = 0, *, parts: Optional[List[str]] = No
                 out["composable_policy_applied"] = pol_rules
         except Exception:
             pass
+        rev = int(pol.get("rev") or 1)
+        try:
+            from . import policy_sign
+            body = policy_sign.attach_policy_signature(body, rev)
+        except Exception:
+            pass
         out["policy"] = body
-        out["policy_rev"] = pol.get("rev")
+        out["policy_rev"] = rev
+        out["dp_crypto"] = agent_edr._dp_crypto_for(agent_id)
 
     if full or "evm" in want:
         out["evm"] = agent_rules.export_evm_document()

@@ -5,9 +5,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,11 +20,15 @@ import (
 )
 
 const (
-	evtSubscribeActionError   = 0
-	evtSubscribeActionDeliver = 1
-	evtSubscribeToFuture      = 1
-	evtRenderEventXML         = 1
-	evtRenderBookmark         = 2
+	evtSubscribeActionError        = 0
+	evtSubscribeActionDeliver      = 1
+	evtSubscribeToFuture           = 1
+	evtSubscribeStartAfterBookmark = 3
+	evtRenderEventXML              = 1
+	evtRenderBookmark              = 2
+	evtQueryChannelPath            = 0x1
+	evtQueryReverseDirection       = 0x200
+	evtQueryTolerateQueryErrors    = 0x1000
 )
 
 var (
@@ -34,9 +40,55 @@ var (
 	procEvtCreateBookmark = modWevtapi.NewProc("EvtCreateBookmark")
 	procEvtUpdateBookmark = modWevtapi.NewProc("EvtUpdateBookmark")
 	procEvtQuery          = modWevtapi.NewProc("EvtQuery")
+	procEvtNext           = modWevtapi.NewProc("EvtNext")
 )
 
-const evtQueryChannelPath = 0x1
+// 各通道投递计数（心跳可观测：Sysmon 已装但仍 EventID=0 时能区分「未订阅」vs「订了没推上来」）
+var (
+	winevtStatsMu sync.Mutex
+	winevtStats   = map[string]map[string]any{}
+)
+
+func winevtNoteStat(id string, key string, add uint64) {
+	winevtStatsMu.Lock()
+	defer winevtStatsMu.Unlock()
+	st := winevtStats[id]
+	if st == nil {
+		st = map[string]any{"id": id}
+		winevtStats[id] = st
+	}
+	cur, _ := st[key].(uint64)
+	st[key] = cur + add
+	st["updated_at"] = time.Now().Format("2006-01-02T15:04:05")
+}
+
+func winevtSetStat(id string, kv map[string]any) {
+	winevtStatsMu.Lock()
+	defer winevtStatsMu.Unlock()
+	st := winevtStats[id]
+	if st == nil {
+		st = map[string]any{"id": id}
+		winevtStats[id] = st
+	}
+	for k, v := range kv {
+		st[k] = v
+	}
+	st["updated_at"] = time.Now().Format("2006-01-02T15:04:05")
+}
+
+func winevtChannelStatsSnapshot() []map[string]any {
+	winevtStatsMu.Lock()
+	defer winevtStatsMu.Unlock()
+	out := make([]map[string]any, 0, len(winevtStats))
+	for _, st := range winevtStats {
+		cp := map[string]any{}
+		for k, v := range st {
+			cp[k] = v
+		}
+		out = append(out, cp)
+	}
+	return out
+}
 
 func winevtTryNative(ctx context.Context, bookmarkDir string, push func(map[string]any)) error {
 	if err := modWevtapi.Load(); err != nil {
@@ -47,15 +99,6 @@ func winevtTryNative(ctx context.Context, bookmarkDir string, push func(map[stri
 	if len(defs) == 0 {
 		return errors.New("no event channels")
 	}
-	var names []string
-	for _, d := range defs {
-		names = append(names, d.ID)
-	}
-	push(map[string]any{
-		"etype": "winevent_status", "summary": "事件通道(native): " + stringsJoin(names, ","),
-		"severity": "info", "ts": time.Now().Format("2006-01-02T15:04:05"),
-		"detail":   map[string]any{"sources": names, "backend": "wevtapi"},
-	})
 
 	var wg sync.WaitGroup
 	for _, ch := range defs {
@@ -115,10 +158,76 @@ func winevtRunChannel(ctx context.Context, bookmarkDir string, ch winevtChannel,
 	}
 }
 
+func winevtBookmarkPath(dir, id string) string {
+	return filepath.Join(dir, id+".xml")
+}
+
+func winevtHasBookmark(dir, id string) bool {
+	fi, err := os.Stat(winevtBookmarkPath(dir, id))
+	return err == nil && fi.Size() > 0
+}
+
+// winevtCatchUpChannel 反向拉取通道近期事件（无书签首次订阅 / Sysmon 刚装好时补时间线）。
+func winevtCatchUpChannel(ch winevtChannel, push func(map[string]any), maxN int) int {
+	if maxN <= 0 {
+		return 0
+	}
+	chPtr, err := windows.UTF16PtrFromString(ch.Channel)
+	if err != nil {
+		return 0
+	}
+	xpPtr, err := windows.UTF16PtrFromString(ch.XPath)
+	if err != nil {
+		return 0
+	}
+	flags := uintptr(evtQueryChannelPath | evtQueryReverseDirection | evtQueryTolerateQueryErrors)
+	h, _, _ := procEvtQuery.Call(0, uintptr(unsafe.Pointer(chPtr)), uintptr(unsafe.Pointer(xpPtr)), flags)
+	if h == 0 {
+		return 0
+	}
+	defer winevtCloseHandle(h)
+
+	n := 0
+	parsed := 0
+	for n < maxN {
+		var evt uintptr
+		var returned uint32
+		r0, _, _ := procEvtNext.Call(h, 1, uintptr(unsafe.Pointer(&evt)), 200, 0, uintptr(unsafe.Pointer(&returned)))
+		if r0 == 0 || returned == 0 || evt == 0 {
+			break
+		}
+		xmlText, err := winevtRenderEventXML(evt)
+		winevtCloseHandle(evt)
+		n++
+		if err != nil {
+			continue
+		}
+		if ev := winevtParseXML(xmlText, ch.Channel); ev != nil {
+			parsed++
+			push(ev)
+		}
+	}
+	winevtSetStat(ch.ID, map[string]any{
+		"channel": ch.Channel, "catchup_scanned": uint64(n), "catchup_parsed": uint64(parsed),
+	})
+	if parsed > 0 {
+		log.Printf("winevent[%s]: catch-up %d/%d events from %s", ch.ID, parsed, n, ch.Channel)
+	}
+	return parsed
+}
+
 func winevtSubscribeOnce(ctx context.Context, bookmarkDir string, ch winevtChannel, push func(map[string]any)) error {
-	deliver := make(chan uintptr, 128)
+	deliver := make(chan uintptr, 2048)
 	var dropped uint32
+	var delivered uint64
+	var sequence uint64
+	progress := &bookmarkProgress{}
 	cb := syscall.NewCallback(func(action, _ /*ctx*/, evt uintptr) uintptr {
+		if action == evtSubscribeActionError {
+			captureAdd("winevent_native", "bookmark_gap", 1)
+			progress.block()
+			return 1
+		}
 		if action != evtSubscribeActionDeliver || evt == 0 {
 			return 1
 		}
@@ -126,10 +235,14 @@ func winevtSubscribeOnce(ctx context.Context, bookmarkDir string, ch winevtChann
 		case deliver <- evt:
 		default:
 			atomic.AddUint32(&dropped, 1)
+			captureAdd("winevent_native", "buffer_dropped", 1)
+			progress.block()
 			procEvtClose.Call(evt)
 		}
 		return 1
 	})
+	// 回调必须对 GC 保持可达，否则订阅会静默停收
+	defer runtime.KeepAlive(cb)
 
 	chPtr, err := windows.UTF16PtrFromString(ch.Channel)
 	if err != nil {
@@ -140,8 +253,25 @@ func winevtSubscribeOnce(ctx context.Context, bookmarkDir string, ch winevtChann
 		return err
 	}
 
+	hadBookmark := winevtHasBookmark(bookmarkDir, ch.ID)
+	// 无书签：先回补近期事件，避免 ToFuture 导致「Sysmon 已装但时间线 EventID=0」
+	if !hadBookmark {
+		limit := 40
+		if ch.ID == "sysmon" {
+			limit = 200
+		} else if ch.ID == "security" {
+			limit = 80
+		}
+		winevtCatchUpChannel(ch, push, limit)
+	}
+
 	bookmark := winevtLoadBookmark(bookmarkDir, ch.ID)
 	defer winevtCloseHandle(bookmark)
+
+	flags := uintptr(evtSubscribeToFuture)
+	if hadBookmark && bookmark != 0 {
+		flags = evtSubscribeStartAfterBookmark
+	}
 
 	sub, _, e1 := procEvtSubscribe.Call(
 		0,
@@ -151,47 +281,107 @@ func winevtSubscribeOnce(ctx context.Context, bookmarkDir string, ch winevtChann
 		bookmark,
 		0,
 		cb,
-		evtSubscribeToFuture,
+		flags,
 	)
 	if sub == 0 {
+		// StartAfterBookmark 失败时回退 ToFuture，避免整通道挂死
+		if flags == evtSubscribeStartAfterBookmark {
+			log.Printf("winevent[%s]: StartAfterBookmark failed (%v), fallback ToFuture", ch.ID, e1)
+			captureAdd("winevent_native", "bookmark_gap", 1)
+			winevtCatchUpChannel(ch, push, 40)
+			sub, _, e1 = procEvtSubscribe.Call(
+				0, 0,
+				uintptr(unsafe.Pointer(chPtr)),
+				uintptr(unsafe.Pointer(xpPtr)),
+				0, 0, cb,
+				evtSubscribeToFuture,
+			)
+			flags = evtSubscribeToFuture
+		}
+	}
+	if sub == 0 {
+		winevtSetStat(ch.ID, map[string]any{"channel": ch.Channel, "subscribe_error": fmt.Sprintf("%v", e1)})
 		if e1 != nil && e1 != syscall.Errno(0) {
 			return e1
 		}
 		return errors.New("EvtSubscribe failed")
 	}
 	defer winevtCloseHandle(sub)
+	winevtSetStat(ch.ID, map[string]any{
+		"channel": ch.Channel, "subscribed": true,
+		"flag": map[bool]string{true: "after_bookmark", false: "to_future"}[flags == evtSubscribeStartAfterBookmark],
+	})
+	push(map[string]any{
+		"etype": "winevent_status", "summary": "Windows Event Log channel active: " + ch.ID,
+		"severity": "info", "ts": time.Now().Format("2006-01-02T15:04:05"),
+		"detail": map[string]any{"source": ch.ID, "channel": ch.Channel, "backend": "wevtapi"},
+	})
+	log.Printf("winevent[%s]: subscribed %s (%s)", ch.ID, ch.Channel,
+		map[bool]string{true: "after_bookmark", false: "to_future"}[flags == evtSubscribeStartAfterBookmark])
 
 	saveTick := time.NewTicker(15 * time.Second)
 	defer saveTick.Stop()
-	eventsSinceSave := 0
+	lastSaved := ""
+	saveConfirmed := func() {
+		xmlText := progress.snapshot()
+		if xmlText == "" || xmlText == lastSaved {
+			return
+		}
+		if winevtSaveBookmarkXML(bookmarkDir, ch.ID, xmlText) {
+			lastSaved = xmlText
+		} else {
+			captureAdd("winevent_native", "bookmark_save_failed", 1)
+		}
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			if bookmark != 0 && eventsSinceSave > 0 {
-				winevtSaveBookmark(bookmarkDir, ch.ID, bookmark)
-			}
+			saveConfirmed()
+			runtime.KeepAlive(cb)
 			return ctx.Err()
 		case <-saveTick.C:
-			if bookmark != 0 && eventsSinceSave > 0 {
-				winevtSaveBookmark(bookmarkDir, ch.ID, bookmark)
-				eventsSinceSave = 0
-			}
+			saveConfirmed()
 			if d := atomic.SwapUint32(&dropped, 0); d > 0 {
+				winevtNoteStat(ch.ID, "dropped", uint64(d))
 				log.Printf("winevent[%s]: dropped %d events (queue full)", ch.ID, d)
 			}
+			runtime.KeepAlive(cb)
 		case h := <-deliver:
+			sequence++
+			captureAdd("winevent_native", "received", 1)
 			xmlText, err := winevtRenderEventXML(h)
+			checkpoint := ""
 			if bookmark != 0 {
-				_, _, _ = procEvtUpdateBookmark.Call(bookmark, h)
-				eventsSinceSave++
+				if ok, _, _ := procEvtUpdateBookmark.Call(bookmark, h); ok != 0 {
+					checkpoint, _ = winevtRenderBookmark(bookmark)
+				}
 			}
 			procEvtClose.Call(h)
 			if err != nil {
+				winevtNoteStat(ch.ID, "render_err", 1)
+				captureAdd("winevent_native", "render_failed", 1)
+				progress.block()
 				continue
 			}
 			if ev := winevtParseXML(xmlText, ch.Channel); ev != nil {
+				if checkpoint != "" {
+					seq := sequence
+					ev[bookmarkAckKey] = func() { progress.acknowledge(seq, checkpoint) }
+				} else {
+					progress.block()
+					captureAdd("winevent_native", "bookmark_gap", 1)
+				}
+				delivered++
+				winevtNoteStat(ch.ID, "delivered", 1)
+				if delivered == 1 || delivered%50 == 0 {
+					log.Printf("winevent[%s]: delivered %d events", ch.ID, delivered)
+				}
 				push(ev)
+			} else {
+				winevtNoteStat(ch.ID, "parsed_nil", 1)
+				progress.block()
+				captureAdd("winevent_native", "parse_failed", 1)
 			}
 		}
 	}
@@ -217,20 +407,28 @@ func winevtLoadBookmark(dir, id string) uintptr {
 	return h
 }
 
-func winevtSaveBookmark(dir, id string, bookmark uintptr) {
-	if bookmark == 0 {
-		return
-	}
-	xmlText, err := winevtRenderBookmark(bookmark)
-	if err != nil || xmlText == "" {
-		return
+func winevtSaveBookmarkXML(dir, id, xmlText string) bool {
+	if xmlText == "" {
+		return false
 	}
 	path := filepath.Join(dir, id+".xml")
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(xmlText), 0600); err != nil {
-		return
+	tmp, err := os.CreateTemp(dir, ".bookmark-*.tmp")
+	if err != nil {
+		return false
 	}
-	_ = os.Rename(tmp, path)
+	name := tmp.Name()
+	defer os.Remove(name)
+	defer tmp.Close()
+	if _, err := tmp.WriteString(xmlText); err != nil {
+		return false
+	}
+	if err := tmp.Sync(); err != nil {
+		return false
+	}
+	if err := tmp.Close(); err != nil {
+		return false
+	}
+	return os.Rename(name, path) == nil
 }
 
 func winevtRenderBookmark(bookmark uintptr) (string, error) {

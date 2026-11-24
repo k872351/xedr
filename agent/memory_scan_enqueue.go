@@ -5,6 +5,23 @@ import (
 	"strings"
 )
 
+// enqueueDropScanAlert 落地扫描结论为恶意时额外上报威胁事件（时间线照常走 pushTimeline）。
+func enqueueDropScanAlert(box *outbox, agentID string, ev map[string]any) {
+	if box == nil || ev == nil || asString(ev["etype"]) != "file_scan" {
+		return
+	}
+	d, _ := ev["detail"].(map[string]any)
+	if d == nil || asString(d["verdict"]) != "malicious" {
+		return
+	}
+	detailBytes, _ := json.Marshal(d)
+	box.enqueue(outEvent, 91, map[string]any{
+		"agent_id": agentID, "hostname": hostname(),
+		"module": "file_scan", "severity": asString(ev["severity"]),
+		"title": asString(ev["summary"]), "detail": string(detailBytes),
+	})
+}
+
 func enqueueMemoryFindings(box *outbox, agentID string, res map[string]any) {
 	if box == nil || res == nil {
 		return

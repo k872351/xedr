@@ -41,6 +41,8 @@ func (w *persistWatcher) drain() []map[string]any {
 }
 
 func (w *persistWatcher) tick() {
+	finishWork := beginComponentWork("persist")
+	defer finishWork()
 	w.mu.Lock()
 	on := w.enabled
 	w.mu.Unlock()
@@ -55,8 +57,68 @@ func (w *persistWatcher) tick() {
 		w.scanRegistry(cur)
 	}
 	w.scanStartupFiles(cur)
+	w.scanPSProfiles(cur)
 	w.scanHosts(cur)
 	w.diff(cur)
+}
+
+// psProfilePaths PowerShell 配置文件：每次启动 PowerShell 都会执行（T1546.013）。
+func psProfilePaths() []string {
+	names := []string{"profile.ps1", "Microsoft.PowerShell_profile.ps1", "Microsoft.PowerShellISE_profile.ps1", "Microsoft.VSCode_profile.ps1"}
+	var dirs []string
+	if root := os.Getenv("SystemRoot"); root != "" {
+		dirs = append(dirs,
+			filepath.Join(root, `System32\WindowsPowerShell\v1.0`),
+			filepath.Join(root, `SysWOW64\WindowsPowerShell\v1.0`),
+		)
+	}
+	if pf := os.Getenv("ProgramFiles"); pf != "" {
+		dirs = append(dirs, filepath.Join(pf, `PowerShell\7`))
+	}
+	for _, up := range userProfiles() {
+		for _, docs := range []string{filepath.Join(up.dir, "Documents"), filepath.Join(up.dir, `OneDrive\Documents`)} {
+			dirs = append(dirs, filepath.Join(docs, "WindowsPowerShell"), filepath.Join(docs, "PowerShell"))
+		}
+	}
+	var out []string
+	for _, d := range dirs {
+		for _, n := range names {
+			out = append(out, filepath.Join(d, n))
+		}
+	}
+	return out
+}
+
+func (w *persistWatcher) scanPSProfiles(cur map[string]string) {
+	for _, p := range psProfilePaths() {
+		fi, err := os.Stat(p)
+		if err != nil || fi.IsDir() {
+			continue
+		}
+		cur["PSProfile\\"+p] = fmt.Sprintf("%d|%d", fi.Size(), fi.ModTime().Unix())
+	}
+}
+
+func enrichPersistPSProfile(ev map[string]any, key string) {
+	if !strings.HasPrefix(key, "PSProfile\\") {
+		return
+	}
+	d, _ := ev["detail"].(map[string]any)
+	if d == nil {
+		return
+	}
+	p := strings.TrimPrefix(key, "PSProfile\\")
+	d["path"] = p
+	d["category"] = "persistence"
+	d["label"] = "PowerShell Profile"
+	d["mitre"] = []string{"T1546.013"}
+	if b, err := os.ReadFile(p); err == nil {
+		if len(b) > 600 {
+			b = b[:600]
+		}
+		d["content_preview"] = string(b)
+	}
+	ev["summary"] = "PowerShell Profile 变更: " + p
 }
 
 func (w *persistWatcher) setRegistryRealtime(on bool) {
@@ -91,6 +153,7 @@ func (w *persistWatcher) diff(cur map[string]string) {
 				"detail": map[string]any{"key": k, "value": v, "source": "persist_watch"},
 			}
 			enrichPersistStartupPayload(ev, k, v)
+			enrichPersistPSProfile(ev, k)
 			w.events = append(w.events, ev)
 		} else if old != v {
 			ev := map[string]any{
@@ -98,6 +161,7 @@ func (w *persistWatcher) diff(cur map[string]string) {
 				"detail": map[string]any{"key": k, "value": v, "old_value": old, "source": "persist_watch"},
 			}
 			enrichPersistStartupPayload(ev, k, v)
+			enrichPersistPSProfile(ev, k)
 			w.events = append(w.events, ev)
 		}
 	}
@@ -256,6 +320,7 @@ func (w *persistWatcher) startLoop(ctx context.Context) {
 	// 首次建基线
 	w.tick()
 	t := time.NewTicker(12 * time.Second)
+	recordComponentObservation("persist", cStateHealthy, "persistence baseline scan completed")
 	defer t.Stop()
 	log.Printf("persist: 持久化监控已启动")
 	for {
@@ -264,6 +329,7 @@ func (w *persistWatcher) startLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			w.tick()
+			recordComponentObservation("persist", cStateHealthy, "persistence baseline scan active")
 		}
 	}
 }

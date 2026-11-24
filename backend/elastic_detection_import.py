@@ -140,10 +140,12 @@ def _severity(rule: Dict[str, Any]) -> str:
 
 def _elastic_id(rule: Dict[str, Any], rel: str) -> str:
     rid = str(rule.get("rule_id") or "").strip()
+    platform = str(rel or "").replace("\\", "/").split("/", 1)[0].lower()
+    suffix = "-linux" if platform == "linux" else ""
     if rid:
-        return f"elastic-{rid.split('-')[0]}"
+        return f"elastic-{rid.split('-')[0]}{suffix}"
     stem = Path(rel).stem[:48]
-    return f"elastic-{stem}"
+    return f"elastic-{stem}{suffix}"
 
 
 def _extract_literals(query: str) -> List[str]:
@@ -441,6 +443,23 @@ def _find_toml_by_elastic_id(elastic_id: str) -> Optional[Tuple[Path, Dict[str, 
     return None
 
 
+def _toml_rule_index() -> Dict[str, Tuple[Path, Dict[str, Any]]]:
+    """Build one ID index for bulk imports instead of rescanning every TOML per ID."""
+    base = Path(config.RULES_DIR)
+    index: Dict[str, Tuple[Path, Dict[str, Any]]] = {}
+    for path in iter_toml_files():
+        doc = _parse_toml(path)
+        rule = doc.get("rule") if isinstance(doc, dict) else None
+        if not isinstance(rule, dict):
+            continue
+        try:
+            rel = str(path.relative_to(base)).replace("\\", "/")
+        except ValueError:
+            rel = path.name
+        index.setdefault(_elastic_id(rule, rel), (path, rule))
+    return index
+
+
 def import_rules(
     rule_ids: List[str],
     *,
@@ -473,9 +492,10 @@ def import_rules(
             existing_evm = []
 
     evm_by_id = {str(r.get("id")): r for r in existing_evm if isinstance(r, dict)}
+    rule_index = _toml_rule_index()
 
     for rid in rule_ids:
-        found = _find_toml_by_elastic_id(rid)
+        found = rule_index.get(str(rid or "").strip())
         if not found:
             skipped.append({"id": rid, "reason": "未找到 TOML"})
             continue

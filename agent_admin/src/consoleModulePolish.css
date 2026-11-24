@@ -1,0 +1,188 @@
+/* Module presentation: preserve the existing controls and data flow. */
+.workspace[data-page] { --module-surface: #f7f9fc; --module-divider: #e2eaf1; }
+.workspace[data-page] .page > .page-hd { gap: 16px; }
+.workspace[data-page] .page > .page-hd > div:first-child { min-width: 0; }
+.workspace[data-page] .page > .page-hd .desc { max-width: 78ch; }
+
+/* Detection: align filters and maintain readable evidence tables. */
+.app .workspace:is([data-page="events"], [data-page="malware"], [data-page="timeline"], [data-page="investigate"], [data-page="dns"], [data-page="behaviors"]) .evt-filter-bar {
+  padding: 14px 16px; border: 1px solid var(--console-border); border-radius: 12px; background: #fff; margin-bottom: 12px;
+}
+.app .workspace .evt-fl { flex: 1 1 140px; min-width: 0; }
+.app .workspace .evt-fl > .field { width: 100%; min-width: 0; }
+.app .workspace .evt-fl.grow { flex: 2 1 220px; }
+.app .workspace .evt-fl-acts { flex-wrap: wrap; }
+.app .workspace .events-page .focus-card { border-radius: 10px; padding: 10px 12px; }
+.app .workspace .events-page .focus-card.on { background: #e8f5f8; border-color: #83bdce; }
+.app .workspace .events-page .table-scroll .evt-table { min-width: 680px; }
+.app .workspace :is(.inv-detail, .dns-detail, .ed-card) { border-radius: 10px; }
+.app .workspace :is(.inv-dbody, .dns-detail-sec) { padding-inline: 16px; }
+.app .workspace .dns-summary { padding: 12px 16px; border: 1px solid var(--module-divider); border-radius: 10px; background: #fff; }
+.app .workspace .dns-summary .mal-stat { min-width: 100px; }
+
+/* Rules: distinct catalog and editor surfaces, aligned action groups. */
+.app .workspace .rules-toolbar { padding: 14px; background: #f7f9fc; }
+.app .workspace .rules-bulk-bar { gap: 10px; flex-wrap: wrap; }
+.app .workspace .rules-bulk-card { border-radius: 9px; padding: 10px; }
+.app .workspace .rules-filter-row { flex-wrap: wrap; }
+.app .workspace .rules-layout > .panel { min-width: 0; }
+.app .workspace .rule-editor > h3 { background: #f7fafc; font-size: 15px; }
+.app .workspace .rule-editor-actions { border-top: 1px solid var(--module-divider); padding: 12px 16px; background: #fff; }
+.app .workspace .rule-platform-heading td { position: relative; }
+
+/* Assets: calm status cards and stable table alignment. */
+.app .workspace .host-summary { gap: 12px; }
+.app .workspace .host-summary .hs { min-width: 0; padding: 12px 16px; border-radius: 12px; }
+.app .workspace .host-group-bar { padding: 10px 14px; background: #fff; }
+.app .workspace .host-group-bar .hg-chip { border-radius: 8px; }
+.app .workspace .host-table { overflow-x: auto; }
+.app .workspace .host-table :is(.ht-head, .ht-row) { min-width: 900px; }
+.app .workspace .host-table .ht-head { background: #edf2f7; }
+.app .workspace .host-table .ht-group-hd { background: #f5f8fb; }
+.app .workspace .host-hdr { padding: 18px 20px; }
+.app .workspace .groups-layout { gap: 16px; }
+.app .workspace .groups-editor { border-top: 3px solid #8aafc3; }
+.app .workspace .groups-pick-list { border-radius: 9px; background: #f8fafc; }
+
+/* Deployment and configuration: readable form cards and consistent spacing. */
+.app .workspace .deploy-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+.app .workspace .deploy-grid > .panel { padding: 20px; }
+.app .workspace .deploy-grid > .panel > h3 { font-size: 16px; color: #243e54; margin: 0 0 12px; padding-bottom: 12px; border-bottom: 1px solid var(--module-divider); }
+.app .workspace .deploy-grid .rel-box { border-radius: 10px; background: #f7f9fc; padding: 14px; }
+.app .workspace .deploy-grid .rel-act { flex-wrap: wrap; }
+.app .workspace .deploy-grid .arch-picker { background: #f7f9fc; }
+.app .workspace .deploy-grid > .linux-package { margin-top: 0; }
+.app .workspace[data-page="deploy"] .deploy-grid-2 .linux-package { margin-top: 0; }
+.app .workspace .settings-stack { gap: 16px; }
+.app .workspace .settings-stack > .panel { padding: 18px 20px; border-left: 1px solid var(--console-border); }
+.app .workspace .settings-addr-row { gap: 12px; flex-wrap: wrap; }
+.app .workspace .settings-addr-acts { flex-wrap: wrap; }
+.app .workspace[data-page="policy"] .panel.pad > h3,
+.app .workspace:is([data-page="accounts"], [data-page="notify"], [data-page="storage"]) .panel.pad > h3 { color: #243e54; margin-top: 0; padding-bottom: 12px; border-bottom: 1px solid var(--module-divider); }
+.app .workspace:is([data-page="accounts"], [data-page="notify"], [data-page="storage"], [data-page="audit"]) .panel.pad { padding: 18px 20px; }
+
+@container (max-width: 900px) {
+  .app .workspace .deploy-grid { grid-template-columns: minmax(0, 1fr); }
+  .app .workspace .evt-fl { flex-basis: 160px; }
+  .app .workspace .evt-fl.grow { flex-basis: 200px; }
+  .app .workspace .host-summary .hs { padding: 10px; }
+}
+@container (max-width: 560px) {
+  .app .workspace .evt-fl, .app .workspace .evt-fl.grow { flex-basis: 100%; }
+  .app .workspace .deploy-grid > .panel, .app .workspace .settings-stack > .panel { padding: 14px; }
+}
+
+/* Content layout: give tables the remaining viewport, not fixed-height cards. */
+.app .workspace .page { min-height: 0; flex: 1 1 0; }
+.app .workspace .page > .page-hd { flex: 0 0 auto; }
+.app .workspace .record-panel { display: flex; flex-direction: column; flex: 1 1 0; min-height: 200px; overflow: hidden; padding: 0; }
+.app .workspace .record-panel > .panel-hd { flex-shrink: 0; }
+.record-count { font-size: 12px; color: #60778a; background: #eef4f8; padding: 4px 9px; border-radius: 6px; font-variant-numeric: tabular-nums; }
+.app .workspace .record-table { flex: 1 1 0; min-height: 0; overflow: auto; border-radius: 0; }
+.app .workspace .record-table > table { width: 100%; }
+.record-empty { flex: 1 1 0; min-height: 160px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 24px; color: #536b80; text-align: center; }
+.record-empty-mark { width: 48px; height: 48px; display: grid; place-items: center; border: 1px solid #d6e5ee; border-radius: 14px; background: #edf5fa; color: #658fa6; font-size: 24px; }
+.record-empty strong { font-size: 15px; color: #344e63; }
+.record-empty p { margin: 0; font-size: 12px; color: #708397; }
+.record-footer { flex-shrink: 0; margin: 0; padding: 12px 16px; border-top: 1px solid var(--module-divider); background: #f8fafc; }
+.app .workspace[data-page="resp-results"] .resp-results-split { flex: 1 1 0; min-height: 200px; }
+.app .workspace[data-page="resp-results"] .resp-results-split > .record-panel { height: 100%; min-height: 0; overflow: hidden; }
+.app .workspace[data-page="storage"] .storage-results { display: flex; flex-direction: column; flex: 1 1 0; min-height: 220px; }
+.app .workspace[data-page="storage"] .storage-results > h3 { margin-top: 0; }
+.app .workspace[data-page="storage"] .host-summary { flex-shrink: 0; }
+.app .workspace .hunt-page > .panel.pad { flex-shrink: 0; }
+.app .workspace .host-table > .empty, .app .workspace .dns-table-panel > .empty { flex: 1; min-height: 160px; display: grid; align-content: center; justify-items: center; }
+.app .workspace .mod-list-panel > .mod-empty { flex: 1; justify-content: center; }
+.app .workspace .overview .ov-body { flex: 1 0 300px; }
+.app .workspace .overview .ov-host-list, .app .workspace .overview .ov-threat-scroll { max-height: none; }
+.app .workspace .overview .ov-body { min-height: 300px; }
+.app .workspace .overview .ov-bottom-grid > .panel { min-height: 220px; }
+.app .workspace .groups-pick-list { max-height: none; }
+.app .workspace[data-page="deploy"] .deploy-grid { align-items: start; grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr); }
+/* 禁止 span/叠层，避免挡住 Windows 下载按钮 */
+.app .workspace[data-page="notify"] .notify-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; gap: 18px 24px; min-height: 0; }
+.notify-form-heading, .notify-settings > .row, .notify-settings > .notify-results { grid-column: 1 / -1; }
+.notify-form-heading { padding-bottom: 12px; border-bottom: 1px solid var(--module-divider); }
+.notify-form-heading h3, .notify-form-heading p { margin: 0; }
+.notify-settings > label { min-width: 0; margin: 0; }
+.notify-settings > .row { padding-top: 12px; border-top: 1px solid var(--module-divider); }
+@container (max-width: 900px) {
+  .app .workspace[data-page="deploy"] .deploy-grid { grid-template-columns: minmax(0, 1fr); }
+  .app .workspace[data-page="deploy"] .deploy-grid:has(> article:nth-child(3)) > article:first-child { grid-row: auto; }
+  .app .workspace[data-page="deploy"] .deploy-grid > article:last-child { grid-column: auto; }
+  .app .workspace[data-page="notify"] .notify-settings { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Deployment: white work surface, content-sized cards (no empty gray hole). */
+.app .workspace .deployment-page,
+.app .workspace .upgrade-page {
+  overflow: auto;
+  background: #fff;
+}
+.app .workspace[data-page="deploy"] .deployment-page > .panel,
+.app .workspace[data-page="deploy"] .deployment-page .deploy-stack .panel {
+  background: #fff;
+}
+.deployment-grid { flex: 1 0 auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: auto 1fr; gap: 16px; align-content: stretch; }
+.app .workspace .deployment-card { min-width: 0; padding: 22px; border-top: 3px solid #9ab9ca; }
+.app .workspace .deployment-card.windows-package { border-top-color: #397ebd; }
+.app .workspace .deployment-card.linux-package { border-top-color: #198b87; }
+.deployment-card-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 15px; padding-bottom: 14px; border-bottom: 1px solid var(--module-divider); }
+.deployment-card-heading h3 { margin: 0; font-size: 17px; color: #243e54; }
+.deployment-card-heading small { display: block; color: #668094; font-size: 12px; margin-top: 3px; }
+.os-mark { width: 42px; height: 42px; flex: 0 0 42px; display: grid; place-items: center; border-radius: 10px; }
+.os-mark svg { width: 24px; height: 24px; }
+.windows-mark { color: #276eb4; background: #eaf2fd; }
+.linux-mark { color: #147977; background: #e7f5f3; }
+.deployment-card > p { color: #607388; line-height: 1.65; }
+.deployment-card .rel-box { overflow-wrap: anywhere; background: #f7f9fc; }
+.deployment-card .linux-package .rel-act, .deployment-card.linux-package .rel-act { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.deployment-card.linux-package .rel-act .btn { min-height: 44px; white-space: normal; }
+.deployment-card > h3 { margin-top: 0; padding-bottom: 12px; border-bottom: 1px solid var(--module-divider); font-size: 16px; }
+.deployment-card .rel-act { flex-wrap: wrap; }
+.deployment-empty { margin: 12px 0 0; color: #71869a; padding: 12px; text-align: center; border: 1px dashed #d6e2ed; border-radius: 8px; background: #f8fafc; }
+.install-guide ol { margin: 8px 0 0; padding-left: 1.4em; line-height: 1.8; color: #425a70; }
+.install-guide li { padding: 5px 0; }
+.deployment-feedback { flex-shrink: 0; padding: 10px 14px; margin-bottom: 12px; border-radius: 8px; color: #176477; background: #e9f5f8; border: 1px solid #c7e5eb; }
+.deployment-feedback.is-error { color: #a52b2b; background: #fff2f2; border-color: #f1caca; }
+
+/* Upgrade: clear metric strip, two form cards and separate record surfaces. */
+.upgrade-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; flex-shrink: 0; margin-bottom: 14px; }
+.app .workspace .upgrade-metric { padding: 12px 16px; border-left: 3px solid #82a9c0; display: flex; flex-direction: column; gap: 3px; }
+.app .workspace .upgrade-metric:nth-child(3) { border-left-color: #20a178; }
+.app .workspace .upgrade-metric:nth-child(4) { border-left-color: #087d9b; }
+.upgrade-metric > span { color: #526a80; font-size: 12px; font-weight: 600; }
+.upgrade-metric > strong { font-size: 26px; line-height: 1.2; font-variant-numeric: tabular-nums; color: #25445c; }
+.upgrade-metric > small { color: #748698; font-size: 11px; }
+.upgrade-form-grid { display: grid; grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr); gap: 14px; flex-shrink: 0; margin-bottom: 14px; }
+.app .workspace .upgrade-form-card { min-width: 0; padding: 16px 18px; }
+.upgrade-card-title { display: flex; align-items: center; gap: 10px; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid var(--module-divider); }
+.upgrade-card-title > span { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; background: #e7f3f7; color: #087d9b; font-weight: 700; }
+.upgrade-card-title > h3 { margin: 0; font-size: 15px; color: #27465d; }
+.upgrade-form-card input[type="file"] { display: block; width: 100%; max-width: 100%; padding: 8px; border: 1px dashed #cbdce7; border-radius: 8px; background: #f7fafc; }
+.upgrade-form-card .row { flex-wrap: wrap; }
+.upgrade-form-card .up-hosts { max-height: 168px; min-height: 82px; overflow: auto; }
+.upgrade-record-grid { display: flex; flex-direction: column; gap: 0; flex: 1 0 auto; min-height: 220px; }
+.upgrade-record-tabs { display: flex; flex-wrap: wrap; gap: 5px; padding: 7px 8px 0; border: 1px solid var(--console-border); border-bottom: 0; border-radius: 12px 12px 0 0; background: #fff; }
+.upgrade-record-tabs button { padding: 10px 14px; background: transparent; border: 0; border-bottom: 3px solid transparent; color: #536b80; font-weight: 600; }
+.upgrade-record-tabs button.on { border-bottom-color: #087d9b; color: #087d9b; background: #edf7fa; border-radius: 7px 7px 0 0; }
+.upgrade-record-tabs button span { margin-left: 5px; font-size: 11px; color: #647a8f; font-variant-numeric: tabular-nums; }
+.app .workspace .upgrade-record-grid > .upgrade-record { flex: 1; border-radius: 0 0 12px 12px; }
+.app .workspace .upgrade-record { display: flex; flex-direction: column; min-width: 0; min-height: 150px; overflow: hidden; }
+.upgrade-record > .panel-hd { flex-shrink: 0; }
+.upgrade-record-note { color: #63798e; font-size: 12px; margin: 0; padding: 9px 16px; border-bottom: 1px solid var(--module-divider); }
+.upgrade-record > .table-scroll { flex: 1 1 auto; min-height: 0; max-height: 300px; overflow: auto; border-radius: 0; }
+.upgrade-record table { width: 100%; }
+.upgrade-record table td { overflow-wrap: anywhere; }
+.upgrade-fleet-record, .upgrade-diag-record { grid-column: 1 / -1; }
+.upgrade-fleet-record table { min-width: 850px; }
+.upgrade-empty { min-height: 78px; flex: 1; display: grid; place-items: center; text-align: center; padding: 18px; color: #74879a; font-size: 13px; }
+@container (max-width: 900px) {
+  .deployment-grid, .upgrade-form-grid, .upgrade-record-grid { grid-template-columns: minmax(0, 1fr); }
+  .deployment-grid { grid-template-rows: auto; }
+  .upgrade-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .app .workspace .deployment-card { padding: 16px; }
+}
+@container (max-width: 460px) {
+  .deployment-card.linux-package .rel-act { grid-template-columns: minmax(0, 1fr); }
+}

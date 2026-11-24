@@ -38,12 +38,16 @@ func processUsage() (cpu100ns uint64, rss uint64, handles uint32) {
 	}
 	var pmc processMemoryCounters
 	pmc.cb = uint32(unsafe.Sizeof(pmc))
-	if r, _, _ := procGetProcessMemInfo.Call(uintptr(h), uintptr(unsafe.Pointer(&pmc)), uintptr(pmc.cb)); r != 0 {
-		rss = uint64(pmc.WorkingSetSize)
+	if procGetProcessMemInfo.Find() == nil {
+		if r, _, _ := procGetProcessMemInfo.Call(uintptr(h), uintptr(unsafe.Pointer(&pmc)), uintptr(pmc.cb)); r != 0 {
+			rss = uint64(pmc.WorkingSetSize)
+		}
 	}
 	var hc uint32
-	if r, _, _ := procGetProcessHandleCnt.Call(uintptr(h), uintptr(unsafe.Pointer(&hc))); r != 0 {
-		handles = hc
+	if procGetProcessHandleCnt.Find() == nil {
+		if r, _, _ := procGetProcessHandleCnt.Call(uintptr(h), uintptr(unsafe.Pointer(&hc))); r != 0 {
+			handles = hc
+		}
 	}
 	return
 }

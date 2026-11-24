@@ -9,7 +9,8 @@
   "disabled_string_rule_ids": [
     "mem.mimikatz",
     "mem.cobalt_strike",
-    "mem.amsi_bypass"
+    "mem.amsi_bypass",
+    "mem.powershell_enc"
   ],
-  "updated_at": "2026-11-06T11:10:26"
+  "updated_at": "2026-11-11T16:26:53"
 }

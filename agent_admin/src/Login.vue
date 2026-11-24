@@ -4,14 +4,13 @@
       <div class="lg-grid" />
       <div class="lg-brand-in">
         <div class="lg-logo">
-          <span class="lg-mark">
-            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.8-7 9-4-1.2-7-4.5-7-9V6l7-3z" /><path d="M9 12l2 2 4-4" /></svg>
-          </span>
+          <img class="lg-mark" src="/logo.png" alt="xedr" />
           <div>
-            <strong>EDR 终端安全</strong>
+            <strong>xedr</strong>
             <em>Endpoint Detection &amp; Response</em>
           </div>
         </div>
+        <p class="lg-badge">xedr Console</p>
         <h1>终端检测与响应<br />管理后台</h1>
         <p class="lg-sub">实时采集 · 威胁检测 · 一键处置，终端风险一屏掌握。</p>
         <ul class="lg-feats">
@@ -26,7 +25,7 @@
     <section class="lg-side">
       <form v-if="mode === 'login'" class="lg-card" @submit.prevent="doLogin">
         <h2>登录</h2>
-        <p class="lg-hint">使用 EDR 后台账号登录</p>
+        <p class="lg-hint">使用 xedr 后台账号登录</p>
         <label class="lg-field">
           <span>用户名</span>
           <input v-model.trim="username" autocomplete="username" autofocus placeholder="请输入用户名" />
@@ -42,7 +41,7 @@
         <button class="lg-btn" type="submit" :disabled="busy || !username || !password">
           {{ busy ? '登录中…' : '登 录' }}
         </button>
-        <p class="lg-note">忘记密码请联系 EDR 管理员重置</p>
+        <p class="lg-note">忘记密码请联系 xedr 管理员重置</p>
       </form>
 
       <form v-else class="lg-card" @submit.prevent="doChange">
@@ -124,12 +123,13 @@ async function doChange() {
 <style scoped>
 .lg {
   min-height: 100%; display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(400px, 1fr);
-  background: #f5f7fb;
+  background: var(--bg);
 }
 .lg-brand {
-  position: relative; overflow: hidden; color: #c9d6ea;
-  background: radial-gradient(1200px 600px at 10% 0%, #1e3a8a 0%, transparent 60%),
-              linear-gradient(160deg, #0a101c 0%, #111b2e 55%, #0c1322 100%);
+  position: relative; overflow: hidden; color: #d4b4a6;
+  background:
+    radial-gradient(900px 600px at 10% 0%, rgba(226, 86, 44, .22) 0%, transparent 60%),
+    linear-gradient(160deg, #25282e 0%, #1c1f24 55%, #15171c 100%);
   display: flex; align-items: center;
 }
 .lg-grid {
@@ -141,10 +141,15 @@ async function doChange() {
   mask-image: radial-gradient(ellipse at 30% 40%, #000 30%, transparent 75%);
 }
 .lg-brand-in { position: relative; padding: 56px 9%; max-width: 640px; }
+.lg-badge {
+  display: inline-flex; margin: 0 0 14px; padding: 4px 10px; border-radius: 999px;
+  font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: #f47a52; background: rgba(226, 86, 44, .14); border: 1px solid rgba(244, 122, 82, .35);
+}
 .lg-logo { display: flex; align-items: center; gap: 12px; margin-bottom: 56px; }
 .lg-mark {
-  width: 42px; height: 42px; border-radius: 12px; color: #fff; display: grid; place-items: center;
-  background: linear-gradient(145deg, #3b82f6, #1d4ed8); box-shadow: 0 8px 22px rgba(37, 99, 235, .45);
+  width: 44px; height: 44px; border-radius: 12px; display: block; object-fit: cover;
+  box-shadow: 0 8px 22px rgba(37, 99, 235, .45);
 }
 .lg-logo strong { display: block; color: #f1f5fb; font-size: 16px; letter-spacing: .02em; }
 .lg-logo em { font-style: normal; font-size: 11px; color: #7f93b2; letter-spacing: .06em; }
@@ -173,7 +178,7 @@ async function doChange() {
   width: 100%; height: 42px; padding: 0 12px; border-radius: 10px; border: 1px solid #d8dfea;
   background: #fbfcfe; outline: none; transition: border-color .15s, box-shadow .15s;
 }
-.lg-field input:focus { border-color: #3b82f6; background: #fff; box-shadow: 0 0 0 3px rgba(59, 130, 246, .15); }
+.lg-field input:focus { border-color: var(--accent); background: #fff; box-shadow: 0 0 0 3px rgba(226, 86, 44, .15); }
 .lg-pw { position: relative; }
 .lg-pw input { padding-right: 56px; }
 .lg-eye {
@@ -187,10 +192,10 @@ async function doChange() {
 }
 .lg-btn {
   width: 100%; height: 44px; border: 0; border-radius: 10px; color: #fff; font-weight: 700; font-size: 15px;
-  background: linear-gradient(135deg, #3b82f6, #2563eb); box-shadow: 0 6px 18px rgba(37, 99, 235, .3);
-  transition: filter .15s, transform .05s;
+  background: var(--accent); box-shadow: 0 6px 18px rgba(226, 86, 44, .28);
+  transition: filter .15s, transform .05s, background .12s;
 }
-.lg-btn:hover:not(:disabled) { filter: brightness(1.06); }
+.lg-btn:hover:not(:disabled) { background: var(--accent-2); filter: brightness(1.02); }
 .lg-btn:active:not(:disabled) { transform: translateY(1px); }
 .lg-btn:disabled { opacity: .55; cursor: not-allowed; box-shadow: none; }
 .lg-note { margin: 18px 0 0; text-align: center; font-size: 12px; color: var(--muted); }
@@ -198,6 +203,14 @@ async function doChange() {
   display: block; margin: 14px auto 0; border: 0; background: transparent; color: var(--muted); font-size: 12px;
 }
 .lg-link:hover { color: var(--accent); }
+.lg-link:focus-visible, .lg-eye:focus-visible, .lg-btn:focus-visible {
+  outline: 2px solid #2563eb; outline-offset: 3px;
+}
+.lg-card { border: 1px solid #dce5ed; box-shadow: 0 18px 55px rgba(18, 52, 76, .12); }
+.lg-field input { transition: border-color .15s, box-shadow .15s, background .15s; }
+@media (prefers-reduced-motion: reduce) {
+  .lg *, .lg *::before, .lg *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
 
 @media (max-width: 900px) {
   .lg { grid-template-columns: 1fr; }
@@ -207,4 +220,25 @@ async function doChange() {
   .lg-side { padding: 16px; }
   .lg-card { padding: 28px 20px 22px; }
 }
+
+/* Tech-console visual layer — presentation only */
+.lg { background: #f4f5f7; }
+.lg-brand {
+  background:
+    radial-gradient(820px 560px at 6% 0%, rgba(226, 86, 44, .22) 0%, transparent 60%),
+    radial-gradient(600px 420px at 95% 100%, rgba(150, 45, 20, .18) 0%, transparent 60%),
+    linear-gradient(160deg, #25282e 0%, #1c1f24 55%, #15171c 100%);
+}
+.lg-grid {
+  background-image:
+    linear-gradient(rgba(244, 122, 82, .09) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(244, 122, 82, .09) 1px, transparent 1px);
+}
+.lg-mark { box-shadow: 0 8px 26px rgba(226, 86, 44, .42), 0 0 0 1px rgba(244, 122, 82, .4); }
+.lg-logo em { color: #d29a86; }
+.lg-feats i { background: #f47a52; box-shadow: 0 0 0 4px rgba(226, 86, 44, .18), 0 0 12px rgba(226, 86, 44, .5); }
+.lg-field input:focus { border-color: #e2562c; box-shadow: 0 0 0 3px rgba(226, 86, 44, .16); }
+.lg-btn { background: linear-gradient(135deg, #f2683a, #cf471e); box-shadow: 0 6px 20px rgba(226, 86, 44, .34); }
+.lg-link:focus-visible, .lg-eye:focus-visible, .lg-btn:focus-visible { outline-color: #e2562c; }
+.lg-card { box-shadow: 0 20px 60px rgba(20, 22, 28, .18); }
 </style>

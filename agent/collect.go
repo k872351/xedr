@@ -47,8 +47,20 @@ func collectModule(module string) ([]any, error) {
 		return collectListen()
 	case "driver":
 		return collectDrivers()
-	case "browser":
-		return collectBrowser()
+	case "netif":
+		return collectNetif()
+	case "groups":
+		return collectGroups()
+	case "firewall":
+		return collectFirewall()
+	case "shares":
+		return collectShares()
+	case "certs":
+		return collectCerts()
+	case "usb":
+		return collectUSB()
+	case "browser_ext":
+		return collectBrowserExt()
 	default:
 		return nil, nil
 	}
@@ -264,8 +276,12 @@ func colIdx(headers []string, names ...string) int {
 }
 
 func truncateItems(items []any) []any {
-	if len(items) > maxItems {
-		return items[:maxItems]
+	return truncateItemsAt(items, maxItems)
+}
+
+func truncateItemsAt(items []any, limit int) []any {
+	if len(items) > limit {
+		return items[:limit]
 	}
 	return items
 }

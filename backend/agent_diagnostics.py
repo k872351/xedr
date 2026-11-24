@@ -5,10 +5,15 @@ from __future__ import annotations
 import base64
 import json
 import re
+import stat
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from . import config
+
+
+def valid_identifier(value: str) -> bool:
+    return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,127}', value) is not None
 
 
 def _root() -> Path:
@@ -22,6 +27,28 @@ def _safe_name(name: str) -> str:
     name = str(name or "diagnostics.zip").strip()
     name = re.sub(r"[^\w.\-]+", "_", name)[:120]
     return name or "diagnostics.zip"
+
+
+def _diagnostic_candidates(directory: Path, pattern: str, min_size: int = 1):
+    """Return only regular files contained in this diagnostic directory.
+
+    Individual entries may disappear while the history is being read; skip
+    those entries without preventing access to the remaining valid records.
+    """
+    candidates = []
+    parent = directory.resolve()
+    for path in directory.glob(pattern):
+        try:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size < min_size:
+                continue
+            if path.resolve().parent != parent:
+                continue
+        except (OSError, RuntimeError):
+            continue
+        candidates.append((path, info))
+    candidates.sort(key=lambda item: item[1].st_mtime, reverse=True)
+    return candidates
 
 
 def persist_from_command_result(
@@ -43,10 +70,17 @@ def persist_from_command_result(
         return result
     aid = str(agent_id or "unknown").strip()
     cid = str(command_id or "cmd").strip()
+    if not valid_identifier(aid) or not valid_identifier(cid):
+        return result
     fn = _safe_name(str(result.get("filename") or f"forensic-agent-diag-{cid}.zip"))
-    dest_dir = _root() / aid
+    root = _root()
+    dest_dir = root / aid
+    if dest_dir.is_symlink() or dest_dir.resolve().parent != root.resolve():
+        return result
     dest_dir.mkdir(parents=True, exist_ok=True)
     path = dest_dir / f"{cid}_{fn}"
+    if path.is_symlink() or path.resolve().parent != dest_dir.resolve():
+        return result
     path.write_bytes(raw)
     slim = {k: v for k, v in result.items() if k != "content_base64"}
     slim.update({
@@ -61,14 +95,14 @@ def persist_from_command_result(
 def resolve_download_path(agent_id: str, command_id: str) -> Optional[Path]:
     aid = str(agent_id or "").strip()
     cid = str(command_id or "").strip()
-    if not aid or not cid:
+    if not valid_identifier(aid) or not valid_identifier(cid):
         return None
-    d = _root() / aid
-    if not d.is_dir():
+    root = _root()
+    d = root / aid
+    if not d.is_dir() or d.is_symlink() or d.resolve().parent != root.resolve():
         return None
-    for p in sorted(d.glob(f"{cid}_*"), key=lambda x: x.stat().st_mtime, reverse=True):
-        if p.is_file() and p.stat().st_size > 0:
-            return p
+    for p, _ in _diagnostic_candidates(d, f"{cid}_*"):
+        return p
     return None
 
 
@@ -114,7 +148,12 @@ def read_download_bytes(agent_id: str, command_id: str) -> Tuple[Optional[bytes]
     name = path.name
     if "_" in name:
         name = name.split("_", 1)[1]
-    return path.read_bytes(), name, None
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None, "", "诊断文件不存在或尚未回传"
+        return path.read_bytes(), name, None
+    except OSError:
+        return None, "", "诊断文件暂时不可读取"
 
 
 def list_diagnostics(agent_id: str = "", limit: int = 50) -> Dict[str, Any]:
@@ -123,24 +162,24 @@ def list_diagnostics(agent_id: str = "", limit: int = 50) -> Dict[str, Any]:
 
     agent_edr.ensure()
     aid = str(agent_id or "").strip()
+    if aid and not valid_identifier(aid):
+        return {"ok": False, "error": "invalid agent identifier"}
     limit = max(1, min(int(limit or 50), 200))
     items: list = []
     root = _root()
-    dirs = [root / aid] if aid else [p for p in root.iterdir() if p.is_dir()]
+    dirs = [root / aid] if aid else [p for p in root.iterdir() if p.is_dir() and valid_identifier(p.name)]
     for d in dirs:
-        if not d.is_dir():
+        if not d.is_dir() or d.is_symlink() or d.resolve().parent != root.resolve():
             continue
-        for p in sorted(d.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True):
-            if not p.is_file() or p.stat().st_size < 32:
-                continue
+        for p, info in _diagnostic_candidates(d, "*", min_size=32):
             name = p.name
             cid = name.split("_", 1)[0] if "_" in name else ""
             items.append({
                 "agent_id": d.name,
                 "command_id": cid,
                 "filename": name.split("_", 1)[1] if "_" in name else name,
-                "size": p.stat().st_size,
-                "mtime": int(p.stat().st_mtime),
+                "size": info.st_size,
+                "mtime": int(info.st_mtime),
                 "download_ready": True,
             })
             if len(items) >= limit:

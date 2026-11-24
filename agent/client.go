@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -47,6 +48,14 @@ func isCredentialRejected(err error) bool {
 func isV2Unsupported(err error) bool {
 	var ae *apiError
 	return errors.As(err, &ae) && (ae.Status == 404 || ae.Status == 405)
+}
+
+// isV2BatchRejected detects an envelope-level rejection. The v2 ingest API
+// reports per-event validation failures in a successful response, so HTTP 400
+// here means the batch cannot be accepted and legacy delivery can recover it.
+func isV2BatchRejected(err error) bool {
+	var ae *apiError
+	return errors.As(err, &ae) && ae.Path == "/api/agent/v2/events/batch" && ae.Status == 400
 }
 
 func (c *APIClient) setCredential(secret, agentID string) {
@@ -163,13 +172,14 @@ type heartbeatResp struct {
 	PolicyRev    int              `json:"policy_rev"`
 	Whitelist    []map[string]any `json:"whitelist"`
 	// RuleFIMPaths 由「文件规则 + 路径前缀」自动生成的监控目录（如 D:\Tools|r|exe,dll）
-	RuleFIMPaths []string `json:"rule_fim_paths"`
-	MemoryYaraRev string           `json:"memory_yara_rev"`
-	SyncRev       int              `json:"sync_rev"`
-	SyncManifest  map[string]any   `json:"sync_manifest"`
-	PolicyApplied bool             `json:"policy_applied"`
+	RuleFIMPaths    []string       `json:"rule_fim_paths"`
+	MemoryYaraRev   string         `json:"memory_yara_rev"`
+	SyncRev         int            `json:"sync_rev"`
+	SyncManifest    map[string]any `json:"sync_manifest"`
+	PolicyApplied   bool           `json:"policy_applied"`
 	AckedCommandIDs []string       `json:"acked_command_ids"`
-	Error         string           `json:"error"`
+	DPCrypto        map[string]any `json:"dp_crypto"`
+	Error           string         `json:"error"`
 }
 
 type batchResp struct {
@@ -278,13 +288,61 @@ func (c *APIClient) Snapshot(agentID, module, collectedAt, digest string, items 
 func (c *APIClient) Event(agentID, module, severity, title, detail string) error {
 	var out map[string]any
 	return c.post("/api/agent/event", map[string]any{
-		"agent_id":  agentID,
-		"module":    module,
-		"severity":  severity,
-		"title":     title,
-		"detail":    detail,
-		"hostname":  hostname(),
+		"agent_id": agentID,
+		"module":   module,
+		"severity": severity,
+		"title":    title,
+		"detail":   detail,
+		"hostname": hostname(),
 	}, &out)
+}
+
+// DownloadArtifact 拉取平台托管制品（如 Sysmon64.exe）到本地路径。
+func (c *APIClient) DownloadArtifact(path, dest string) error {
+	req, err := http.NewRequest(http.MethodGet, c.base+path, nil)
+	if err != nil {
+		return err
+	}
+	if sec, aid := c.credential(); sec != "" {
+		req.Header.Set("Authorization", "Bearer "+sec)
+		if aid != "" {
+			req.Header.Set("X-Agent-Id", aid)
+		}
+	} else if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	// Sysmon 约数 MB；放宽超时
+	cli := &http.Client{Timeout: 3 * time.Minute, Transport: c.client.Transport}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return &apiError{Path: path, Status: resp.StatusCode, Body: string(data)}
+	}
+	tmp := dest + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(f, io.LimitReader(resp.Body, 64<<20))
+	closeErr := f.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmp)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return closeErr
+	}
+	_ = os.Remove(dest)
+	if err := os.Rename(tmp, dest); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func truncate(s string, n int) string {

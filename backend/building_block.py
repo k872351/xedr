@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Any, Dict, List, Set
 
-from . import agent_protocol
+from . import agent_protocol, risk_scoring
 
 _lock = threading.RLock()
 # agent_id -> last upgrade ts (avoid spam)
@@ -87,38 +87,64 @@ def aggregate_building_blocks(agent_id: str, host: str) -> int:
         if rel_key in seen_related:
             continue
         seen_related.add(rel_key)
+        cmd = str(detail.get("command_line") or detail.get("command") or detail.get("script_block") or "")
+        path = str(detail.get("path") or detail.get("image") or detail.get("TargetFilename") or "")
+        reg = str(detail.get("reg_key") or detail.get("key") or "")
         related.append({
             "event_id": r["id"],
             "rule_id": rid[:80],
-            "title": str(detail.get("rule_title") or r["title"] or "")[:100],
-            "summary": str(detail.get("summary") or detail.get("matched") or r["title"] or "")[:120],
+            "title": str(detail.get("rule_title") or r["title"] or "")[:160],
+            "summary": str(detail.get("summary") or detail.get("matched") or r["title"] or "")[:240],
+            "matched": str(detail.get("matched") or "")[:240],
             "etype": str(detail.get("etype") or "")[:40],
+            "module": mod[:40],
             "process_name": str(detail.get("process_name") or detail.get("name") or "")[:80],
             "pid": detail.get("pid"),
+            "ppid": detail.get("ppid"),
+            "parent_name": str(detail.get("parent_name") or "")[:80],
+            "user": str(detail.get("user") or detail.get("username") or "")[:80],
+            "path": path[:260],
+            "command_line": cmd[:500],
+            "reg_key": reg[:260],
+            "value_name": str(detail.get("value_name") or "")[:80],
+            "value": str(detail.get("value") or "")[:200],
             "remote": str(detail.get("remote") or detail.get("remote_ip") or "")[:80],
+            "domain": str(detail.get("domain") or "")[:120],
             "severity": str(r["severity"] or ""),
+            "created_at": str(detail.get("event_ts") or detail.get("ts") or "")[:32],
         })
     if len(bb_rules) < _MIN_DISTINCT_RULES and len(tactics) < 2:
         return 0
     title = f"多阶段可疑行为：{host or agent_id} 命中 {len(bb_rules)} 条积木/关联"
     matched_bits = []
-    for item in related[:8]:
+    for item in related[:10]:
         bit = item.get("title") or item.get("rule_id") or ""
-        if item.get("summary") and item["summary"] != bit:
-            bit = f"{bit} · {item['summary']}"
+        extra = item.get("matched") or item.get("summary") or ""
+        if extra and extra != bit:
+            bit = f"{bit} · {extra}"
+        proc = item.get("process_name") or ""
+        if proc and proc not in bit:
+            bit = f"{bit} [{proc}]"
         if bit:
-            matched_bits.append(bit)
+            matched_bits.append(f"{len(matched_bits)+1}) {bit}")
     detail = {
         "building_block_upgrade": True,
         "etype": "building_block_upgrade",
         "distinct_rules": sorted(bb_rules)[:20],
         "tactics": sorted(tactics),
         "window_sec": _LOOKBACK_SEC,
-        "related_hits": related[:12],
-        "matched": "；".join(matched_bits)[:500] or f"{len(bb_rules)} 条积木/关联规则",
-        "investigation": "同一主机在 30 分钟内出现多条低置信关联/积木告警，建议打开威胁视图做进程树与外联溯源。",
+        "related_hits": related[:16],
+        "related_count": len(related),
+        "matched": " | ".join(matched_bits)[:1200] or f"{len(bb_rules)} 条积木/关联规则",
+        "investigation": (
+            f"同一主机在 {_LOOKBACK_SEC // 60} 分钟内出现 {len(bb_rules)} 条低置信关联/积木告警"
+            f"（战术：{', '.join(sorted(tactics)) or '未映射'}）。"
+            "请展开下方「积木子告警」逐条查看进程/路径/命令行/注册表，并结合威胁视图进程树与外联溯源。"
+        ),
         "risk_score": 72,
     }
+    # 多战术叠加的聚合结果作为一个"高战术宽度"信号纳入主机级评分快照。
+    risk_scoring.report(agent_id, detail, "default", weight=72)
     r = agent_protocol.report_event({
         "agent_id": agent_id,
         "hostname": host,

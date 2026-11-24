@@ -191,6 +191,18 @@ func enrichPEMeta(items []any, pathKey string, maxHash int) {
 		if pm.SHA256 != "" {
 			m["sha256"] = pm.SHA256
 		}
+		if peExtHot(r.path) {
+			if meta, err := peFileMetaOf(r.path); err == nil && meta != nil {
+				applyPEFileMeta(m, meta)
+			}
+			if mw := motwOf(r.path); mw.Present {
+				m["motw"] = true
+				if mw.ZoneID >= 0 {
+					m["motw_zone"] = mw.ZoneID
+					m["motw_zone_label"] = motwZoneLabel(mw.ZoneID)
+				}
+			}
+		}
 	}
 }
 

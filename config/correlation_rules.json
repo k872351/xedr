@@ -1,6 +1,34 @@
 {
-  "version": "1.0",
-  "updated_at": "2026-10-31",
+  "version": "1.1",
+  "updated_at": "2026-11-22",
+  "risk_scoring": {
+    "enabled": true,
+    "comment": "多信号风险评分参数（对齐 DataProtector DpThreatEngine，可在运行时按 mtime 热加载）",
+    "thresholds": { "low": 30, "medium": 60, "high": 90, "critical": 130 },
+    "score_max": 1000,
+    "cooldown_sec": 30,
+    "repeat_min": 1,
+    "repetition_bonus": 6,
+    "repetition_threshold": 3,
+    "decay_interval_sec": 30,
+    "decay_points": 8,
+    "correlation_bonus": 12,
+    "propagation_pct": 50,
+    "ancestry_max_depth": 8,
+    "max_nodes": 4096,
+    "signals": {
+      "default": { "weight": 10, "tactic": "unknown", "technique_id": 0 },
+      "lsass_access": { "weight": 48, "tactic": "credential_access", "technique_id": 1003 },
+      "office_spawn": { "weight": 28, "tactic": "execution", "technique_id": 1204 },
+      "script_interpreter": { "weight": 12, "tactic": "execution", "technique_id": 1059 },
+      "lolbin_exec": { "weight": 20, "tactic": "defense_evasion", "technique_id": 1218 },
+      "c2_outbound": { "weight": 18, "tactic": "command_and_control", "technique_id": 1071 },
+      "task_persist": { "weight": 38, "tactic": "persistence", "technique_id": 1053 },
+      "first_seen_unsigned": { "weight": 15, "tactic": "execution", "technique_id": 1204 },
+      "login_bruteforce": { "weight": 24, "tactic": "credential_access", "technique_id": 1110 },
+      "login_impossible_travel": { "weight": 34, "tactic": "credential_access", "technique_id": 1078 }
+    }
+  },
   "rules": [
     {
       "id": "corr.proc.lsass_access_burst",

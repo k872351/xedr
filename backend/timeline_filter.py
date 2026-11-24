@@ -25,13 +25,13 @@ KIND_ORDER = ("proc", "exit", "file", "net", "module", "script", "persist", "ale
 
 def etype_kind(etype: str) -> str:
     e = str(etype or "").lower()
-    if "remote_thread" in e or "protect_block" in e or "driver" in e:
+    if "remote_thread" in e or "protect_block" in e or "driver" in e or "process_tampering" in e or "credential_access" in e:
         return "alert"
     if "image_load" in e:
         return "module"
     if "scriptblock" in e or e.startswith("win_ps"):
         return "script"
-    if "file" in e or e.startswith("fim_"):
+    if "file" in e or e.startswith("fim_") or "pipe_" in e or e == "pipe_created":
         return "file"
     if "exit" in e:
         return "exit"

@@ -73,6 +73,14 @@
       "event_ids": [31001, 31002, 31003, 31004]
     },
     {
+      "id": "smbserver",
+      "channel": "Security",
+      "priority": "high",
+      "ecs_category": ["network"],
+      "note": "File share audit 5140/5142/5143/5145 (merged into security XPath)",
+      "event_ids": [5140, 5142, 5143, 5145]
+    },
+    {
       "id": "bits",
       "channel": "Microsoft-Windows-Bits-Client/Operational",
       "priority": "medium",

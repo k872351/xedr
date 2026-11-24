@@ -65,10 +65,18 @@ def db_path() -> Path:
 
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path()), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(_SCHEMA)
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() != "wal":
+            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        if str(mode).lower() != "wal":
+            raise sqlite3.OperationalError("Account database did not enter required WAL mode")
+        conn.executescript(_SCHEMA)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 # ---------- 密码 ----------
@@ -163,15 +171,17 @@ def create_user(username: str, password: str, *, role: str = "analyst",
     _check_password_strength(password)
     now = time.time()
     uid = uuid.uuid4().hex
+    password_hash = _hash_password(password)
     with _lock:
         conn = _connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             if conn.execute("SELECT 1 FROM edr_users WHERE username=?", (username,)).fetchone():
                 raise ValueError("用户名已存在")
             conn.execute(
                 """INSERT INTO edr_users(id, username, display_name, role, password_hash, enabled,
                    must_change, created_at, updated_at) VALUES(?,?,?,?,?,1,?,?,?)""",
-                (uid, username, str(display_name or "")[:64], role, _hash_password(password),
+                (uid, username, str(display_name or "")[:64], role, password_hash,
                  1 if must_change else 0, now, now),
             )
             conn.commit()
@@ -185,6 +195,7 @@ def update_user(user_id: str, *, role: Optional[str] = None, enabled: Optional[b
     with _lock:
         conn = _connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM edr_users WHERE id=?", (user_id,)).fetchone()
             if not row:
                 raise ValueError("用户不存在")
@@ -228,6 +239,7 @@ def delete_user(user_id: str) -> None:
     with _lock:
         conn = _connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM edr_users WHERE id=?", (user_id,)).fetchone()
             if not row:
                 raise ValueError("用户不存在")
@@ -247,6 +259,7 @@ def change_own_password(user_id: str, current: str, new_password: str, *, keep_t
     with _lock:
         conn = _connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM edr_users WHERE id=?", (user_id,)).fetchone()
             if not row or not _verify_password(current or "", row["password_hash"]):
                 raise ValueError("当前密码不正确")
@@ -280,6 +293,13 @@ def login(username: str, password: str, *, ip: str = "") -> Dict[str, Any]:
                 raise ValueError("用户名或密码错误")
             if not row["enabled"]:
                 raise ValueError("账号已禁用")
+            # Recheck the verified account while holding the database write
+            # transaction so concurrent password resets and account changes
+            # cannot leave a newly issued session based on stale state.
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("SELECT * FROM edr_users WHERE id=?", (row["id"],)).fetchone()
+            if not current or not current["enabled"] or current["password_hash"] != row["password_hash"] or current["role"] != row["role"] or current["must_change"] != row["must_change"]:
+                raise ValueError("Account state changed; please sign in again")
             token = secrets.token_hex(32)
             now = time.time()
             conn.execute(
@@ -362,7 +382,10 @@ def token_from_request(cookie_header: str, authorization: str = "") -> str:
 # ---------- 初始化 ----------
 
 def ensure_bootstrap_admin() -> None:
-    """首次启动没有任何 EDR 账号时创建 admin，密码只打印到控制台。"""
+    """首次启动没有任何 EDR 账号时创建 admin。
+
+    密码不写入日志：优先环境变量；否则写入权限受限的交付文件，仅打印路径。
+    """
     with _lock:
         conn = _connect()
         try:
@@ -375,12 +398,28 @@ def ensure_bootstrap_admin() -> None:
     pwd = env_pwd or (secrets.token_urlsafe(12) + "A1")
     create_user("admin", pwd, role="admin", display_name="EDR 管理员", must_change=True)
     if env_pwd:
-        print("[edr-auth] bootstrap admin created from EDR_BOOTSTRAP_ADMIN_PASSWORD", file=sys.stderr)
-    else:
-        print("[edr-auth] ===== EDR 后台首次启动 · 管理员账号（首次登录须改密）=====", file=sys.stderr)
-        print("[edr-auth] username: admin", file=sys.stderr)
-        print(f"[edr-auth] password: {pwd}", file=sys.stderr)
-        print("[edr-auth] ===========================================================", file=sys.stderr)
+        print("[edr-auth] bootstrap admin created from EDR_BOOTSTRAP_ADMIN_PASSWORD (password not logged)", file=sys.stderr)
+        return
+    try:
+        from pathlib import Path
+        from . import config
+        root = Path(getattr(config, "DATA_ROOT", None) or getattr(config, "ROOT", Path(".")))
+        out = root / "data" / "bootstrap_admin.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            "username=admin\n"
+            f"password={pwd}\n"
+            "must_change=1\n"
+            "note=首次登录后立即修改密码，并删除本文件\n",
+            encoding="utf-8",
+        )
+        try:
+            out.chmod(0o600)
+        except Exception:
+            pass
+        print(f"[edr-auth] bootstrap admin credentials written to {out} (not logged)", file=sys.stderr)
+    except Exception as e:
+        print(f"[edr-auth] bootstrap admin created; credential file write failed: {e}", file=sys.stderr)
 
 
 def reset_admin_cli() -> str:

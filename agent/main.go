@@ -72,6 +72,29 @@ func main() {
 			fatal(err)
 		}
 		return
+	case "ensure-running":
+		// 计划任务 keepalive 入口：服务停着则拉起，已运行则静默成功
+		if err := ensureServiceRunning(); err != nil {
+			log.Printf("ensure-running: %v", err)
+			os.Exit(1)
+		}
+		return
+	case "ensure-sysmon":
+		cfg, _, err := loadConfig(false)
+		if err != nil {
+			// 无配置时仍可尝试本地 Sysmon 二进制安装
+			cfg = Config{StateDir: filepath.Join(os.Getenv("ProgramData"), "ForensicAgent")}
+		}
+		globalCfg = cfg
+		setupFileLog(cfg.StateDir)
+		api := newClient(cfg)
+		st := ensureSysmonManaged(api)
+		fmt.Printf("sysmon: action=%v present=%v installed=%v err=%v\n",
+			st["action"], st["present"], st["installed"], st["error"])
+		if e, _ := st["error"].(string); e != "" && st["action"] != "already_ok" && st["action"] != "installed" && st["action"] != "config_updated" && st["action"] != "disabled_by_policy" {
+			os.Exit(1)
+		}
+		return
 	case "write-example":
 		writeExampleConfig("agent.example.json")
 		return
@@ -104,12 +127,14 @@ func main() {
 	}
 
 	switch cmd {
-	case "install":
+	case "install", "setup":
 		setupFileLog(cfg.StateDir)
 		if err := installService(cfgPath); err != nil {
 			log.Printf("install failed: %v", err)
 			fatal(err)
 		}
+		fmt.Println("ForensicAgent 已安装并启动（服务名 ForensicAgent，开机自启）。")
+		fmt.Println("图形安装器请运行安装包内 Install-GUI.ps1 / install.vbs。")
 		return
 	case "run", "once", "":
 		setupFileLog(cfg.StateDir)
@@ -161,8 +186,11 @@ func printUsage() {
 
 命令（管理员）:
   install   [-config agent.json]   安装并启动 Windows 服务 ForensicAgent
+  setup     [-config agent.json]   同 install（装完自动启动）
   uninstall                        停止并卸载服务
   start | stop | status            控制服务
+  ensure-sysmon                    安装/刷新托管 Sysmon（需 Sysmon64.exe）
+  ensure-running                   若服务停着则拉起（保活任务入口）
 
 前台调试:
   run       [-config agent.json]   控制台运行（不装服务）

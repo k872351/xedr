@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package main
 
@@ -12,3 +12,4 @@ func (w *fimWatcher) start(context.Context)      {}
 func (w *fimWatcher) stop()                      {}
 func (w *fimWatcher) running() bool              { return false }
 func (w *fimWatcher) drain() []map[string]any    { return nil }
+func applyFIMWebRoots([]string)                  {}

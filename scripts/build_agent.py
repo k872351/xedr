@@ -102,6 +102,7 @@ def main() -> int:
         "protocol_min": info.get("protocol_min", 1),
         "protocol_max": info.get("protocol_max", 1),
         "capabilities": info.get("capabilities", []),
+        "yara_compiled": info.get("yara_compiled", False),  # default build uses CGO_ENABLED=0
         "go_version": info.get("go_version", ""),
         "goos": "windows",
         "goarch": args.goarch,
@@ -111,6 +112,19 @@ def main() -> int:
     tmp_m.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp_m, mp)
     print(f"[build] OK sha256={manifest['exe_sha256'][:16]}… manifest={mp}", flush=True)
+
+    # 图形安装器：双击 ForensicAgent-Setup.exe
+    setup_out = out.parent / "ForensicAgent-Setup.exe"
+    setup_ld = "-s -w -H windowsgui"
+    print(f"[build] setup -> {setup_out}", flush=True)
+    cp2 = subprocess.run(
+        [go, "build", "-trimpath", f"-ldflags={setup_ld}", "-o", str(setup_out), "./cmd/setup"],
+        cwd=str(src), env=env,
+    )
+    if cp2.returncode != 0:
+        print("[build] ForensicAgent-Setup.exe 构建失败（安装包将缺少 Setup.exe）", file=sys.stderr)
+    else:
+        print(f"[build] setup OK size={setup_out.stat().st_size}", flush=True)
 
     return 0
 

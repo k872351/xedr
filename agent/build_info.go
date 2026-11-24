@@ -22,45 +22,64 @@ const (
 
 // agentCapabilities 只列出已真正实现的能力，供服务端按能力启用新功能。
 func agentCapabilities() []string {
-	return []string{
+	base := []string{
 		"snapshot.v1",
 		"timeline.v1",
 		"command.ack.v1",
-		"process.identity.v1",
-		"sensor.etw",
-		"sensor.wevt",
-		"upgrade.replace",
-		"upgrade.ed25519",   // 升级包 Ed25519 签名校验
-		"upgrade.watchdog",  // 升级后健康看门狗，失败自动回滚 N-1
-		"ingest.v2",         // 本地 SQLite outbox + v2 幂等批量上报
-		"auth.agent_secret", // 每 Agent 独立凭据（DPAPI 保护）
-		"command.lease",     // 命令租约重投 + 本地回执去重
-		"health.v1",         // 心跳健康指标
-		"process.entity.v1", // boot_id+pid+创建时间 进程实体与墓碑
-		"registry.realtime", // RegNotifyChangeKeyValue 实时注册表
-		"dns.aggregate",     // DNS 查询聚合 / 应答反查 / NXDOMAIN 爆发
-		"fim.v1",            // 目录实时变更 + 本地基线对账
-		"inventory.delta",   // 增量资产清单（generation 链 + 全量兜底）
-		"policy.lkg",        // 策略整体校验/试用期/LKG 回滚，心跳回报 policy 状态
-		"fleet.checkin.v1",  // PolicyApplied + local/server rev + 心跳内联 command ack
-		"diagnostics.v2",    // Elastic 风格诊断包（state/components/redact）
+		"ingest.v2",
+		"health.v1",
+		"inventory.delta",
+		"inventory.parts.v1",
+		"policy.lkg",
+		"fleet.checkin.v1",
+		"diagnostics.v2",
 		"composable.host.v1",
-		// 内核驱动：不嵌入第三方开源驱动（OpenEDR CASL / Wazuh GPL）；可选自研需微软签名
+		"event.schema.v1",
 	}
+	if runtime.GOOS == "windows" || runtime.GOOS == "linux" {
+		base = append(base, "inventory.software.extended.v1", "inventory.software.paged.v1", "inventory.assets.paged.v1", "inventory.user.paged.v1")
+	}
+	if runtime.GOOS == "windows" {
+		return append(base,
+			"process.identity.v1", "sensor.etw", "sensor.wevt",
+			"upgrade.replace", "upgrade.ed25519", "upgrade.watchdog",
+			"auth.agent_secret", "command.lease", "process.entity.v1",
+			"registry.realtime", "dns.aggregate", "fim.v1",
+			"memory.integrity.v1", "file.meta.v1", "http.etw.v1",
+			"beacon.watch.v1", "response.persist.v1", "policy.sign.v1",
+			"self.protect.watch.v1",
+		)
+	}
+	if runtime.GOOS == "linux" {
+		return append(base,
+			"dns.aggregate", "fim.polling.v1", "inventory.kernel_module.v1",
+			"inventory.process.procfs.v1", "inventory.network.procfs.v1",
+			"inventory.services.systemd_units.linux.v1",
+			"inventory.tasks.cron_systemd.linux.v1", "inventory.startup.linux.v1",
+			"rules.linux.process_snapshot.v1",
+			"inventory.software.linux.v1", "inventory.package_updates.linux.v1",
+			"rootcheck.linux.v1", "sca.linux.v1",
+			"response.kill_process.linux.v1", "response.quarantine_file.linux.v1",
+			"sensor.linux.journal.v1",
+		)
+	}
+	return base
 }
-
 func buildInfoMap() map[string]any {
 	return map[string]any{
-		"version":      agentVersion,
-		"build_id":     buildID,
-		"build_time":   buildTime,
-		"source_rev":   sourceRev,
-		"protocol_min": protocolMin,
-		"protocol_max": protocolMax,
-		"capabilities": agentCapabilities(),
-		"go_version":   runtime.Version(),
-		"goos":         runtime.GOOS,
-		"goarch":       runtime.GOARCH,
+		"version":            agentVersion,
+		"build_id":           buildID,
+		"build_time":         buildTime,
+		"source_rev":         sourceRev,
+		"protocol_min":       protocolMin,
+		"protocol_max":       protocolMax,
+		"capabilities":       agentCapabilities(),
+		"capability_status":  capabilityStatusReport(),
+		"go_version":         runtime.Version(),
+		"goos":               runtime.GOOS,
+		"goarch":             runtime.GOARCH,
+		"yara_compiled":      yaraCompiled,
+		"yara_optional_note": "YARA 为可选构建；yara_compiled=false 时内存扫描能力为 built_disabled",
 	}
 }
 
@@ -80,12 +99,14 @@ func printBuildInfo(path string) error {
 // registerExtras 注册/心跳附带的构建与协议信息。
 func registerExtras() map[string]any {
 	return map[string]any{
-		"build_id":     buildID,
-		"build_time":   buildTime,
-		"source_rev":   sourceRev,
-		"protocol_min": protocolMin,
-		"protocol_max": protocolMax,
-		"capabilities": agentCapabilities(),
-		"host":         hostMetadata(),
+		"build_id":          buildID,
+		"build_time":        buildTime,
+		"source_rev":        sourceRev,
+		"protocol_min":      protocolMin,
+		"protocol_max":      protocolMax,
+		"capabilities":      agentCapabilities(),
+		"capability_status": capabilityStatusReport(),
+		"yara_compiled":     yaraCompiled,
+		"host":              hostMetadata(),
 	}
 }

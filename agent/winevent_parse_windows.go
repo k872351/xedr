@@ -13,7 +13,11 @@ import (
 
 type winevtXML struct {
 	System struct {
-		EventID     int    `xml:"EventID"`
+		// System 通道常见 <EventID Qualifiers="…">7036</EventID>；不能直接解到 int
+		EventID struct {
+			Qualifiers string `xml:"Qualifiers,attr"`
+			Value      string `xml:",chardata"`
+		} `xml:"EventID"`
 		Channel     string `xml:"Channel"`
 		TimeCreated struct {
 			SystemTime string `xml:"SystemTime,attr"`
@@ -27,18 +31,36 @@ type winevtXML struct {
 	} `xml:"EventData"`
 }
 
+func winevtParseEventID(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 func winevtParseXML(xmlText string, logChannel string) map[string]any {
 	var doc winevtXML
 	if err := xml.Unmarshal([]byte(xmlText), &doc); err != nil {
 		return nil
 	}
 	data := map[string]string{}
+	unnamed := 0
 	for _, d := range doc.EventData.Data {
+		v := strings.TrimSpace(d.Text)
 		if d.Name != "" {
-			data[d.Name] = strings.TrimSpace(d.Text)
+			data[d.Name] = v
+			continue
 		}
+		// System 7036/7040 等无名 Data：按顺序记为 param1、param2…
+		unnamed++
+		data["param"+strconv.Itoa(unnamed)] = v
 	}
-	eid := doc.System.EventID
+	eid := winevtParseEventID(doc.System.EventID.Value)
 	chanName := doc.System.Channel
 	if chanName == "" {
 		chanName = logChannel
@@ -75,6 +97,8 @@ func winevtMapEvent(eid int, ts, chanName string, data map[string]string) map[st
 		return winevtSMBEvent(eid, ts, chanName, data)
 	}
 	switch eid {
+	case 5140, 5142, 5143, 5145:
+		return winevtSMBServerEvent(eid, ts, chanName, data)
 	case 4624:
 		logonType := data["LogonType"]
 		if logonType == "0" || logonType == "5" || logonType == "11" {
@@ -325,13 +349,45 @@ func winevtMapEvent(eid int, ts, chanName string, data map[string]string) map[st
 			return nil
 		}
 		tgt := data["TargetImage"]
+		sev := "medium"
+		etype := "process_access"
+		sum := "进程打开(Sysmon): " + filepath.Base(src) + " → " + filepath.Base(tgt)
+		detail := withChan(map[string]any{
+			"source": "sysmon", "event_id": eid, "path": src, "target_path": tgt,
+			"pid": winevtInt(data["SourceProcessId"]), "target_pid": winevtInt(data["TargetProcessId"]),
+			"access": am, "call_trace": data["CallTrace"],
+		})
+		// 凭据访问：打开 LSASS 升级为 credential_access，并与内存扫描触发绑定
+		if winevtPathEnds(tgt, `\lsass.exe`) {
+			sev = "high"
+			etype = "credential_access"
+			sum = "凭据访问(Sysmon): " + filepath.Base(src) + " → lsass.exe"
+			detail["technique"] = "T1003.001"
+			detail["target_name"] = "lsass.exe"
+			detail["credential_access"] = true
+		}
 		return map[string]any{
-			"etype": "process_access", "summary": "进程打开(Sysmon): " + filepath.Base(src) + " → " + filepath.Base(tgt),
-			"severity": "medium", "ts": ts,
+			"etype": etype, "summary": sum, "severity": sev, "ts": ts, "detail": detail,
+		}
+	case 12: // RegistryEvent CreateKey / DeleteKey
+		if !winevtIsSysmon(chanName) {
+			return winevtGenericEvent(eid, ts, chanName, data)
+		}
+		to := data["TargetObject"]
+		if !winevtRegASEP(to) {
+			return nil
+		}
+		evType := data["EventType"]
+		etype, sum := "registry_create", "注册表创建(Sysmon): "+to
+		if strings.Contains(strings.ToLower(evType), "delete") {
+			etype, sum = "registry_delete", "注册表删除(Sysmon): "+to
+		}
+		return map[string]any{
+			"etype": etype, "summary": sum, "severity": "medium", "ts": ts,
 			"detail": withChan(map[string]any{
-				"source": "sysmon", "event_id": eid, "path": src, "target_path": tgt,
-				"pid": winevtInt(data["SourceProcessId"]), "target_pid": winevtInt(data["TargetProcessId"]),
-				"access": am, "call_trace": data["CallTrace"],
+				"source": "sysmon", "event_id": eid, "path": to, "operation": evType,
+				"pid": winevtInt(data["ProcessId"]), "process_name": filepath.Base(data["Image"]),
+				"process_path": data["Image"], "topic": winevtPersistTopic(to),
 			}),
 		}
 	case 13:
@@ -344,8 +400,56 @@ func winevtMapEvent(eid int, ts, chanName string, data map[string]string) map[st
 			"detail": withChan(map[string]any{
 				"source": "sysmon", "event_id": eid, "path": to, "value": data["Details"],
 				"pid": winevtInt(data["ProcessId"]), "process_name": filepath.Base(data["Image"]),
+				"process_path": data["Image"], "topic": winevtPersistTopic(to),
 			}),
 		}
+	case 14: // RegistryEvent RenameKey / RenameValue
+		if !winevtIsSysmon(chanName) {
+			return winevtGenericEvent(eid, ts, chanName, data)
+		}
+		to := data["TargetObject"]
+		if !winevtRegASEP(to) {
+			return nil
+		}
+		return map[string]any{
+			"etype": "registry_rename", "summary": "注册表重命名(Sysmon): " + to, "severity": "medium", "ts": ts,
+			"detail": withChan(map[string]any{
+				"source": "sysmon", "event_id": eid, "path": to, "new_name": data["NewName"],
+				"operation": data["EventType"],
+				"pid": winevtInt(data["ProcessId"]), "process_name": filepath.Base(data["Image"]),
+				"process_path": data["Image"], "topic": winevtPersistTopic(to),
+			}),
+		}
+	case 6: // DriverLoad
+		if !winevtIsSysmon(chanName) {
+			return winevtGenericEvent(eid, ts, chanName, data)
+		}
+		img := data["ImageLoaded"]
+		if img == "" {
+			img = data["Image"]
+		}
+		if img == "" {
+			return nil
+		}
+		sigSt := data["SignatureStatus"]
+		sev := "info"
+		if winevtUnsignedStatus(sigSt) {
+			sev = "high"
+		}
+		return map[string]any{
+			"etype": "driver_load_sysmon", "summary": "驱动加载(Sysmon): " + filepath.Base(img),
+			"severity": sev, "ts": ts,
+			"detail": withChan(map[string]any{
+				"source": "sysmon", "event_id": eid, "path": img, "name": filepath.Base(img),
+				"signed": sigSt, "signer": data["Signature"], "hash": data["Hashes"],
+			}),
+		}
+	case 19, 20: // WmiEventFilter / Consumer（21 与 RDP 会话共用，见下方）
+		if !winevtIsSysmon(chanName) {
+			return winevtGenericEvent(eid, ts, chanName, data)
+		}
+		et, sum, det := winevtSysmonWmiParts(eid, data)
+		return map[string]any{"etype": et, "summary": sum, "severity": "high", "ts": ts, "detail": withChan(det)}
 	case 22:
 		if strings.Contains(strings.ToLower(chanName), "terminalservices") {
 			user := data["User"]
@@ -385,35 +489,154 @@ func winevtMapEvent(eid int, ts, chanName string, data map[string]string) map[st
 		if winevtSysmonSrcNoise(img) {
 			return nil
 		}
+		parentImg := data["ParentImage"]
+		detail := withChan(map[string]any{
+			"source": "sysmon", "event_id": eid, "pid": winevtInt(data["ProcessId"]),
+			"ppid": winevtInt(data["ParentProcessId"]), "name": filepath.Base(img), "path": img,
+			"command_line": data["CommandLine"], "user": data["User"],
+			"hash": data["Hashes"], "hashes": data["Hashes"],
+			"parent_path": parentImg, "parent_name": filepath.Base(parentImg),
+			"parent_command_line": data["ParentCommandLine"],
+			"company": data["Company"], "product": data["Product"], "description": data["Description"],
+			"file_version": data["FileVersion"], "integrity": data["IntegrityLevel"],
+			"original_file_name": data["OriginalFileName"],
+			"logon_guid": data["LogonGuid"], "process_guid": data["ProcessGuid"],
+			"parent_process_guid": data["ParentProcessGuid"],
+		})
+		winevtApplyHashes(detail, data["Hashes"])
+		winevtAttachSysmonExtras(detail, data)
+		// Sysmon 未带公司/签名时补读 PE；Temp 安装器落地后常秒删，需同步补一次
+		winevtEnrichProcessImage(detail, img)
 		return map[string]any{
-			"etype": "process_create_etw", "summary": "进程创建(Sysmon): " + filepath.Base(img), "severity": "info", "ts": ts,
-			"detail": withChan(map[string]any{
-				"source": "sysmon", "event_id": eid, "pid": winevtInt(data["ProcessId"]),
-				"ppid": winevtInt(data["ParentProcessId"]), "name": filepath.Base(img), "path": img,
-				"command_line": data["CommandLine"], "user": data["User"],
-				"hash": data["Hashes"],
-			}),
+			"etype": "process_create_sysmon", "summary": "进程创建(Sysmon): " + filepath.Base(img), "severity": "info", "ts": ts,
+			"detail": detail,
 		}
 	case 3:
+		detail := withChan(map[string]any{
+			"source": "sysmon", "event_id": eid, "remote_ip": data["DestinationIp"], "remote_port": data["DestinationPort"],
+			"remote": data["DestinationIp"] + ":" + data["DestinationPort"],
+			"local": data["SourceIp"], "local_port": data["SourcePort"], "proto": data["Protocol"],
+			"pid": winevtInt(data["ProcessId"]),
+			"process_name": filepath.Base(data["Image"]), "path": data["Image"],
+			"user": data["User"], "initiated": data["Initiated"],
+		})
+		winevtAttachSysmonExtras(detail, data)
 		return map[string]any{
 			"etype": "network_connect", "summary": "网络(Sysmon): " + data["DestinationIp"] + ":" + data["DestinationPort"],
-			"severity": "info", "ts": ts,
-			"detail": withChan(map[string]any{
-				"source": "sysmon", "event_id": eid, "remote_ip": data["DestinationIp"], "remote_port": data["DestinationPort"],
-				"local": data["SourceIp"], "proto": data["Protocol"], "pid": winevtInt(data["ProcessId"]),
-				"process_name": filepath.Base(data["Image"]),
-			}),
+			"severity": "info", "ts": ts, "detail": detail,
 		}
 	case 11:
 		target := data["TargetFilename"]
 		if target == "" {
 			return nil
 		}
+		detail := withChan(map[string]any{
+			"source": "sysmon", "event_id": eid, "path": target, "pid": winevtInt(data["ProcessId"]),
+			"process_name": filepath.Base(data["Image"]), "process_path": data["Image"],
+			"topic": winevtFileTopic(target),
+			"hash": data["Hashes"], "hashes": data["Hashes"],
+		})
+		winevtApplyHashes(detail, data["Hashes"])
+		winevtAttachSysmonExtras(detail, data)
+		attachFileMetaCached(detail, target)
+		winevtEnrichProcessImage(detail, target)
+		sev := bumpSeverityForFileMeta("info", detail)
 		return map[string]any{
-			"etype": "file_create", "summary": "文件创建(Sysmon): " + filepath.Base(target), "severity": "info", "ts": ts,
+			"etype": "file_create", "summary": "文件创建(Sysmon): " + filepath.Base(target), "severity": sev, "ts": ts,
+			"detail": detail,
+		}
+	case 5: // ProcessTerminate
+		if !winevtIsSysmon(chanName) {
+			return winevtGenericEvent(eid, ts, chanName, data)
+		}
+		img := data["Image"]
+		return map[string]any{
+			"etype": "process_exit_sysmon", "summary": "进程退出(Sysmon): " + filepath.Base(img),
+			"severity": "info", "ts": ts,
 			"detail": withChan(map[string]any{
-				"source": "sysmon", "event_id": eid, "path": target, "pid": winevtInt(data["ProcessId"]),
-				"process_name": filepath.Base(data["Image"]),
+				"source": "sysmon", "event_id": eid, "pid": winevtInt(data["ProcessId"]),
+				"name": filepath.Base(img), "path": img, "exit_code": data["ExitCode"],
+			}),
+		}
+	case 7: // ImageLoad
+		if !winevtIsSysmon(chanName) {
+			return winevtGenericEvent(eid, ts, chanName, data)
+		}
+		img := data["ImageLoaded"]
+		if img == "" {
+			img = data["Image"]
+		}
+		host := data["Image"]
+		sigSt := data["SignatureStatus"]
+		signed := sigSt
+		if winevtUnsignedStatus(sigSt) {
+			signed = "NotSigned"
+		} else if strings.EqualFold(strings.TrimSpace(sigSt), "Valid") {
+			signed = "Valid"
+		}
+		detail := withChan(map[string]any{
+			"source": "sysmon", "event_id": eid, "path": img, "module": filepath.Base(img),
+			"module_name": filepath.Base(img), "pid": winevtInt(data["ProcessId"]),
+			"host_process": filepath.Base(host), "process_path": host,
+			"signed": signed, "signer": data["Signature"], "signature_status": sigSt,
+			"hash": data["Hashes"],
+		})
+		sev := "info"
+		if winevtUnsignedStatus(sigSt) {
+			sev = "medium"
+		}
+		return map[string]any{
+			"etype": "image_load_sysmon", "summary": "DLL 加载(Sysmon): " + filepath.Base(img),
+			"severity": sev, "ts": ts, "detail": detail,
+		}
+	case 15: // FileCreateStreamHash (ADS / MotW)
+		if !winevtIsSysmon(chanName) {
+			return winevtGenericEvent(eid, ts, chanName, data)
+		}
+		target := data["TargetFilename"]
+		if target == "" {
+			return nil
+		}
+		return map[string]any{
+			"etype": "file_stream_create", "summary": "ADS/流创建(Sysmon): " + filepath.Base(target),
+			"severity": "medium", "ts": ts,
+			"detail": withChan(map[string]any{
+				"source": "sysmon", "event_id": eid, "path": target,
+				"hash": data["Hash"], "contents": data["Contents"],
+				"pid": winevtInt(data["ProcessId"]), "process_name": filepath.Base(data["Image"]),
+			}),
+		}
+	case 17: // PipeCreated
+		if !winevtIsSysmon(chanName) {
+			return winevtGenericEvent(eid, ts, chanName, data)
+		}
+		pipe := data["PipeName"]
+		if pipe == "" {
+			return nil
+		}
+		return map[string]any{
+			"etype": "pipe_created", "summary": "命名管道(Sysmon): " + pipe,
+			"severity": "info", "ts": ts,
+			"detail": withChan(map[string]any{
+				"source": "sysmon", "event_id": eid, "pipe": pipe, "path": pipe,
+				"pid": winevtInt(data["ProcessId"]), "process_name": filepath.Base(data["Image"]),
+			}),
+		}
+	case 26: // FileDeleteDetected
+		if !winevtIsSysmon(chanName) {
+			return winevtGenericEvent(eid, ts, chanName, data)
+		}
+		target := data["TargetFilename"]
+		if target == "" {
+			return nil
+		}
+		return map[string]any{
+			"etype": "file_delete_detected", "summary": "文件删除检测(Sysmon): " + filepath.Base(target),
+			"severity": "info", "ts": ts,
+			"detail": withChan(map[string]any{
+				"source": "sysmon", "event_id": eid, "path": target,
+				"pid": winevtInt(data["ProcessId"]), "process_name": filepath.Base(data["Image"]),
+				"hash": data["Hashes"],
 			}),
 		}
 	case 1116, 1117:
@@ -450,7 +673,77 @@ func winevtMapEvent(eid int, ts, chanName string, data map[string]string) map[st
 		}
 		enrichWinTaskOpsFromCache(ev, task)
 		return ev
-	case 21, 23, 24, 25:
+	case 23: // Sysmon FileDelete 或 TerminalServices 会话
+		if winevtIsSysmon(chanName) {
+			target := data["TargetFilename"]
+			if target == "" {
+				return nil
+			}
+			return map[string]any{
+				"etype": "file_delete", "summary": "文件删除(Sysmon): " + filepath.Base(target),
+				"severity": "info", "ts": ts,
+				"detail": withChan(map[string]any{
+					"source": "sysmon", "event_id": eid, "path": target,
+					"pid": winevtInt(data["ProcessId"]), "process_name": filepath.Base(data["Image"]),
+					"hash": data["Hashes"], "is_executable": data["IsExecutable"],
+				}),
+			}
+		}
+		if !strings.Contains(strings.ToLower(chanName), "terminalservices") {
+			return nil
+		}
+		user := data["User"]
+		if user == "" {
+			user = data["Account"]
+		}
+		return map[string]any{
+			"etype": "win_rdp_session", "summary": "终端会话: " + user, "severity": "info", "ts": ts,
+			"detail": withChan(map[string]any{"source": "terminalservices", "event_id": eid, "user": user, "ip": data["Address"]}),
+		}
+	case 25: // Sysmon ProcessTampering 或 TerminalServices
+		if winevtIsSysmon(chanName) {
+			img := data["Image"]
+			typ := data["Type"]
+			if typ == "" {
+				typ = "Tampering"
+			}
+			return map[string]any{
+				"etype": "process_tampering", "summary": "进程篡改(Sysmon): " + filepath.Base(img) + " · " + typ,
+				"severity": "high", "ts": ts,
+				"detail": withChan(map[string]any{
+					"source": "sysmon", "event_id": eid, "path": img, "name": filepath.Base(img),
+					"pid": winevtInt(data["ProcessId"]), "tamper_type": typ,
+				}),
+			}
+		}
+		if !strings.Contains(strings.ToLower(chanName), "terminalservices") {
+			return nil
+		}
+		user := data["User"]
+		if user == "" {
+			user = data["Account"]
+		}
+		return map[string]any{
+			"etype": "win_rdp_session", "summary": "终端会话: " + user, "severity": "info", "ts": ts,
+			"detail": withChan(map[string]any{"source": "terminalservices", "event_id": eid, "user": user, "ip": data["Address"]}),
+		}
+	case 21: // Sysmon WmiEventConsumerToFilter 或 TerminalServices 会话
+		if winevtIsSysmon(chanName) {
+			et, sum, det := winevtSysmonWmiParts(eid, data)
+			return map[string]any{"etype": et, "summary": sum, "severity": "high", "ts": ts, "detail": withChan(det)}
+		}
+		if !strings.Contains(strings.ToLower(chanName), "terminalservices") {
+			return nil
+		}
+		user := data["User"]
+		if user == "" {
+			user = data["Account"]
+		}
+		return map[string]any{
+			"etype": "win_rdp_session", "summary": "终端会话: " + user, "severity": "info", "ts": ts,
+			"detail": withChan(map[string]any{"source": "terminalservices", "event_id": eid, "user": user, "ip": data["Address"]}),
+		}
+	case 24:
 		if !strings.Contains(strings.ToLower(chanName), "terminalservices") {
 			return nil
 		}
@@ -496,21 +789,172 @@ func winevtMapEvent(eid int, ts, chanName string, data map[string]string) map[st
 	return nil
 }
 
+func winevtIsSysmon(chanName string) bool {
+	return strings.Contains(strings.ToLower(chanName), "sysmon")
+}
+
+// winevtApplyHashes 把 Sysmon Hashes（MD5=..,SHA256=..,IMPHASH=..）拆成独立字段，方便管理端展示。
+func winevtApplyHashes(detail map[string]any, raw string) {
+	raw = strings.TrimSpace(raw)
+	if detail == nil || raw == "" {
+		return
+	}
+	detail["hash"] = raw
+	detail["hashes"] = raw
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		i := strings.IndexByte(part, '=')
+		if i <= 0 {
+			continue
+		}
+		k := strings.ToLower(strings.TrimSpace(part[:i]))
+		v := strings.TrimSpace(part[i+1:])
+		if v == "" {
+			continue
+		}
+		switch k {
+		case "md5":
+			detail["md5"] = v
+		case "sha1":
+			detail["sha1"] = v
+		case "sha256":
+			detail["sha256"] = v
+		case "imphash":
+			if asString(detail["imphash"]) == "" {
+				detail["imphash"] = v
+			}
+		}
+	}
+}
+
+// winevtEnrichProcessImage：非系统路径补签名/厂商/哈希（Temp 落地文件尤其需要同步）。
+func winevtEnrichProcessImage(detail map[string]any, img string) {
+	if detail == nil || img == "" || !peExtHot(img) {
+		return
+	}
+	needHash := asString(detail["sha256"]) == ""
+	needCorp := asString(detail["company"]) == "" && asString(detail["file_version"]) == ""
+	needSig := asString(detail["signed"]) == ""
+	if !needHash && !needCorp && !needSig {
+		attachFileMetaCached(detail, img)
+		return
+	}
+	// 用户目录 / Temp：文件可能秒删，同步补齐；系统目录只走缓存预热
+	low := strings.ToLower(img)
+	urgent := strings.Contains(low, `\temp\`) || strings.Contains(low, `\appdata\`) ||
+		strings.Contains(low, `\downloads\`) || strings.Contains(low, `\users\`) ||
+		!winevtWinDirPath(img)
+	if urgent {
+		pm := peMetaOf(img)
+		if needCorp {
+			if pm.Company != "" {
+				detail["company"] = pm.Company
+			}
+			if pm.FileVersion != "" {
+				detail["file_version"] = pm.FileVersion
+			}
+		}
+		if needSig && pm.Signed != "" {
+			detail["signed"] = pm.Signed
+			if pm.Signer != "" {
+				detail["signer"] = pm.Signer
+			}
+		}
+		if needHash && pm.SHA256 != "" {
+			detail["sha256"] = pm.SHA256
+		}
+		attachFileMeta(detail, img)
+		return
+	}
+	peMetaWarmAsync(img)
+	attachFileMetaCached(detail, img)
+}
+
+// winevtAttachSysmonExtras 把未单独建模的 Sysmon EventData 灌进 detail，供日志调查全字段研判。
+func winevtAttachSysmonExtras(detail map[string]any, data map[string]string) {
+	if detail == nil || data == nil {
+		return
+	}
+	skip := map[string]bool{
+		"Image": true, "CommandLine": true, "ProcessId": true, "ParentProcessId": true,
+		"User": true, "Hashes": true, "ParentImage": true, "ParentCommandLine": true,
+		"DestinationIp": true, "DestinationPort": true, "SourceIp": true, "SourcePort": true,
+		"Protocol": true, "QueryName": true, "QueryType": true, "TargetFilename": true,
+		"SourceImage": true, "TargetImage": true, "GrantedAccess": true, "CallTrace": true,
+		"TargetObject": true, "Details": true, "PipeName": true, "ImageLoaded": true,
+		"RuleName": true,
+	}
+	n := 0
+	for k, v := range data {
+		v = strings.TrimSpace(v)
+		if v == "" || skip[k] {
+			continue
+		}
+		lk := strings.ToLower(k)
+		if _, exists := detail[lk]; exists {
+			continue
+		}
+		if _, exists := detail[k]; exists {
+			continue
+		}
+		// 扁平写入，日志调查/详情可直接展示
+		detail[lk] = v
+		n++
+		if n >= 24 {
+			break
+		}
+	}
+}
+
+func winevtUnsignedStatus(st string) bool {
+	s := strings.ToLower(strings.TrimSpace(st))
+	if s == "" {
+		return false
+	}
+	return strings.Contains(s, "notsigned") || strings.Contains(s, "unavailable") ||
+		strings.Contains(s, "hashmismatch") || strings.Contains(s, "expired") ||
+		s == "unsigned" || strings.Contains(s, "未签名")
+}
+
 func winevtGenericEvent(eid int, ts, chanName string, data map[string]string) map[string]any {
+	if eid <= 0 {
+		return nil
+	}
 	low := strings.ToLower(chanName)
-	// BITS / SMB 已有专用 mapper；仅 TaskScheduler 等兜底时带上关键 EventData
+	// BITS / SMB 已有专用 mapper；未命中时不要再兜底，避免重复语义
 	if strings.Contains(low, "bits") || strings.Contains(low, "smb") {
 		return nil
 	}
-	if !strings.Contains(low, "taskscheduler") {
-		return nil
-	}
+	// XPath 已筛过的事件：兜底带 EventID 进时间线，供日志规则匹配
 	sum := chanName + " E" + strconv.Itoa(eid)
-	d := map[string]any{"source": "winevent", "event_id": eid, "channel": chanName}
-	for _, k := range []string{"TaskName", "Path", "UserContext", "ResultCode"} {
+	src := "winevent"
+	if winevtIsSysmon(chanName) {
+		src = "sysmon"
+	}
+	d := map[string]any{"source": src, "event_id": eid, "channel": chanName}
+	for _, k := range []string{"TaskName", "Path", "UserContext", "ResultCode", "ImagePath", "ServiceName", "param1", "param2",
+		"Image", "CommandLine", "User", "TargetFilename", "ProcessId", "ParentImage"} {
 		if v := data[k]; v != "" {
-			d[strings.ToLower(k)] = v
+			lk := strings.ToLower(k)
+			if k == "Image" {
+				d["path"] = v
+				d["name"] = filepath.Base(v)
+			} else if k == "CommandLine" {
+				d["command_line"] = v
+			} else if k == "ProcessId" {
+				d["pid"] = winevtInt(v)
+			} else if k == "ParentImage" {
+				d["parent_path"] = v
+				d["parent_name"] = filepath.Base(v)
+			} else if k == "TargetFilename" {
+				d["path"] = v
+			} else {
+				d[lk] = v
+			}
 		}
+	}
+	if winevtIsSysmon(chanName) {
+		winevtAttachSysmonExtras(d, data)
 	}
 	return map[string]any{
 		"etype": "winevent_generic", "summary": sum, "severity": "info", "ts": ts, "detail": d,
@@ -574,7 +1018,41 @@ func winevtSMBEvent(eid int, ts, chanName string, data map[string]string) map[st
 		"detail": map[string]any{
 			"source": "smbclient", "event_id": eid, "channel": chanName,
 			"share": share, "path": path, "user": user, "status": status,
-			"matched": firstNonEmpty(share, path),
+			"matched": firstNonEmpty(share, path), "direction": "client",
+		},
+	}
+}
+
+// winevtSMBServerEvent：本机作为 SMB 服务端被访问（横向移动落点常见）。
+func winevtSMBServerEvent(eid int, ts, chanName string, data map[string]string) map[string]any {
+	share := winevtPick(data, "ShareName", "shareName", "ObjectName")
+	user := winevtPick(data, "SubjectUserName", "AccountName", "IpAddress")
+	ip := winevtPick(data, "IpAddress", "SourceAddress", "ClientAddress")
+	path := winevtPick(data, "RelativeTargetName", "ObjectName", "ShareName", "Path")
+	access := winevtPick(data, "AccessMask", "AccessList", "Accesses")
+	sum := "SMB共享访问: " + firstNonEmpty(share, path, "share")
+	if ip != "" && ip != "-" {
+		sum += " ← " + ip
+	}
+	sev := "medium"
+	lowShare := strings.ToLower(share)
+	if strings.Contains(lowShare, "admin$") || strings.Contains(lowShare, "c$") || strings.Contains(lowShare, "ipc$") {
+		sev = "high"
+		sum = "SMB高危共享: " + firstNonEmpty(share, path)
+		if ip != "" && ip != "-" {
+			sum += " ← " + ip
+		}
+	}
+	if eid == 5145 {
+		sev = "high"
+	}
+	return map[string]any{
+		"etype": "win_smb", "summary": sum, "severity": sev, "ts": ts,
+		"detail": map[string]any{
+			"source": "smbserver", "event_id": eid, "channel": chanName,
+			"share": share, "path": path, "user": user, "remote_ip": ip,
+			"access": access, "matched": firstNonEmpty(share, path, ip),
+			"direction": "server",
 		},
 	}
 }
@@ -635,6 +1113,64 @@ func winevtTaskMicrosoft(tn string) bool {
 func winevtPrivInteresting(priv string) bool { return winevtPriv.MatchString(priv) }
 
 func winevtServiceNoise(short string) bool { return winevtSvcRe.MatchString(short) }
+
+func winevtSysmonWmiParts(eid int, data map[string]string) (etype, sum string, detail map[string]any) {
+	name := data["Name"]
+	if name == "" {
+		name = data["Consumer"]
+	}
+	if name == "" {
+		name = data["Filter"]
+	}
+	etype, sum = "wmi_persist_add", "WMI 永久订阅(Sysmon): "+name
+	switch eid {
+	case 19:
+		sum = "WMI Filter(Sysmon): " + name
+	case 20:
+		sum = "WMI Consumer(Sysmon): " + name
+	case 21:
+		sum = "WMI Binding(Sysmon): " + name
+	}
+	op := strings.ToLower(data["Operation"])
+	if strings.Contains(op, "delet") {
+		etype = "wmi_persist_delete"
+	} else if strings.Contains(op, "modif") {
+		etype = "wmi_persist_modify"
+	}
+	detail = map[string]any{
+		"source": "sysmon", "event_id": eid, "name": name, "operation": data["Operation"],
+		"user": data["User"], "type": data["Type"], "destination": data["Destination"],
+		"consumer": data["Consumer"], "filter": data["Filter"], "topic": "startup",
+	}
+	return etype, sum, detail
+}
+
+// winevtPersistTopic：注册表 ASEP → 调查页主题（启动项 / 服务）。
+func winevtPersistTopic(regPath string) string {
+	low := strings.ToLower(regPath)
+	if strings.Contains(low, `\services\`) && (strings.Contains(low, `\imagepath`) || strings.Contains(low, `\servicedll`) || strings.HasSuffix(low, `\start`) || strings.Contains(low, `\servicemanifest`)) {
+		return "service"
+	}
+	if strings.Contains(low, `currentversion\run`) || strings.Contains(low, `\runonce`) ||
+		strings.Contains(low, `\winlogon`) || strings.Contains(low, `shell folders\startup`) ||
+		strings.Contains(low, `\appinit_dlls`) || strings.Contains(low, `image file execution options`) {
+		return "startup"
+	}
+	return ""
+}
+
+// winevtFileTopic：文件落地路径 → 调查页主题。
+func winevtFileTopic(path string) string {
+	low := strings.ToLower(path)
+	if strings.Contains(low, `\startup\`) || strings.Contains(low, `\start menu\`) {
+		return "startup"
+	}
+	if strings.Contains(low, `\windows\system32\tasks`) || strings.Contains(low, `\windows\syswow64\tasks`) ||
+		strings.Contains(low, `\windows\tasks\`) {
+		return "task"
+	}
+	return "file_create"
+}
 
 func winevtSnip(s string, n int) string {
 	if len(s) <= n {

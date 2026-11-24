@@ -1,421 +1,101 @@
 <template>
   <div class="app">
-    <aside
-      class="rail"
-      @mouseenter="onNavEnter"
-      @mouseleave="onNavLeave"
-    >
-      <div class="logo" title="EDR 终端安全管理后台">
-        <span class="logo-mark">E</span>
-        <strong class="logo-name">EDR</strong>
-      </div>
-      <nav class="rail-nav">
-        <button
-          v-for="item in railItems"
-          :key="item.id"
-          type="button"
-          class="rail-item"
-          :class="{ on: section === item.id }"
-          :title="item.label"
-          @click="setSection(item.id); menuHover = true"
-        >
-          <span class="ico" v-html="item.ico" />
-          <em>{{ item.short || item.label }}</em>
-          <i v-if="item.id === 'detect' && openEventCount" class="dot-n">{{ openEventCount > 99 ? '99+' : openEventCount }}</i>
-        </button>
-      </nav>
-      <div class="rail-bottom">
-        <button type="button" class="rail-user" :title="`${user?.display_name || user?.username || ''}（${user?.role_label || ''}）`" @click.stop="userMenuOpen = !userMenuOpen">
-          <span class="ru-avatar">{{ userInitial }}</span>
-          <em>{{ user?.username }}</em>
-        </button>
-        <div v-if="userMenuOpen" class="user-pop" @click.stop>
-          <div class="up-head">
-            <span class="ru-avatar lg">{{ userInitial }}</span>
-            <div>
-              <strong>{{ user?.display_name || user?.username }}</strong>
-              <small>{{ user?.username }} · {{ user?.role_label }}</small>
-            </div>
-          </div>
-          <p v-if="user?.last_login_ip" class="up-meta">本次登录 IP：{{ user.last_login_ip }}</p>
-          <button type="button" class="up-item" @click="openPwDialog">修改密码</button>
-          <button v-if="isAdmin" type="button" class="up-item" @click="userMenuOpen = false; goMenu('accounts')">账号管理</button>
-          <button type="button" class="up-item danger" @click="emit('logout')">退出登录</button>
-        </div>
-      </div>
-    </aside>
+    <ConsoleNavigationShell :rail-items="railItems" :section="section" :page="page" :rules-section="rulesSection" :open-event-count="openEventCount"
+      :user="user" :user-initial="userInitial" :is-admin="isAdmin" :user-menu-open="userMenuOpen" :menu-visible="menuVisible && section !== 'overview'" :menu-pinned="menuPinned" :section-title="sectionTitle" :menu-groups="menuGroups"
+      @nav-enter="onNavEnter" @nav-leave="onNavLeave" @section="setSection($event)" @page="goMenu"
+      @toggle-user="userMenuOpen = !userMenuOpen" @password="openPwDialog" @accounts="userMenuOpen = false; goMenu('accounts')" @logout="emit('logout')" @toggle-pin="menuPinned = !menuPinned" />
 
-    <aside
-      class="menu"
-      :class="{ open: menuVisible }"
-      @mouseenter="onNavEnter"
-      @mouseleave="onNavLeave"
-    >
-      <div class="menu-top">
-        <h2>{{ sectionTitle }}</h2>
-        <button
-          type="button"
-          class="menu-pin"
-          :class="{ on: menuPinned }"
-          :title="menuPinned ? '取消固定' : '固定二级菜单'"
-          @click="menuPinned = !menuPinned"
-        >{{ menuPinned ? '已固定' : '固定' }}</button>
-      </div>
-      <template v-for="group in menuGroups" :key="group.title || 'g'">
-        <p v-if="group.title" class="menu-group">{{ group.title }}</p>
-        <button
-          v-for="m in group.items"
-          :key="m.id"
-          type="button"
-          class="menu-item"
-          :class="{ on: page === m.id || (m.id === 'events' && (page === 'threat-view' || page === 'events')) || (m.id === 'malware' && page === 'malware') || (m.id === 'whitelist' && page === 'rules' && rulesSection === 'whitelist') }"
-          @click="goMenu(m.id)"
-        >{{ m.label }}</button>
-      </template>
-      <p v-if="section === 'asset'" class="menu-hint">
-        在终端列表点主机，即可查看进程 / 服务 / 网络等模块数据与可疑行为。
-      </p>
-      <p v-if="section === 'overview'" class="menu-hint">
-        态势 / 调查 / 终端三类快捷入口；点选后会跳到对应分区继续深入。
-      </p>
-      <p v-if="section === 'detect'" class="menu-hint">
-        威胁事件可处置；时间线 / 狩猎 / IOC 在本栏下方菜单。处置结果在详情「处置结果」页签查看。
-      </p>
-      <p v-if="section === 'deploy'" class="menu-hint">
-        「处置审计」可查看谁点了结束进程 / 隔离等操作及结果。
-      </p>
-      <p v-if="section === 'rules'" class="menu-hint">
-        Agent 规则：单条快照特征（可限文件类型）。行为序列：时间窗口内 A→B→C 链式命中。
-      </p>
-      <p v-if="section === 'ai'" class="menu-hint">
-        选择在线终端后自动汇总快照、威胁事件与日志，结合 Skill 调用本地大模型研判。
-      </p>
-      <p class="menu-hint soft">默认隐藏二级菜单：鼠标移到左侧图标栏可展开；需要常显时点「固定」。</p>
-    </aside>
-
-    <div class="workspace" :class="{ 'menu-pinned': menuPinned }">
-      <div v-if="error || okMsg || respToast" class="toast-stack">
-        <div v-if="error" class="toast err toast-with-x" role="alert">
-          <span class="toast-main" @click="clearErrorToast">{{ error }}</span>
-          <button type="button" class="toast-x" title="关闭" @click="clearErrorToast">×</button>
-        </div>
-        <p v-if="okMsg" class="toast ok">{{ okMsg }}</p>
-        <div v-if="respToast" class="toast float" :class="respToast.cls" @click="dismissRespToast">
-          <div class="toast-main">
-            <b>{{ respToast.title }}</b>
-            <span>{{ respToast.detail }}</span>
-          </div>
-          <button type="button" class="toast-x" @click.stop="dismissRespToast">×</button>
-        </div>
-      </div>
+    <Teleport to="body">
+      <ConsoleWorkbenchBar
+        :crumbs="workbenchCrumbs"
+        :tab-items="tabItems"
+        :show-tabs="showTabs"
+        :page="page"
+        :density="density"
+        :theme="theme"
+        :menu-open="sideMenuOpen"
+        @search="globalSearchOpen = true"
+        @activate-tab="activateTab"
+        @close-tab="closeTab"
+        @close-other-tabs="closeOtherTabs"
+        @close-all-tabs="closeAllTabs"
+        @toggle-density="toggleDensity"
+        @toggle-theme="onToggleTheme"
+        @open-theme="onOpenThemeFromMenu"
+      >
+        <LiveConnectionBadge :connected="liveOk" :age="liveAgo" />
+        <SampleInboxPanel
+          :open="sampleInboxOpen"
+          :notifications="notifyItems"
+          :badge-count="notifyBadgeCount"
+          @toggle="onToggleNotify"
+          @close="sampleInboxOpen = false"
+          @download="onSampleInboxDownload"
+          @dismiss="dismissNotify"
+          @clear-ready="clearReadySamples"
+          @refresh="refreshSampleInbox"
+          @open-event="onSampleOpenEvent"
+          @mark-read="markNotifyRead"
+          @mark-all-read="markAllNotifyRead"
+        />
+      </ConsoleWorkbenchBar>
+    </Teleport>
+    <ConsoleThemeDrawer
+      :open="themeDrawerOpen"
+      :theme="theme"
+      :density="density"
+      :radius="radius"
+      :font-scale="fontScale"
+      :watermark="watermark"
+      :show-tabs="showTabs"
+      @close="closeThemeDrawer"
+      @set-theme="onThemeDrawerSetTheme"
+      @set-density="setDensity"
+      @set-radius="setRadius"
+      @set-font="setFontScale"
+      @set-watermark="setWatermark"
+      @set-show-tabs="setShowTabs"
+    />
+    <div class="workspace" :class="{ 'menu-pinned': menuPinned && section !== 'overview' }" :data-page="page">
+      <ConsoleGlobalSearch
+        :open="globalSearchOpen"
+        :is-admin="isAdmin"
+        @close="globalSearchOpen = false"
+        @select="goMenu"
+      />
+      <ConsoleWatermark :enabled="watermark" :username="user?.username || user?.display_name || ''" />
+      <ConsoleToastStack
+        :error="error"
+        :ok-msg="okMsg"
+        :resp-toast="respToast"
+        :sample-toast="sampleToast"
+        @clear-error="clearErrorToast"
+        @dismiss="dismissRespToast"
+        @sample-action="onSampleToastAction"
+        @dismiss-sample="sampleToast = null"
+      />
 
       <!-- ========== 数据概览 ========== -->
-      <section v-if="page === 'overview'" class="page overview">
-        <header class="page-hd">
-          <div>
-            <h1>数据概览</h1>
-            <p class="desc">威胁优先 · 终端态势 · 一键下钻</p>
-          </div>
+      <OverviewPage v-if="page === 'overview'"
+        :fleet="{ ovAgentTotal, onlineCount, overviewStats, overviewSparkTl, overviewSparkDns, ovFleetCollapsed }"
+        :activity="{ recentThreats, recentRiskTimeline, agents, onlineCount, sevLabel, short, modLabel, fmtTime, cleanSummary, etypeLabel, alertCount }"
+        :summary="{ focusCats, ovStatus, ovSevDist, ovTrend, overviewTopMalware, ovTopHosts }"
+        @navigate="goPage" @network="openOverviewNetworkView" @toggle="ovFleetCollapsed = !ovFleetCollapsed" @events="goEventsWith"
+        @menu="goMenu" @event="openEvent" @timeline="openTimelineFor" @host="openHost">
+        <template #header>
+        <ConsolePageHeader title="数据概览" description="威胁优先 · 终端态势 · 一键下钻">
           <div class="hd-right">
-            <span class="live-hint" :class="{ on: liveOk }">
-              <i class="live-dot" />
-              {{ liveOk ? `已连接 · ${liveAgo}` : '连接中…' }}
-            </span>
+            <LiveConnectionBadge :connected="liveOk" :age="liveAgo" />
+            <button type="button" class="btn ghost-btn" @click="goMenu('attck')">ATT&CK 看板</button>
             <button type="button" class="btn ghost-btn" :disabled="loading" @click="refresh">立即同步</button>
           </div>
-        </header>
-
-        <div class="ov-fleet-strip" :class="{ collapsed: ovFleetCollapsed }">
-          <div class="ov-fleet-main">
-            <section class="ov-fleet-block">
-              <header class="ov-fleet-hd">
-                <span class="ov-fleet-ico" aria-hidden="true">🖥</span>
-                <span>已接入终端</span>
-                <i class="ov-info" title="Forensic Agent 注册主机；VA 为无 Agent 探针占位">i</i>
-              </header>
-              <div class="ov-fleet-metric">
-                <strong>{{ ovAgentTotal }}</strong>
-                <span class="ov-pill agent">Agent {{ ovAgentTotal }}</span>
-                <span class="ov-pill va">VA {{ overviewStats.agents?.va ?? 0 }}</span>
-              </div>
-              <div class="ov-fleet-sub">
-                <div class="ov-fleet-cell click" @click="goPage('hosts')">
-                  <em>在线终端</em><b class="c-online">{{ onlineCount }}</b>
-                </div>
-                <div class="ov-fleet-cell">
-                  <em>24小时采集日志</em>
-                  <div class="ov-spark-row">
-                    <b>{{ overviewStats.timeline_24h?.display ?? '—' }}</b>
-                    <svg v-if="overviewSparkTl" class="ov-spark" viewBox="0 0 120 32" preserveAspectRatio="none">
-                      <polyline :points="overviewSparkTl" fill="none" stroke="#12b76a" stroke-width="1.5" />
-                    </svg>
-                  </div>
-                </div>
-              </div>
-            </section>
-            <span class="ov-fleet-div" />
-            <section class="ov-fleet-block">
-              <header class="ov-fleet-hd">
-                <span class="ov-fleet-ico" aria-hidden="true">🏢</span>
-                <span>职场 / 出口</span>
-              </header>
-              <div class="ov-fleet-sub three">
-                <div class="ov-fleet-cell click" @click="goPage('groups')">
-                  <em>已接入分组</em><b>{{ overviewStats.groups ?? 0 }}</b>
-                </div>
-                <div class="ov-fleet-cell click" @click="openOverviewNetworkView('external')">
-                  <em>活跃外联 IP(24h)</em><b>{{ overviewStats.network_exits ?? 0 }}</b>
-                </div>
-                <div class="ov-fleet-cell click" @click="openOverviewNetworkView('dns')">
-                  <em>24小时 DNS 请求</em>
-                  <div class="ov-spark-row">
-                    <b>{{ overviewStats.dns_24h?.display ?? '—' }}</b>
-                    <svg v-if="overviewSparkDns" class="ov-spark" viewBox="0 0 120 32" preserveAspectRatio="none">
-                      <polyline :points="overviewSparkDns" fill="none" stroke="#12b76a" stroke-width="1.5" />
-                    </svg>
-                  </div>
-                </div>
-              </div>
-            </section>
-          </div>
-          <button type="button" class="ov-fleet-toggle" :aria-expanded="!ovFleetCollapsed" @click="ovFleetCollapsed = !ovFleetCollapsed">
-            {{ ovFleetCollapsed ? '展开' : '收起' }}
-          </button>
-        </div>
-
-        <div class="ov-threat-rail">
-          <article class="ov-rail-card click" @click="goPage('events')">
-            <div class="ov-rail-ico warn">!</div>
-            <div class="ov-rail-body">
-              <span>告警主机</span>
-              <strong>{{ overviewStats.threats?.alerted_hosts ?? 0 }}</strong>
-              <small>Agent <b>{{ overviewStats.agents?.online ?? onlineCount }}</b> · VA <b>0</b></small>
-            </div>
-          </article>
-          <article class="ov-rail-card click" @click="goPage('malware')">
-            <div class="ov-rail-ico file">📁</div>
-            <div class="ov-rail-body">
-              <span>检出恶意文件</span>
-              <strong>{{ overviewStats.threats?.malware_total ?? 0 }}</strong>
-              <small>已处置 <b class="ok">{{ overviewStats.threats?.malware_handled ?? 0 }}</b></small>
-            </div>
-          </article>
-          <article class="ov-rail-card click" @click="goEventsWith({ focus: 'process' })">
-            <div class="ov-rail-ico endpoint">🛡</div>
-            <div class="ov-rail-body">
-              <span>终端威胁</span>
-              <strong>{{ overviewStats.threats?.endpoint_total ?? 0 }}</strong>
-              <small>已处置 <b class="ok">{{ overviewStats.threats?.endpoint_handled ?? 0 }}</b>
-                <template v-if="overviewStats.threats?.endpoint_need_auth"> · 待跟进 {{ overviewStats.threats.endpoint_need_auth }}</template>
-              </small>
-            </div>
-          </article>
-          <article class="ov-rail-card click" @click="goEventsWith({ focus: 'network' })">
-            <div class="ov-rail-ico net">🌐</div>
-            <div class="ov-rail-body">
-              <span>外连威胁</span>
-              <strong>{{ overviewStats.threats?.external_total ?? 0 }}</strong>
-              <small>已处置 <b class="ok">{{ overviewStats.threats?.external_handled ?? 0 }}</b></small>
-            </div>
-          </article>
-        </div>
-
-        <div class="ov-body">
-          <div class="panel ov-threats">
-            <div class="panel-hd">
-              <div>
-                <h3>最近威胁</h3>
-                <span class="meta">点击进入威胁视图处置</span>
-              </div>
-              <div class="hd-right">
-                <button type="button" class="btn-text" @click="goMenu('behaviors')">检出行为</button>
-                <button type="button" class="btn-text" @click="goPage('events')">全部 →</button>
-              </div>
-            </div>
-            <div v-if="recentThreats.length" class="table-scroll ov-threat-scroll">
-              <table class="evt-table">
-                <thead>
-                  <tr>
-                    <th>级别</th>
-                    <th>事件</th>
-                    <th>主机</th>
-                    <th>模块</th>
-                    <th>时间</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr
-                    v-for="e in recentThreats"
-                    :key="e.id"
-                    class="row-click"
-                    @click="openEvent(e)"
-                  >
-                    <td><span class="sev" :data-s="e.severity">{{ sevLabel(e.severity) }}</span></td>
-                    <td class="strong">{{ e.title }}</td>
-                    <td>{{ e.hostname || short(e.agent_id) }}</td>
-                    <td class="muted">{{ modLabel(e.module) || '—' }}</td>
-                    <td class="mono">{{ fmtTime(e.updated_at || e.created_at) }}</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-            <div v-else-if="recentRiskTimeline.length" class="table-scroll ov-threat-scroll">
-              <p class="hint" style="margin:8px 14px">暂无正式威胁事件，以下为近期中高危时间线</p>
-              <table class="evt-table">
-                <thead>
-                  <tr><th>级别</th><th>摘要</th><th>主机</th><th>类型</th><th>时间</th></tr>
-                </thead>
-                <tbody>
-                  <tr
-                    v-for="t in recentRiskTimeline"
-                    :key="t.id || (t.ts + t.summary)"
-                    class="row-click"
-                    @click="openTimelineFor(t.agent_id)"
-                  >
-                    <td><span class="sev" :data-s="t.severity">{{ sevLabel(t.severity) }}</span></td>
-                    <td class="strong">{{ cleanSummary(t.summary) }}</td>
-                    <td>{{ t.hostname || short(t.agent_id) }}</td>
-                    <td class="muted">{{ etypeLabel(t.etype) }}</td>
-                    <td class="mono">{{ fmtTime(t.ts) }}</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-            <div v-else class="empty sm ov-empty">
-              <p>暂无威胁事件</p>
-              <p v-if="!agents.length" class="hint sm">尚未接入终端，可前往 <button type="button" class="btn-text" @click="goMenu('deploy')">部署安装</button> 纳管第一台主机。</p>
-              <button type="button" class="btn sm" @click="goMenu('timeline')">查看时间线</button>
-            </div>
-          </div>
-
-          <aside class="panel ov-side">
-            <div class="panel-hd">
-              <h3>终端</h3>
-              <button type="button" class="btn-text" @click="goPage('hosts')">管理 →</button>
-            </div>
-            <div class="ov-host-summary">
-              <div><b>{{ onlineCount }}</b><span>在线</span></div>
-              <div><b>{{ agents.length - onlineCount }}</b><span>离线</span></div>
-              <div><b>{{ agents.reduce((n, a) => n + (alertCount(a.agent_id) || 0), 0) }}</b><span>告警</span></div>
-            </div>
-            <div class="ov-host-list">
-              <button
-                v-for="a in agents"
-                :key="a.agent_id"
-                type="button"
-                class="ov-host-row"
-                @click="openHost(a, 'hosts')"
-              >
-                <i :class="['dot', a.online ? 'on' : '']" />
-                <div class="ov-host-main">
-                  <b>{{ a.hostname || short(a.agent_id) }}</b>
-                  <small>{{ a.ip || '—' }} · v{{ a.version || '—' }} · {{ a.online ? '在线' : '离线' }}</small>
-                </div>
-                <span v-if="alertCount(a.agent_id)" class="alert-n badge">{{ alertCount(a.agent_id) }}</span>
-                <span v-else class="ov-host-ok">正常</span>
-              </button>
-              <p v-if="!agents.length" class="empty sm">暂无终端</p>
-            </div>
-            <div class="ov-ops-mini">
-              <div class="ov-ops-hd">
-                <b>采集与下发</b>
-                <button type="button" class="btn-text sm" @click="setSection('rules')">端上能力 →</button>
-              </div>
-              <dl class="ov-ops-dl">
-                <div><dt>sync_rev</dt><dd class="mono">{{ agentSyncManifest?.sync_rev ?? '—' }}</dd></div>
-                <div><dt>采集异常</dt><dd>{{ overviewStats.agents?.degraded_capture ?? 0 }} 台在线</dd></div>
-                <div>
-                  <dt>组件漂移</dt>
-                  <dd>
-                    <button
-                      type="button"
-                      class="btn-text"
-                      :class="{ warn: (overviewStats.agents?.component_drift ?? 0) > 0 }"
-                      @click="goMenu('upgrade')"
-                    >
-                      {{ overviewStats.agents?.component_drift ?? 0 }} 台
-                    </button>
-                  </dd>
-                </div>
-                <div><dt>策略未收敛</dt><dd>{{ overviewStats.agents?.policy_drift ?? 0 }} 台在线</dd></div>
-                <div><dt>威胁事件</dt><dd>{{ allEvents.length }} 条</dd></div>
-              </dl>
-              <p v-if="ovDriftHint" class="hint sm ov-cap-hint warn-line">{{ ovDriftHint }}</p>
-              <p v-else-if="ovOnlineCaptureHint" class="hint sm ov-cap-hint">{{ ovOnlineCaptureHint }}</p>
-            </div>
-            <div class="ov-side-links">
-              <button type="button" class="btn sm" @click="goMenu('deploy')">部署安装</button>
-              <button type="button" class="btn sm" @click="goMenu('hunt')">调查狩猎</button>
-              <button type="button" class="btn sm" @click="goMenu('policy')">EDR 策略</button>
-              <button type="button" class="btn sm" @click="goMenu('attck')">ATT&CK</button>
-            </div>
-          </aside>
-        </div>
-
-        <div class="ov-bottom-grid">
-          <div class="panel ov-panel">
-            <div class="panel-hd"><h3>威胁分类</h3><button type="button" class="btn-text" @click="goPage('events')">威胁事件 →</button></div>
-            <div class="ov-cats ov-cats-compact">
-              <button v-for="c in focusCats" :key="c.key" type="button" class="ov-cat" @click="goEventsWith({ focus: c.key })">
-                <span class="focus-ico" :style="{ background: c.color }">{{ c.short }}</span>
-                <b>{{ c.label }}</b>
-                <em>{{ c.count }}</em>
-              </button>
-            </div>
-          </div>
-
-          <div class="panel ov-panel">
-            <div class="panel-hd"><h3>告警级别</h3><span class="meta">未处置 {{ ovStatus.open }} · 已处置 {{ ovStatus.closed }}</span></div>
-            <div class="ov-bars">
-              <div v-for="s in ovSevDist" :key="s.key" class="ov-bar-row">
-                <span class="sev" :data-s="s.key">{{ s.label }}</span>
-                <div class="ov-bar"><i :style="{ width: s.pct + '%' }" :data-s="s.key" /></div>
-                <b>{{ s.count }}</b>
-              </div>
-            </div>
-          </div>
-
-          <div class="panel ov-panel">
-            <div class="panel-hd"><h3>近 7 天告警趋势</h3><span class="meta">共 {{ ovTrend.total }} 条</span></div>
-            <div class="ov-trend">
-              <div v-for="d in ovTrend.days" :key="d.day" class="ov-trend-col" :title="`${d.day}：${d.count} 条（高危 ${d.high}）`">
-                <em>{{ d.count || '' }}</em>
-                <div class="ov-trend-bar"><i :style="{ height: d.pct + '%' }" /><i class="hi" :style="{ height: d.hpct + '%' }" /></div>
-                <small>{{ d.label }}</small>
-              </div>
-            </div>
-          </div>
-
-          <div class="panel ov-panel">
-            <div class="panel-hd">
-              <h3>{{ overviewTopMalware.length ? 'TOP5 恶意文件' : '风险终端 Top 5' }}</h3>
-              <button type="button" class="btn-text" @click="overviewTopMalware.length ? goPage('malware') : goPage('hosts')">{{ overviewTopMalware.length ? '全部 →' : '终端列表 →' }}</button>
-            </div>
-            <ul v-if="overviewTopMalware.length" class="ov-mal-list compact">
-              <li v-for="(m, i) in overviewTopMalware" :key="i">
-                <i>{{ i + 1 }}</i><span class="mono" :title="m.title">{{ m.title }}</span><em>{{ m.count }}</em>
-              </li>
-            </ul>
-            <div v-else class="ov-rank">
-              <button v-for="(h, i) in ovTopHosts" :key="h.agent_id" type="button" class="ov-rank-row" @click="goEventsWith({ agent: h.agent_id })">
-                <i>{{ i + 1 }}</i>
-                <b>{{ h.hostname }}</b>
-                <span v-if="h.high" class="sev" data-s="high">高危 {{ h.high }}</span>
-                <em>{{ h.count }} 条</em>
-              </button>
-              <p v-if="!ovTopHosts.length" class="empty sm">暂无数据</p>
-            </div>
-          </div>
-        </div>
-      </section>
+        </ConsolePageHeader>
+        </template>
+      </OverviewPage>
 
       <!-- ========== 主机时间线 ========== -->
       <section v-else-if="page === 'timeline'" class="page timeline-page">
-        <header class="page-hd">
-          <div>
-            <h1>主机时间线</h1>
-            <p class="desc">进程创建 / 退出、文件落地等近实时事件 · 共 {{ filteredTimeline.length }} 条</p>
-          </div>
+        <ConsolePageHeader title="主机时间线" :description="`进程创建 / 退出、文件落地等近实时事件 · 共 ${filteredTimeline.length} 条`">
           <div class="hd-right">
             <select v-model="tlAgentId" class="search" @change="loadTimeline">
               <option value="">全部终端</option>
@@ -424,9 +104,21 @@
             <input v-model="tlQ" class="search" placeholder="搜索摘要 / 路径 / PID…" @keyup.enter="loadTimeline" />
             <button type="button" class="btn primary" @click="loadTimeline">查询</button>
           </div>
-        </header>
+        </ConsolePageHeader>
 
-        <div class="tl-filters">
+        <div class="tl-view-switch" role="tablist" aria-label="时间线视图">
+          <button type="button" role="tab" class="tlv" :class="{ on: tlView === 'timeline' }" :aria-selected="tlView === 'timeline'" @click="tlView = 'timeline'">
+            事件时间线
+          </button>
+          <button type="button" role="tab" class="tlv" :class="{ on: tlView === 'tree' }" :aria-selected="tlView === 'tree'" @click="tlView = 'tree'">
+            进程视角 <em>{{ tlProcessTree.total }}</em>
+          </button>
+          <span class="tlv-legend">
+            <i data-k="proc" />进程 <i data-k="net" />网络 <i data-k="file" />文件 <i data-k="persist" />持久化 <i data-k="alert" />告警
+          </span>
+        </div>
+
+        <div class="tl-filters" v-show="tlView === 'timeline'">
           <button
             type="button"
             class="tl-fchip"
@@ -445,7 +137,7 @@
         </div>
         <p class="tl-hint">已过滤 Agent 自身采集命令及同一进程的重复记录；分类计数为全部数据，列表显示最近 300 条。点卡片「详情」查看完整字段。</p>
 
-        <div class="tl-board" v-if="filteredTimeline.length">
+        <div class="tl-board" v-if="filteredTimeline.length" v-show="tlView === 'timeline'">
           <div class="tl-rail">
             <article
               v-for="t in pagedTimeline"
@@ -519,6 +211,46 @@
         </div>
         <div v-else class="panel pad">
           <p class="empty">暂无时间线事件。请确认终端已安装 Agent 且在线上报。</p>
+        </div>
+
+        <!-- Process-tree view (derived from the same timeline data) -->
+        <div v-if="filteredTimeline.length && tlView === 'tree'" class="tl-tree-board panel pad">
+          <div class="tl-tree-head">
+            <div>
+              <h3>进程视角</h3>
+              <p class="hint sm">按 PID 聚合并用父子关系连成进程树 · 共 {{ tlProcessTree.total }} 个进程 / {{ filteredTimeline.length }} 条事件</p>
+            </div>
+            <span class="muted sm">点节点展开该进程的事件</span>
+          </div>
+          <div v-if="tlProcessTree.roots.length" class="tl-tree">
+            <div
+              v-for="entry in tlProcessTree.flat"
+              :key="entry.node.key"
+              class="tl-tree-node"
+              :class="{ child: entry.depth > 0 }"
+              :data-s="entry.node.topSeverity"
+              :style="{ marginLeft: entry.depth * 26 + 'px' }"
+            >
+              <div class="tpn-row" @click="tlToggleTreeNode(entry.node.key)">
+                <span class="tpn-caret" :class="{ open: tlTreeOpen.has(entry.node.key) }">›</span>
+                <span v-if="entry.depth > 0" class="tpn-branch">└</span>
+                <span class="tpn-dot" />
+                <b class="tpn-name" :title="entry.node.cmd || entry.node.name">{{ entry.node.name }}</b>
+                <span v-if="entry.node.pid" class="tpn-pid mono">PID {{ entry.node.pid }}</span>
+                <span class="sev" :data-s="entry.node.topSeverity">{{ sevLabel(entry.node.topSeverity) }}</span>
+                <em class="tpn-count">{{ entry.node.eventCount }} 条</em>
+              </div>
+              <div v-if="tlTreeOpen.has(entry.node.key)" class="tpn-events">
+                <div v-for="e in entry.node.events" :key="e.id" class="tpn-ev" :data-k="etypeKind(e.etype)">
+                  <time>{{ fmtTime(e.ts || e.created_at) }}</time>
+                  <span class="tpn-ev-kind">{{ etypeLabel(e.etype) }}</span>
+                  <span>{{ e.summary }}</span>
+                </div>
+                <button type="button" class="btn sm" @click="tlFocusTreeEvents(entry.node)">在时间线中查看</button>
+              </div>
+            </div>
+          </div>
+          <p v-else class="empty">当前事件窗口内没有可关联的父子进程关系，切回「事件时间线」查看。</p>
         </div>
       </section>
 
@@ -608,6 +340,28 @@
                 <option v-for="(lab, key) in TACTIC_CN" :key="key" :value="key">{{ lab }}</option>
               </select>
             </label>
+            <label>采集来源
+              <select v-model="invFilters.source">
+                <option value="">全部</option>
+                <option value="sysmon">Sysmon</option>
+                <option value="etw">ETW</option>
+                <option value="security">Security</option>
+                <option value="powershell">PowerShell</option>
+              </select>
+            </label>
+            <label>EventID
+              <input v-model="invFilters.event_id" class="field mono" placeholder="如 11 / 22" />
+            </label>
+            <div class="inv-more-quick">
+              <span class="inv-more-quick-lab">快捷主题</span>
+              <button
+                type="button"
+                class="chip"
+                :class="{ on: invSysmonFileOn }"
+                @click="toggleInvSysmonFile"
+                title="Sysmon 文件创建 / 落地 / ADS / 删除等"
+              >Sysmon</button>
+            </div>
           </div>
           <div class="inv-search-row">
             <input
@@ -617,10 +371,6 @@
               @keyup.enter="runInvestigate"
             />
             <button type="button" class="btn" :class="{ on: invMoreFilters }" @click="invMoreFilters = !invMoreFilters">{{ invMoreFilters ? '− 收起筛选' : '+ 更多筛选条件' }}</button>
-            <label class="inv-check inv-hide-noise">
-              <input v-model="invHideProcNoise" type="checkbox" @change="runInvestigate" />
-              <em>隐藏普通进程创建</em>
-            </label>
             <button type="button" class="btn primary" :disabled="invBusy" @click="runInvestigate">{{ invBusy ? '查询中…' : '查询' }}</button>
             <button type="button" class="btn" @click="resetInvestigate">重置</button>
           </div>
@@ -656,6 +406,17 @@
             <button type="button" :class="{ on: invNatureTab === 'surface' }" @click="setInvNature('surface')">攻击面收敛 <em>{{ invCounts.surface || 0 }}</em></button>
             <button type="button" :class="{ on: invNatureTab === 'minor' }" @click="setInvNature('minor')">细微 <em>{{ invCounts.minor || 0 }}</em></button>
           </div>
+          <div class="inv-topics">
+            <span class="inv-topics-lab">关注</span>
+            <button
+              v-for="t in INV_TOPIC_CHIPS"
+              :key="t.id"
+              type="button"
+              class="chip"
+              :class="{ on: invFilters.topic === t.id }"
+              @click="setInvTopic(t.id)"
+            >{{ t.label }}</button>
+          </div>
 
           <div class="inv-layout" :class="{ open: !!invDetail }">
             <div class="inv-list">
@@ -684,27 +445,26 @@
                       >
                         <td class="mono">{{ fmtTime(it.ts) }}</td>
                         <td><span class="nat" :data-n="it.nature">{{ natureLabel(it.nature) }}</span></td>
-                        <td>{{ etypeLabel(it.etype) }}</td>
+                        <td class="inv-etype-td">
+                          <span class="inv-etype">{{ etypeLabel(it.etype) }}</span>
+                          <em
+                            v-for="tp in (it.topics || [])"
+                            :key="tp"
+                            class="src-chip topic"
+                          >{{ invTopicLabel(tp) }}</em>
+                          <em v-if="invRowIsSysmon(it)" class="src-chip sysmon" title="来源含 Sysmon">Sysmon</em>
+                          <em v-if="it.detail?.event_id != null && it.detail?.event_id !== ''" class="src-eid" title="EventID">E{{ it.detail.event_id }}</em>
+                        </td>
                         <td class="strong" :title="cleanSummary(it.summary)">{{ cleanSummary(it.summary) }}</td>
                         <td>{{ it.hostname || short(it.agent_id) }}</td>
-                        <td>{{ it.name || '—' }} <em v-if="it.pid" class="muted">#{{ it.pid }}</em></td>
-                        <td class="muted mono" :title="it.command_line || it.path">{{ (it.command_line || it.path || '—').slice(0, 64) }}</td>
+                        <td>{{ it.name || it.detail?.process_name || '—' }} <em v-if="it.pid || it.detail?.pid" class="muted">#{{ it.pid || it.detail?.pid }}</em></td>
+                        <td class="muted mono" :title="it.command_line || it.path || it.detail?.path">{{ (it.command_line || it.path || it.detail?.path || '—').slice(0, 64) }}</td>
                       </tr>
                     </tbody>
                   </table>
                 </div>
-                <div class="list-pager">
-                  <span class="pg-info">第 {{ invPage }} / {{ invPageCount }} 页 · 共 {{ invItems.length }} 条</span>
-                  <div class="pg-acts">
-                    <select v-model.number="invPageSize" class="pg-size" @change="invPage = 1">
-                      <option :value="10">10 条/页</option>
-                      <option :value="20">20 条/页</option>
-                      <option :value="50">50 条/页</option>
-                    </select>
-                    <button type="button" class="btn sm" :disabled="invPage <= 1" @click="invPage--">上一页</button>
-                    <button type="button" class="btn sm" :disabled="invPage >= invPageCount" @click="invPage++">下一页</button>
-                  </div>
-                </div>
+                <ConsoleListPager :page-data="{ page: invPage, pageCount: invPageCount, total: invItems.length }"
+                  :page-size="invPageSize" :page-sizes="[10, 20, 50]" @size-change="invPageSize = $event; invPage = 1" @page-change="invPage = $event" />
               </template>
               <p v-else-if="!invBusy" class="empty ov-empty">暂无日志。确认 Agent 在线上报时间线后会自动加载；也可点「查询」。</p>
               <p v-else class="empty ov-empty">正在拉取时间线…</p>
@@ -840,12 +600,7 @@
 
       <!-- ========== 全局狩猎 ========== -->
       <section v-else-if="page === 'hunt'" class="page">
-        <header class="page-hd">
-          <div>
-            <h1>调查狩猎</h1>
-            <p class="desc">跨主机搜索：时间线 / 快照 / 威胁事件（哈希、路径、命令行等）</p>
-          </div>
-        </header>
+        <ConsolePageHeader title="威胁狩猎" description="跨主机搜索：时间线 / 快照 / 威胁事件（哈希、路径、命令行等）" />
         <div class="panel pad">
           <div class="hunt-bar">
             <input v-model="huntQ" class="search grow" placeholder="输入 SHA256 / 路径 / 进程名 / 命令片段…" @keyup.enter="runHunt" />
@@ -878,16 +633,12 @@
 
       <!-- ========== DNS 狩猎 ========== -->
       <section v-else-if="page === 'dns'" class="page dns-page">
-        <header class="page-hd">
-          <div>
-            <h1>DNS 狩猎</h1>
-            <p class="desc">按域名聚合：谁解析过某域名 / 应答 IP 反查 / 解析失败与 DGA；可筛情报命中外联</p>
-          </div>
+        <ConsolePageHeader title="DNS 狩猎" description="按域名聚合：谁解析过某域名 / 应答 IP 反查 / 解析失败与 DGA；可筛情报命中外联">
           <div class="hd-right">
             <button type="button" class="btn sm" :disabled="dnsBusy" @click="loadDns">{{ dnsBusy ? '刷新中…' : '刷新' }}</button>
             <button type="button" class="btn sm" @click="goMenu('events')">威胁事件 →</button>
           </div>
-        </header>
+        </ConsolePageHeader>
 
         <div class="evt-filter-bar panel pad">
           <label class="evt-fl">
@@ -988,12 +739,24 @@
                     </td>
                     <td>{{ d.nx_hits || '' }}</td>
                     <td>{{ d.max_dga ? Number(d.max_dga).toFixed(2) : '' }}</td>
-                    <td>
-                      <span
-                        v-if="d.ioc_hit"
-                        class="tag judge"
-                        :title="dnsIocTitle(d)"
-                      >{{ dnsIocLabel(d) }}</span>
+                    <td class="dns-ioc-cell" @click.stop>
+                      <template v-if="d.ioc_hit && (d.ioc_hits || []).length">
+                        <div class="dns-ioc-tags" :title="dnsIocTitle(d)">
+                          <span
+                            v-for="(h, hi) in (d.ioc_hits || []).slice(0, 3)"
+                            :key="hi"
+                            class="tag judge dns-ioc-tag"
+                          >
+                            <em class="via">{{ h.via_label || (h.via === 'answer' ? '应答IP' : '域名') }}</em>
+                            {{ dnsHitChip(h) }}
+                          </span>
+                          <span v-if="(d.ioc_hits || []).length > 3" class="muted sm">+{{ (d.ioc_hits || []).length - 3 }}</span>
+                        </div>
+                        <div v-if="dnsHitTags(d).length" class="dns-ioc-fam">
+                          <span v-for="(t, ti) in dnsHitTags(d).slice(0, 4)" :key="ti" class="tag soft">{{ t }}</span>
+                        </div>
+                      </template>
+                      <span v-else-if="d.ioc_hit" class="tag judge" :title="dnsIocTitle(d)">情报</span>
                       <span v-else class="muted">—</span>
                     </td>
                     <td class="muted" :title="(d.processes || []).join(', ')">{{ (d.processes || []).slice(0, 2).join(', ') }}{{ (d.processes || []).length > 2 ? '…' : '' }}</td>
@@ -1004,18 +767,8 @@
                 </tbody>
               </table>
             </div>
-            <div class="list-pager dns-pager">
-              <span class="pg-info">第 {{ dnsPage }} / {{ dnsPageCount }} 页 · 共 {{ filteredDnsItems.length }} 条</span>
-              <div class="pg-acts">
-                <select v-model.number="dnsPageSize" class="pg-size" @change="dnsPage = 1">
-                  <option :value="10">10 条/页</option>
-                  <option :value="20">20 条/页</option>
-                  <option :value="50">50 条/页</option>
-                </select>
-                <button type="button" class="btn sm" :disabled="dnsPage <= 1" @click="dnsPage--">上一页</button>
-                <button type="button" class="btn sm" :disabled="dnsPage >= dnsPageCount" @click="dnsPage++">下一页</button>
-              </div>
-            </div>
+            <ConsoleListPager class="dns-pager" :page-data="{ page: dnsPage, pageCount: dnsPageCount, total: filteredDnsItems.length }"
+              :page-size="dnsPageSize" :page-sizes="[10, 20, 50]" @size-change="dnsPageSize = $event; dnsPage = 1" @page-change="dnsPage = $event" />
           </template>
           <div v-else-if="!dnsBusy" class="empty ov-empty">
             <p>{{ dnsHasFilter ? '当前筛选下无 DNS 记录' : '暂无 DNS 记录（需要 0.11+ Agent 且 ETW 原生会话可用）' }}</p>
@@ -1295,33 +1048,17 @@
               </table>
             </div>
             <p v-else class="empty">暂无检出行为</p>
-            <div v-if="behaviorEvents.length" class="list-pager">
-              <span class="pg-info">第 {{ bhPage }} / {{ bhPageCount }} 页 · 共 {{ behaviorEvents.length }} 条</span>
-              <div class="pg-acts">
-                <select v-model.number="bhPageSize" class="pg-size" @change="bhPage = 1">
-                  <option :value="10">10 条/页</option>
-                  <option :value="20">20 条/页</option>
-                  <option :value="50">50 条/页</option>
-                </select>
-                <button type="button" class="btn sm" :disabled="bhPage <= 1" @click="bhPage--">上一页</button>
-                <button type="button" class="btn sm" :disabled="bhPage >= bhPageCount" @click="bhPage++">下一页</button>
-              </div>
-            </div>
+            <ConsoleListPager v-if="behaviorEvents.length" :page-data="{ page: bhPage, pageCount: bhPageCount, total: behaviorEvents.length }"
+              :page-size="bhPageSize" :page-sizes="[10, 20, 50]" @size-change="bhPageSize = $event; bhPage = 1" @page-change="bhPage = $event" />
           </div>
         </div>
       </section>
 
       <!-- ========== 威胁事件 / 恶意文件 ========== -->
       <section v-else-if="page === 'events' || page === 'malware'" class="page events-page" :class="{ 'malware-page': page === 'malware' }">
-        <header class="page-hd">
-          <div>
-            <h1>{{ page === 'malware' ? '恶意文件' : '威胁事件' }}</h1>
-            <p class="desc">{{ page === 'malware'
-              ? '文件落地、FIM 变更、带可执行路径/样本的告警（含「规则命中」类文件威胁）；点击行查看详情与隔离处置'
-              : '点击行在右侧查看详情；点「打开威胁视图」进入处置页' }}</p>
-          </div>
+        <ConsolePageHeader :title="page === 'malware' ? '恶意文件' : '威胁事件'" :description="page === 'malware' ? '文件落地、FIM 变更、带可执行路径/样本的告警（含「规则命中」类文件威胁）；点击行查看详情与隔离处置' : '点击行在右侧查看详情；点「打开威胁视图」进入处置页'" hide-description>
           <div class="hd-right">
-            <span class="live-hint" :class="{ on: liveOk }"><i class="live-dot" />{{ liveOk ? liveAgo : '连接中' }}</span>
+            <LiveConnectionBadge :connected="liveOk" :age="liveAgo" compact />
             <select v-if="page === 'malware'" v-model="eventSevFilter" class="search sev-filter">
               <option value="">全部级别</option>
               <option value="critical">严重</option>
@@ -1342,7 +1079,7 @@
               @click="removeAllEvents"
             >{{ eventFiltersActive || page === 'malware' ? '删除筛选结果' : '全部删除' }}</button>
           </div>
-        </header>
+        </ConsolePageHeader>
 
         <div v-if="page === 'events'" class="evt-filter-bar panel pad">
           <label class="evt-fl">
@@ -1391,24 +1128,52 @@
             <button type="button" class="btn primary" @click="applyEventFilters">查询</button>
             <button type="button" class="btn" @click="resetEventFilters">重置</button>
           </div>
+          <p v-if="eventListScope" class="evt-scope-note">
+            正在显示主页「{{ eventListScope === 'endpoint' ? '终端威胁' : '外连威胁' }}」：
+            {{ eventListScope === 'endpoint' ? '进程、内存、脚本等终端侧告警' : '网络外联与 DNS 告警' }}。
+            <button type="button" class="btn-text" @click="resetEventFilters">查看全部威胁事件</button>
+          </p>
         </div>
 
         <div class="event-layout single">
           <div class="event-main">
-            <div v-if="page === 'malware'" class="malware-summary panel pad">
-              <div class="mal-stat">
-                <b>{{ malwareFileStats.total }}</b>
+            <div v-if="page === 'malware'" class="malware-summary">
+              <button
+                type="button"
+                class="mal-stat"
+                :class="{ on: malwareStatFocus === 'all' }"
+                title="查看全部文件相关告警"
+                @click="onMalwareStatClick('all')"
+              >
                 <span>文件相关告警</span>
-              </div>
-              <div class="mal-stat">
-                <b>{{ malwareFileStats.hosts }}</b>
+                <b>{{ malwareFileStats.total }}</b>
+              </button>
+              <button
+                type="button"
+                class="mal-stat"
+                :class="{ on: malwareStatFocus === 'hosts' }"
+                title="按涉及终端查看告警"
+                @click="onMalwareStatClick('hosts')"
+              >
                 <span>涉及终端</span>
-              </div>
-              <div class="mal-stat">
-                <b>{{ malwareFileStats.high }}</b>
+                <b>{{ malwareFileStats.hosts }}</b>
+              </button>
+              <button
+                type="button"
+                class="mal-stat hot"
+                :class="{ on: malwareStatFocus === 'high' }"
+                title="只看高危 / 严重告警"
+                @click="onMalwareStatClick('high')"
+              >
                 <span>高危及以上</span>
-              </div>
-              <p class="hint sm">含 FIM、文件模块、路径/哈希可识别的规则命中（不仅「文件落地」分类卡片）</p>
+                <b>{{ malwareFileStats.high }}</b>
+              </button>
+              <p class="mal-note">
+                <template v-if="malwareStatFocus === 'high'">当前：高危 / 严重告警。再点一次卡片可取消筛选。</template>
+                <template v-else-if="malwareStatFocus === 'hosts'">当前：按涉及终端筛选。再点一次卡片可取消筛选。</template>
+                <template v-else-if="malwareStatFocus === 'all'">当前：全部文件相关告警。</template>
+                <template v-else>含 FIM、文件落地，以及路径 / 哈希能识别的规则命中。点上方数字可筛选对应告警。</template>
+              </p>
             </div>
             <div v-else class="focus-block">
               <div class="focus-title">重点关注事件</div>
@@ -1450,6 +1215,7 @@
               <div class="panel table-pane">
                 <div class="panel-hd">
                   <h3>{{ page === 'malware' ? '恶意文件告警' : '事件列表' }} ({{ filteredEvents.length }})</h3>
+                  <span v-if="eventWorkingSetIncomplete" class="hint">当前筛选仅覆盖已加载工作集，不代表全部历史告警（服务端总数 {{ eventServerTotal ?? '未知' }}）</span>
                 </div>
                 <div class="table-scroll">
                   <table class="evt-table">
@@ -1528,18 +1294,8 @@
                     </div>
                   </div>
                 </div>
-                <div v-if="filteredEvents.length" class="list-pager">
-                  <span class="pg-info">第 {{ evtPage }} / {{ evtPageCount }} 页 · 共 {{ filteredEvents.length }} 条</span>
-                  <div class="pg-acts">
-                    <select v-model.number="evtPageSize" class="pg-size" @change="evtPage = 1">
-                      <option :value="10">10 条/页</option>
-                      <option :value="20">20 条/页</option>
-                      <option :value="50">50 条/页</option>
-                    </select>
-                    <button type="button" class="btn sm" :disabled="evtPage <= 1" @click="evtPage--">上一页</button>
-                    <button type="button" class="btn sm" :disabled="evtPage >= evtPageCount" @click="evtPage++">下一页</button>
-                  </div>
-                </div>
+                <ConsoleListPager v-if="filteredEvents.length" :page-data="{ page: evtPage, pageCount: evtPageCount, total: filteredEvents.length }"
+                  :page-size="evtPageSize" :page-sizes="[10, 20, 50]" @size-change="evtPageSize = $event; evtPage = 1" @page-change="evtPage = $event" />
               </div>
 
               <aside v-if="listFocusEvent" class="panel ed-side">
@@ -1644,14 +1400,33 @@
                           恶意文件 ({{ listMaliciousFiles.length }})
                         </button>
                       </div>
-                      <p class="hint sm ed-prev-hint">第 1 条为当前告警；其余仅当同终端、±2h 内且<strong>同规则 ID / 同路径 / 同 PID / 同标题对象（如 · 后文件名）/ 同注册表键</strong> 时才出现</p>
+                      <p class="hint sm ed-prev-hint">
+                        第 1 条为当前告警。
+                        <template v-if="isBuildingBlockUpgrade(listEvidenceFlat, listEventEvidence)">多阶段告警会展开其积木子告警（含进程/路径/命令行摘要），点击可跳转。</template>
+                        <template v-else>其余仅当同终端、±2h 内且<strong>同规则 ID / 同路径 / 同 PID / 同标题对象（如 · 后文件名）/ 同注册表键</strong> 时才出现</template>
+                      </p>
                       <div v-if="edAlertTab === 'behavior'" class="ed-beh">
-                        <article v-for="b in listAlertBehaviors" :key="'beh-' + (b.eventId ?? b.title)" class="ed-beh-row" :class="{ current: b.isCurrent }">
+                        <article
+                          v-for="b in listAlertBehaviors"
+                          :key="'beh-' + (b.eventId ?? b.title)"
+                          class="ed-beh-row"
+                          :class="{ current: b.isCurrent, clickable: !b.isCurrent && b.eventId }"
+                          @click="!b.isCurrent && b.eventId && openEventById(b.eventId)"
+                        >
                           <span class="sev" :data-s="b.severity">{{ sevLabel(b.severity) }}</span>
                           <div class="ed-beh-main">
-                            <b :title="b.title">{{ b.title }}<i v-if="b.isCurrent" class="ed-cur-tag">当前</i></b>
+                            <b :title="b.title">
+                              {{ b.title }}
+                              <i v-if="b.isCurrent" class="ed-cur-tag">当前</i>
+                              <i v-else-if="b.fromBuildingBlock" class="ed-cur-tag bb">积木</i>
+                            </b>
                             <small>{{ b.sub }}</small>
                             <em>{{ b.time }}</em>
+                            <div v-if="b.fromBuildingBlock && b.detail" class="ed-bb-extra">
+                              <code v-if="b.detail.command_line" :title="b.detail.command_line">{{ b.detail.command_line }}</code>
+                              <code v-else-if="b.detail.path" :title="b.detail.path">{{ b.detail.path }}</code>
+                              <code v-else-if="b.detail.reg_key" :title="b.detail.reg_key">{{ b.detail.reg_key }}{{ b.detail.value_name ? ' → ' + b.detail.value_name : '' }}{{ b.detail.value ? ' = ' + b.detail.value : '' }}</code>
+                            </div>
                           </div>
                         </article>
                         <p v-if="!listAlertBehaviors.length" class="empty sm">暂无关联告警行为</p>
@@ -1691,6 +1466,18 @@
                         <div><span>规则 ID</span><b class="mono">{{ listEventEvidence.rule_id || listEvidenceFlat.watch || '—' }}</b></div>
                         <div class="span2"><span>匹配特征</span><b class="mono">{{ listEventEvidence.matched || '—' }}</b></div>
                         <div class="span2"><span>首次 / 活跃</span><b>{{ fmtTime(listFocusEvent.created_at) }} · {{ fmtTime(listFocusEvent.updated_at || listFocusEvent.created_at) }}</b></div>
+                        <div v-if="isBuildingBlockUpgrade(listEvidenceFlat, listEventEvidence)" class="span2">
+                          <span>研判提示</span>
+                          <b>{{ listEvidenceFlat.investigation || listEventEvidence.investigation || '多阶段积木升级，请查看告警行为中的积木子告警。' }}</b>
+                        </div>
+                        <div v-if="isBuildingBlockUpgrade(listEvidenceFlat, listEventEvidence)">
+                          <span>战术</span>
+                          <b>{{ (listEvidenceFlat.tactics || listEventEvidence.tactics || []).join(' · ') || '—' }}</b>
+                        </div>
+                        <div v-if="isBuildingBlockUpgrade(listEvidenceFlat, listEventEvidence)">
+                          <span>窗口 / 子告警</span>
+                          <b>{{ listEvidenceFlat.window_sec || listEventEvidence.window_sec || 1800 }}s · {{ buildingBlockHitsOf(listEvidenceFlat, listEventEvidence).length }} 条</b>
+                        </div>
                       </div>
                       <div class="ed-acts">
                         <button type="button" class="btn sm primary" @click="openEvent(listFocusEvent)">打开威胁视图</button>
@@ -1728,32 +1515,31 @@
             </div>
           </div>
           <div class="tv-head-actions">
-            <div class="tv-act-group">
-              <span class="tv-act-label">处置</span>
-              <button type="button" class="btn danger" :disabled="respBusy" @click="doResponse('kill_process')">结束进程</button>
-              <button type="button" class="btn danger-outline" :disabled="respBusy" @click="doResponse('quarantine_file')">隔离文件</button>
-              <button type="button" class="btn danger-outline" :disabled="respBusy" @click="doResponse('isolate_network')">网络隔离</button>
-              <button type="button" class="btn" :disabled="respBusy" @click="doResponse('unisolate_network')">解除隔离</button>
-              <button type="button" class="btn" :disabled="respBusy" @click="doResponse('scan_memory')">内存扫描</button>
-            </div>
-            <div class="tv-act-group nav">
-              <button type="button" class="btn" @click="threatTab = 'response'; loadRespCommands()">处置结果</button>
-              <button type="button" class="btn" @click="openTimelineFor(activeEvent.agent_id)">时间线</button>
-              <button type="button" class="btn" @click="jumpToHost">终端资产</button>
-              <button type="button" class="btn" @click="openAllow(activeEvent)">加白</button>
-              <button type="button" class="btn" @click="closeThreat">返回列表</button>
-            </div>
+            <button v-if="canRespond" type="button" class="btn danger" :disabled="respBusy" @click="doResponse('kill_process')">结束进程</button>
+            <button v-if="canRespond" type="button" class="btn" @click="threatTab = 'response'; loadRespCommands()">处置与跳转</button>
+            <button type="button" class="btn primary" :disabled="threatAiBusy" @click="openThreatAi">智能分析</button>
+            <button type="button" class="btn" @click="threatTab = 'story'; loadAttackStory()">攻击故事</button>
+            <button type="button" class="btn" @click="closeThreat">返回列表</button>
+            <span class="tv-act-hint">智能分析聚焦本条告警（并参考该主机近期证据）；攻击故事为规则串联</span>
           </div>
         </header>
 
         <div class="tv-tabs">
-          <button type="button" class="tv-tab" :class="{ on: threatTab === 'graph' }" @click="threatTab = 'graph'">威胁视图</button>
-          <button type="button" class="tv-tab" :class="{ on: threatTab === 'story' }" @click="threatTab = 'story'; loadAttackStory()">攻击故事</button>
-          <button type="button" class="tv-tab" :class="{ on: threatTab === 'evidence' }" @click="threatTab = 'evidence'">证据详情</button>
-          <button type="button" class="tv-tab" :class="{ on: threatTab === 'response' }" @click="threatTab = 'response'; loadRespCommands()">
-            处置结果
-            <em v-if="respPendingCount" class="tab-n">{{ respPendingCount }}</em>
-          </button>
+          <div class="tv-tab-list">
+            <button type="button" class="tv-tab" :class="{ on: threatTab === 'graph' }" @click="threatTab = 'graph'">威胁视图</button>
+            <button type="button" class="tv-tab" :class="{ on: threatTab === 'ai' }" @click="openThreatAi">智能分析</button>
+            <button type="button" class="tv-tab" :class="{ on: threatTab === 'story' }" @click="threatTab = 'story'; loadAttackStory()">攻击故事</button>
+            <button type="button" class="tv-tab" :class="{ on: threatTab === 'evidence' }" @click="threatTab = 'evidence'">证据详情</button>
+            <button type="button" class="tv-tab" :class="{ on: threatTab === 'response' }" @click="threatTab = 'response'; loadRespCommands()">
+              处置结果
+              <em v-if="respPendingCount" class="tab-n">{{ respPendingCount }}</em>
+            </button>
+          </div>
+          <div class="tv-tree-bar" v-show="threatTab === 'graph'">
+            <label class="tv-tree-opt"><input type="checkbox" v-model="tvShowDotted" /> 虚线关联</label>
+            <label class="tv-tree-opt"><input type="checkbox" v-model="tvReadable" /> 增强可读</label>
+            <button type="button" class="btn sm" :disabled="threatTreeBusy" @click="loadThreatProcessTree">刷新进程树</button>
+          </div>
         </div>
 
         <div class="tv-body">
@@ -1769,11 +1555,6 @@
                 <span class="chip soft">{{ modLabel(activeEvent.module) || '检测模块' }}</span>
                 <span v-if="eventAttck.technique" class="chip soft atk">{{ eventAttck.technique }}</span>
               </div>
-            </div>
-            <div class="tv-tree-bar">
-              <label class="tv-tree-opt"><input type="checkbox" v-model="tvShowDotted" /> 展示虚线关联关系</label>
-              <label class="tv-tree-opt"><input type="checkbox" v-model="tvReadable" /> 增强可读性</label>
-              <button type="button" class="btn sm" :disabled="threatTreeBusy" @click="loadThreatProcessTree">刷新进程树</button>
             </div>
             <div v-if="threatDropChainSteps.length >= 2" class="tv-drop-chain">
               <div class="tv-drop-head">
@@ -1902,11 +1683,17 @@
                         :class="[n.tone, { on: n.tone === 'hit' && threatPanelNode === 'hit' }]"
                         @click="n.tone === 'hit' && (threatPanelNode = 'hit')"
                       >
-                        <span class="tvf-kind">{{ n.kind }}</span>
-                        <b :title="n.title">{{ n.title }}</b>
-                        <small v-if="n.sub" :title="n.sub">{{ n.sub }}</small>
-                        <div v-if="n.meta && n.meta.length" class="tvf-meta">
-                          <span v-for="m in n.meta" :key="m.k" :class="m.cls"><i>{{ m.k }}</i>{{ m.v }}</span>
+                        <span class="tvf-stage-no">{{ i + 1 }}</span>
+                        <div class="tvf-node-main">
+                          <div class="tvf-node-top">
+                            <span class="tvf-kind">{{ n.kind }}</span>
+                            <span v-if="n.tone === 'hit'" class="tvf-when">发现 {{ fmtTime(activeEvent.created_at) }}</span>
+                          </div>
+                          <b :title="n.title">{{ n.title }}</b>
+                          <small v-if="n.sub" :title="n.sub">{{ n.sub }}</small>
+                          <div v-if="n.meta && n.meta.length" class="tvf-meta">
+                            <span v-for="m in n.meta" :key="m.k" :class="m.cls"><i>{{ m.k }}</i>{{ m.v }}</span>
+                          </div>
                         </div>
                       </div>
                     </template>
@@ -1954,8 +1741,60 @@
                   <b>{{ modLabel(activeEvent.module) || '—' }}</b>
                 </div>
               </div>
-              <p class="tv-canvas-hint">横向进程树：点击「威胁命中」节点 · 右侧查看对象详情与处置；± 折叠子进程</p>
+              <p class="tv-canvas-hint">阶段链自上而下展开 · 点击「威胁命中」节点在右侧查看对象详情与处置；± 折叠子进程</p>
             </div>
+          </div>
+
+          <div class="tv-canvas ai-pane" v-show="threatTab === 'ai'">
+            <div class="panel-hd bare">
+              <h3>智能分析 · 当前告警</h3>
+              <div class="hunt-bar" style="margin:0">
+                <button type="button" class="btn sm primary" :disabled="threatAiBusy || !activeEvent?.agent_id" @click="runThreatAi(true)">
+                  {{ threatAiBusy ? (threatAiRefining ? '模型精炼中…' : '分析中…') : '重新分析' }}
+                </button>
+                <button type="button" class="btn sm" @click="goMenu('settings')">接入与模型</button>
+              </div>
+            </div>
+            <p class="hint" style="margin:0 0 10px">
+              聚焦<strong>当前告警</strong> <b>#{{ activeEvent?.id }}</b> {{ activeEvent?.title }}；附带该主机近期威胁/时间线作佐证，不是全舰队或全部告警扫描。
+            </p>
+            <p v-if="threatAiError" class="err-text">{{ threatAiError }}</p>
+            <p v-else-if="threatAiBusy && !threatAiResult" class="empty sm">正在围绕本条告警收集证据…</p>
+            <template v-else-if="threatAiResult?.result">
+              <p v-if="threatAiResult.result.focus_event?.note || threatAiResult.result.data_scope?.focus" class="hint sm" style="margin:0 0 8px">
+                {{ threatAiResult.result.focus_event?.note || threatAiResult.result.data_scope?.focus?.note || '已聚焦当前告警' }}
+              </p>
+              <div class="threat-ai-kpis">
+                <div><span>研判</span><b>{{ threatAiResult.result.verdict || threatAiResult.result.risk_level || '待复核' }}</b></div>
+                <div><span>风险</span><b>{{ threatAiResult.result.risk_level || '—' }} <em v-if="threatAiResult.result.risk_score != null">{{ threatAiResult.result.risk_score }}</em></b></div>
+                <div><span>模式</span><b>{{ threatAiResult.result.mode === 'llm' || threatAiResult.mode === 'llm' ? '大模型' : '启发式' }}{{ threatAiRefining ? ' · 精炼中' : '' }}</b></div>
+                <div><span>威胁数</span><b>{{ (threatAiResult.result.threat_events || []).length }}</b></div>
+              </div>
+              <div class="threat-ai-summary" v-if="threatAiSummary">
+                <label>摘要</label>
+                <pre>{{ threatAiSummary }}</pre>
+              </div>
+              <div class="threat-ai-pipe" v-if="(threatAiResult.result.pipeline || []).length">
+                <label>调查流水线</label>
+                <ol>
+                  <li v-for="(p, i) in threatAiResult.result.pipeline.slice(0, 6)" :key="i">
+                    <b>{{ p.stage || p.name || ('步骤 ' + (i + 1)) }}</b>
+                    <span>{{ p.goal || p.output || p.summary || '' }}</span>
+                  </li>
+                </ol>
+              </div>
+              <div class="threat-ai-think" v-if="(threatAiResult.result.thinking_chain || []).length">
+                <label>思维链（节选）</label>
+                <ul>
+                  <li v-for="(s, i) in threatAiResult.result.thinking_chain.slice(0, 5)" :key="i">
+                    <b>{{ s.title || s.stage || ('步骤 ' + (i + 1)) }}</b>
+                    <span>{{ s.observation || s.reasoning || s.hypothesis || s.clue || '' }}</span>
+                  </li>
+                </ul>
+              </div>
+              <p class="hint">完整主机级报告可在分析完成后对照本告警进程链与攻击故事核对。</p>
+            </template>
+            <p v-else class="empty">点「智能分析」对本主机告警做研判；未配置模型时仅跑启发式。</p>
           </div>
 
           <div class="tv-canvas story-pane" v-show="threatTab === 'story'">
@@ -2036,11 +1875,29 @@
           </div>
 
           <div class="tv-canvas" v-show="threatTab === 'response'">
+            <div class="tv-resp-bar">
+              <div class="tv-resp-group" v-if="canRespond">
+                <span class="tv-resp-lab">处置</span>
+                <button type="button" class="btn danger sm" :disabled="respBusy" @click="doResponse('kill_process')">结束进程</button>
+                <button type="button" class="btn primary sm" :disabled="respBusy" @click="doResponse('pull_file')">采集样本</button>
+                <button type="button" class="btn danger-outline sm" :disabled="respBusy" @click="doResponse('quarantine_file')">隔离文件</button>
+                <button type="button" class="btn danger-outline sm" :disabled="respBusy" @click="doResponse('isolate_network')">网络隔离</button>
+                <button type="button" class="btn sm" :disabled="respBusy" @click="doResponse('unisolate_network')">解除隔离</button>
+                <button type="button" class="btn sm" :disabled="respBusy" @click="doResponse('scan_memory')">内存扫描</button>
+              </div>
+              <p v-else class="hint" style="margin:0">当前为只读账号，可查看处置记录，不可下发指令。</p>
+              <div class="tv-resp-group">
+                <span class="tv-resp-lab">跳转</span>
+                <button type="button" class="btn sm" @click="openTimelineFor(activeEvent.agent_id)">时间线</button>
+                <button type="button" class="btn sm" @click="jumpToHost">终端资产</button>
+                <button type="button" class="btn sm" @click="openAllow(activeEvent)">加白</button>
+              </div>
+            </div>
             <div class="panel-hd bare">
               <h3>本机处置指令</h3>
               <button type="button" class="btn sm" @click="loadRespCommands">刷新状态</button>
             </div>
-            <p class="hint" style="margin:0 0 12px">下发后由 Agent 下一心跳执行；状态：pending→sent→done/failed</p>
+            <p class="hint" style="margin:0 0 12px">下发后由 Agent 下一心跳执行；状态：pending→sent→done/failed。样本采集成功后，在本表右侧点「下载样本」保存到本机浏览器下载目录。</p>
             <table v-if="respCommands.length">
               <thead>
                 <tr><th>时间</th><th>动作</th><th>状态</th><th>参数</th><th>结果</th><th></th></tr>
@@ -2055,6 +1912,9 @@
                     <template v-if="c.action === 'scan_memory' && c.status === 'done'">
                       扫描 {{ parseJsonSafe(c.result_json).scanned ?? 0 }} 个进程，发现 {{ parseJsonSafe(c.result_json).finding_count ?? 0 }} 处
                     </template>
+                    <template v-else-if="c.action === 'pull_file'">
+                      {{ friendlyCmdResult('pull_file', c.result_json) }}
+                    </template>
                     <template v-else>{{ shortJson(c.result_json) }}</template>
                   </td>
                   <td>
@@ -2064,12 +1924,18 @@
                       class="btn-text"
                       @click="restoreQuarantined(c)"
                     >回滚</button>
+                    <button
+                      v-if="c.action === 'pull_file' && c.status === 'done' && parseJsonSafe(c.result_json).stored"
+                      type="button"
+                      class="btn primary sm"
+                      @click="downloadPulledSample(c)"
+                    >下载样本</button>
                   </td>
                 </tr>
               </tbody>
             </table>
             <p v-else class="empty">暂无处置指令。点击上方红色按钮下发后，在此查看是否成功。</p>
-            <button type="button" class="btn" style="margin-top:12px" @click="goAuditPage">打开处置审计 →</button>
+            <button type="button" class="btn" style="margin-top:12px" @click="goAuditPage">打开审计日志 →</button>
           </div>
 
           <aside class="tv-side">
@@ -2087,6 +1953,9 @@
               <p v-else-if="evidenceFlat.reg_key || evidenceFlat.key" class="hint sm tvs-cmd-hint">
                 本条为注册表类告警，无独立进程命令行。写入值：<span class="mono">{{ evidenceFlat.value || '—' }}</span>
                 <template v-if="evidenceFlat.image || evidenceFlat.process_path"> · 关联进程映像 {{ evidenceFlat.image || evidenceFlat.process_path }}</template>
+              </p>
+              <p v-else-if="isBuildingBlockUpgrade(evidenceFlat, eventEvidence)" class="hint sm tvs-cmd-hint">
+                本条为多阶段积木升级告警，无单一进程命令行；请查看下方「积木子告警」与匹配特征。
               </p>
               <p v-else class="hint sm tvs-cmd-hint">
                 暂无命令行。可点「刷新进程树」从进程实体/时间线补全，或查看「匹配特征」。
@@ -2115,6 +1984,40 @@
                   </tr>
                 </tbody>
               </table>
+            </div>
+
+            <div
+              v-if="isBuildingBlockUpgrade(evidenceFlat, eventEvidence) && buildingBlockHitsOf(evidenceFlat, eventEvidence).length"
+              class="tvs-sec tvs-bb-block"
+            >
+              <h4>积木子告警（{{ buildingBlockHitsOf(evidenceFlat, eventEvidence).length }}）</h4>
+              <p class="hint sm" style="margin:0 0 8px">{{ evidenceFlat.investigation || eventEvidence.investigation || '同一主机多条低置信告警升级为多阶段事件。' }}</p>
+              <div class="ed-beh">
+                <article
+                  v-for="(h, i) in buildingBlockHitsOf(evidenceFlat, eventEvidence)"
+                  :key="'bb-' + (h.event_id || i)"
+                  class="ed-beh-row clickable"
+                  @click="h.event_id && openEventById(h.event_id)"
+                >
+                  <span class="sev" :data-s="h.severity || 'medium'">{{ sevLabel(h.severity || 'medium') }}</span>
+                  <div class="ed-beh-main">
+                    <b :title="h.title">{{ h.title || h.rule_id || `#${h.event_id || i + 1}` }}<i class="ed-cur-tag bb">积木</i></b>
+                    <small>{{ buildingBlockHitSub(h) }}</small>
+                    <div class="ed-bb-extra">
+                      <code v-if="h.command_line" :title="h.command_line">{{ h.command_line }}</code>
+                      <code v-else-if="h.path" :title="h.path">{{ h.path }}</code>
+                      <code v-else-if="h.reg_key" :title="h.reg_key">{{ h.reg_key }}{{ h.value_name ? ' → ' + h.value_name : '' }}{{ h.value ? ' = ' + h.value : '' }}</code>
+                    </div>
+                    <em v-if="h.event_id">#{{ h.event_id }} · 打开详情</em>
+                  </div>
+                </article>
+              </div>
+              <dl class="td-dl" style="margin-top:10px">
+                <div><dt>战术</dt><dd>{{ (evidenceFlat.tactics || eventEvidence.tactics || []).join(' · ') || '—' }}</dd></div>
+                <div><dt>规则数</dt><dd>{{ (evidenceFlat.distinct_rules || eventEvidence.distinct_rules || []).length }}</dd></div>
+                <div class="span2"><dt>规则列表</dt><dd class="mono">{{ (evidenceFlat.distinct_rules || eventEvidence.distinct_rules || []).join(', ') || '—' }}</dd></div>
+                <div class="span2"><dt>匹配特征</dt><dd class="mono">{{ evidenceFlat.matched || eventEvidence.matched || '—' }}</dd></div>
+              </dl>
             </div>
 
             <div class="tvs-sec">
@@ -2214,79 +2117,36 @@
         </div>
       </section>
 
+      <PlatformExtras v-else-if="['lineage-risk', 'network-awareness', 'abnormal-files', 'approvals', 'cases', 'archive'].includes(page)" :page="page" :is-admin="isAdmin" @goto="goMenu" @open-host="openHostFromBaseline" />
+
       <!-- ========== 终端列表 ========== -->
-      <section v-else-if="page === 'hosts' && !selected" class="page hosts-page">
-        <header class="page-hd">
-          <div>
-            <h1>终端列表</h1>
-            <p class="desc">接入主机一览；点主机查看进程 / 服务 / 网络等模块与可疑行为</p>
-          </div>
+      <HostsPage v-else-if="page === 'hosts' && !selected" :items="filteredAgents" :total="agents.length" :online-count="onlineCount" :hosts-with-alert="hostsWithAlert" :loading="loading" :short="short" :fmt-time="fmtTime" :alert-count="alertCount">
+        <template #filters>
           <div class="hd-right">
             <input v-model="q" class="search" placeholder="搜索主机 / IP…" />
             <button type="button" class="btn primary" @click="refresh">刷新</button>
           </div>
-        </header>
-
-        <div class="host-summary">
-          <div class="hs"><span>全部</span><b>{{ agents.length }}</b></div>
-          <div class="hs on"><span>在线</span><b>{{ onlineCount }}</b></div>
-          <div class="hs off"><span>离线</span><b>{{ agents.length - onlineCount }}</b></div>
-          <div class="hs danger"><span>有告警</span><b>{{ hostsWithAlert }}</b></div>
-        </div>
-
-        <div class="panel host-panel">
-          <div class="host-table">
-            <div class="ht-head">
-              <span>主机</span><span>系统</span><span>IP</span><span>状态</span><span>最近心跳</span><span>版本</span><span>告警</span><span>操作</span>
-            </div>
-            <div
-              v-for="a in filteredAgents"
-              :key="a.agent_id"
-              class="ht-row"
-            >
-              <span class="ht-host">
-                <i :class="['dot', a.online ? 'on' : '']" />
-                <b>{{ a.hostname || short(a.agent_id) }}</b>
-              </span>
-              <span>{{ a.os_family || '—' }}</span>
-              <span class="mono">{{ a.ip || '—' }}</span>
-              <span><em class="pill" :class="{ on: a.online }">{{ a.online ? '在线' : '离线' }}</em></span>
-              <span class="muted">{{ fmtTime(a.last_seen) }}</span>
-              <span>{{ a.version || '—' }}<em v-if="a.outdated" class="pill warn" title="落后于当前发布版本" style="margin-left:4px">可升级</em></span>
-              <span>
-                <em v-if="alertCount(a.agent_id)" class="alert-n">{{ alertCount(a.agent_id) }}</em>
-                <em v-else class="muted">0</em>
-              </span>
+        </template>
+        <template #actions="{ agent: a }">
               <span class="ops">
                 <button type="button" class="btn sm" @click="openHost(a, 'hosts')">查看主机</button>
                 <button type="button" class="btn sm" :disabled="!a.online" @click="uninstallHost(a)">远程卸载</button>
                 <button type="button" class="btn sm danger" @click="removeHost(a)">删除记录</button>
               </span>
-            </div>
-            <p v-if="!filteredAgents.length" class="empty">暂无终端，请先部署安装包</p>
-          </div>
-        </div>
-      </section>
+        </template>
+      </HostsPage>
 
       <!-- ========== 主机详情（模块数据 + 可疑行为） ========== -->
-      <section v-else-if="page === 'hosts' && selected" class="page host-detail">
-        <header class="host-hdr">
-          <div class="host-hdr-top">
-            <div class="host-hdr-id">
+      <HostDetailPage v-else-if="page === 'hosts' && selected" :current-module="module" :group="hostTabGroup" :view="snapView" :risk-count="snapRiskCount" @view-change="snapView = $event">
+        <template #header>
+        <HostDetailHeader :agent="selected" :fmt-time="fmtTime" :quick-stats="hostQuickStats(selected)" :warning-chips="componentWarnChips(selected)"
+          :sensor-panel="hostSensorsPanel(selected)" :expanded="hostHealthOpen" :component-chips="hostHealthOpen ? componentHealthChips(selected) : []"
+          :runtime-chips="hostHealthOpen ? healthChips(selected) : []" :drift="hostHealthOpen ? agentDriftLine(selected) : ''" :module-label="modLabel"
+          @toggle-health="hostHealthOpen = !hostHealthOpen">
+          <template #back>
               <button type="button" class="btn sm ghost host-back" @click="backFromHost">← 返回</button>
-              <div class="host-hdr-title">
-                <h1>{{ selected.hostname || selected.agent_id }}</h1>
-                <p class="host-hdr-meta">
-                  <i :class="['dot', selected.online ? 'on' : '']" />
-                  <em class="pill" :class="{ on: selected.online }">{{ selected.online ? '在线' : '离线' }}</em>
-                  <span>{{ selected.ip || '—' }}</span>
-                  <span>心跳 {{ fmtTime(selected.last_seen) }}</span>
-                  <span>Agent v{{ selected.version || '—' }}</span>
-                  <em v-if="selected.revoked" class="pill warn">凭据已吊销</em>
-                </p>
-              </div>
-            </div>
-            <div class="host-hdr-acts">
+          </template>
+          <template #actions>
               <span class="sync-pill" :class="{ on: selected.online }">
                 <i class="sync-dot" />
                 {{ selected.online ? '实时同步' : '离线' }}
@@ -2310,647 +2170,38 @@
                   <button type="button" class="host-more-item danger" @click="removeHost(selected); hostHdrMore = false">删除记录</button>
                 </div>
               </div>
-            </div>
-          </div>
-
-          <div class="host-hdr-stats">
-            <span v-for="c in hostQuickStats(selected)" :key="c.k" class="hchip" :class="{ warn: c.warn }" :title="c.title || ''">{{ c.k }} {{ c.v }}</span>
-            <span
-              v-for="c in componentWarnChips(selected).slice(0, 3)"
-              :key="'cw-' + c.k"
-              class="hchip warn"
-              :title="c.message || ''"
-            >{{ c.k }} {{ c.state }}</span>
-            <button
-              v-if="hostSensorsPanel(selected)"
-              type="button"
-              class="host-health-toggle"
-              :class="{ warn: (hostSensorsPanel(selected).advise?.length || 0) > 0 || hostSensorsPanel(selected).level === 'poor' }"
-              @click="hostHealthOpen = !hostHealthOpen"
-            >
-              采集健康 {{ hostSensorsPanel(selected).score ?? '—' }}
-              <em>{{ hostHealthOpen ? '▾' : '▸' }}</em>
-            </button>
-          </div>
-
-          <div v-if="hostHealthOpen && hostSensorsPanel(selected)" class="host-health-card open">
-            <div class="host-health-body">
-              <div class="hsp-row">
-                <span class="hsp-score" :data-lv="hostSensorsPanel(selected).level">{{ hostSensorsPanel(selected).score ?? '—' }}</span>
-                <span class="hsp-chip">{{ hostSensorsPanel(selected).pipeline }}</span>
-                <span v-if="hostSensorsPanel(selected).cmdFill != null" class="hsp-chip">cmd {{ hostSensorsPanel(selected).cmdFill }}%</span>
-                <span v-if="hostSensorsPanel(selected).disks" class="hsp-chip" :class="{ warn: String(hostSensorsPanel(selected).disks).includes('100%') }">{{ hostSensorsPanel(selected).disks }}</span>
-                <span v-if="hostSensorsPanel(selected).netLine" class="hsp-chip">{{ hostSensorsPanel(selected).netLine }}</span>
-              </div>
-              <div v-if="hostSensorsPanel(selected).statusChips?.length" class="hsp-row hsp-chips">
-                <span
-                  v-for="(c, i) in hostSensorsPanel(selected).statusChips"
-                  :key="i"
-                  class="hsp-chip"
-                  :class="{ warn: c.warn, ok: c.ok }"
-                  :title="c.title || ''"
-                >{{ c.label }}</span>
-              </div>
-              <div v-if="componentHealthChips(selected).length" class="hsp-row hsp-chips">
-                <span class="hsp-label">组件</span>
-                <span
-                  v-for="c in componentHealthChips(selected)"
-                  :key="'cmp-' + c.k"
-                  class="hsp-chip"
-                  :class="{ warn: c.state === 'DEGRADED', off: c.state === 'OFF', ok: c.state === 'OK' }"
-                  :title="c.message || ''"
-                >{{ c.k }} {{ c.state }}</span>
-              </div>
-              <div v-if="hostSensorsPanel(selected).channelChips?.length" class="hsp-row hsp-channels">
-                <span class="hsp-label">Winlog</span>
-                <span v-for="ch in hostSensorsPanel(selected).channelChips" :key="ch" class="hsp-chip soft">{{ ch }}</span>
-              </div>
-              <div v-if="healthChips(selected).length" class="hsp-row hsp-chips">
-                <span class="hsp-label">运行</span>
-                <span v-for="c in healthChips(selected)" :key="'hc-' + c.k" class="hsp-chip" :class="{ warn: c.warn }" :title="c.title || ''">{{ c.k }} {{ c.v }}</span>
-              </div>
-              <div v-if="hostSensorsPanel(selected).byKindLine" class="hsp-row mono sm muted">outbox {{ hostSensorsPanel(selected).byKindLine }}</div>
-              <p v-if="agentDriftLine(selected)" class="hsp-drift">{{ agentDriftLine(selected) }}</p>
-              <ul v-if="hostSensorsPanel(selected).advise?.length" class="hsp-advise">
-                <li v-for="(a, i) in hostSensorsPanel(selected).advise" :key="i">{{ a }}</li>
-              </ul>
-            </div>
-          </div>
-        </header>
-
-        <div class="snap-shell">
-          <nav class="host-group-nav">
-            <button
-              v-for="g in HOST_TAB_GROUPS"
-              :key="g.id"
-              type="button"
-              class="host-group-btn"
-              :class="{ on: hostTabGroup === g.id }"
-              @click="selectHostGroup(g.id)"
-            >{{ g.label }}</button>
-          </nav>
-          <nav v-if="hostTabGroup !== 'remote'" class="mod-tabs bar">
-            <button
-              v-for="m in hostGroupMods"
-              :key="m"
-              type="button"
-              class="mod-tab"
-              :class="{ on: module === m }"
-              @click="loadSnap(m)"
-            >{{ modLabel(m) }}</button>
-          </nav>
-
-          <div v-if="hostTabGroup === 'remote'" class="host-remote-wrap panel">
-            <div class="host-remote-hero">
-              <div class="host-remote-hero-main">
-                <h2>应急远程管理</h2>
-                <p class="hint">经 Agent 指令通道运维（非 RDP）：Live Query 表 · 只读文件/注册表 · 白名单命令 · 交互 Shell。终端需<strong>在线</strong>，策略开启「远程运维」；下发需管理员。</p>
-                <div class="host-remote-steps">
-                  <span>① Live Query</span>
-                  <span>② 读盘/注册表</span>
-                  <span>③ Shell / 命令</span>
-                </div>
-              </div>
-              <div class="host-remote-hero-aside">
-                <span class="sync-pill lg" :class="{ on: selected.online }">
-                  <i class="sync-dot" />
-                  {{ selected.online ? '可下发指令' : '离线 · 仅可查看历史' }}
-                </span>
-                <span v-if="hostRemoteBusy" class="hr-busy-pill">执行中…</span>
-              </div>
-            </div>
-            <nav class="host-remote-subnav" aria-label="远程运维功能">
-              <button
-                v-for="t in HOST_REMOTE_TABS"
-                :key="t.id"
-                type="button"
-                class="hr-tab"
-                :class="{ on: hostRemoteSubTab === t.id }"
-                @click="hostRemoteSubTab = t.id"
-              >
-                <span class="hr-tab-label">{{ t.label }}</span>
-                <span class="hr-tab-hint">{{ t.hint }}</span>
-              </button>
-            </nav>
-            <div v-show="hostRemoteSubTab === 'files'" class="host-remote-panel hr-fs-panel">
-              <div class="host-remote-toolbar">
-                <input v-model="hostRemoteFsPath" class="field mono grow" placeholder="C:\" @keyup.enter="hostRemoteFsBrowse" />
-                <button type="button" class="btn sm" :disabled="!hostRemoteFsPath || hostRemoteBusy" @click="hostRemoteFsUp">上级</button>
-                <button type="button" class="btn sm primary" :disabled="!selected.online || hostRemoteBusy" @click="hostRemoteFsBrowse">刷新</button>
-                <button type="button" class="btn sm" :disabled="!selected.online || hostRemoteBusy" @click="hostRemoteFsRead">读文件</button>
-                <button type="button" class="btn sm" :disabled="!selected.online || hostRemoteBusy" @click="hostRemoteFsLoadVolumes">重新获取盘符</button>
-              </div>
-              <p v-if="hostRemoteFsHint" class="hint sm">{{ hostRemoteFsHint }}</p>
-              <div class="hr-fs-explorer">
-                <aside class="hr-fs-tree">
-                  <div class="hr-fs-tree-hd">盘符 / 目录</div>
-                  <p v-if="!hostRemoteFsTree.length" class="empty sm">{{ selected.online ? '正在读取盘符…' : '终端离线，无法列盘符' }}</p>
-                  <ul v-else class="hr-fs-tree-ul">
-                    <li v-for="row in hostRemoteFsTree" :key="row.node.path">
-                      <button
-                        type="button"
-                        class="hr-fs-node"
-                        :class="{ on: hostRemoteFsSamePath(hostRemoteFsPath, row.node.path) }"
-                        :style="{ paddingLeft: (8 + row.depth * 14) + 'px' }"
-                        :disabled="hostRemoteBusy"
-                        @click="hostRemoteFsToggle(row.node)"
-                      >
-                        <i class="hr-fs-caret">{{ row.node.expanded ? '▼' : '▶' }}</i>
-                        <span class="hr-fs-node-name">{{ row.node.label }}</span>
-                        <em v-if="row.node.child_count != null">{{ row.node.child_count }} 项</em>
-                      </button>
-                    </li>
-                  </ul>
-                </aside>
-                <div class="hr-fs-main">
-                  <p class="hr-fs-crumb mono">
-                    {{ hostRemoteFsPath || '未选择' }}
-                    <span v-if="hostRemoteFsEntries.length"> · {{ hostRemoteFsEntries.length }} 项</span>
-                    <span v-if="hostRemoteFsDirCount"> · 目录 {{ hostRemoteFsDirCount }}</span>
-                    <span v-if="hostRemoteFsFileCount"> · 文件 {{ hostRemoteFsFileCount }}</span>
-                  </p>
-                  <p v-if="hostRemoteFsTruncated" class="hint sm warn-hint">目录项过多，仅显示前 200 条</p>
-                  <table v-if="hostRemoteFsEntries.length" class="host-remote-cmd-table hr-fs-table">
-                    <thead><tr><th>名称</th><th>类型</th><th>大小 / 项数</th><th></th></tr></thead>
-                    <tbody>
-                      <tr v-for="e in hostRemoteFsEntries" :key="e.name" class="hr-fs-row" @dblclick="hostRemoteFsEnter(e)">
-                        <td><span class="hr-fs-icon">{{ e.dir ? '📁' : '📄' }}</span>{{ e.name }}</td>
-                        <td>{{ e.dir ? '目录' : '文件' }}</td>
-                        <td>{{ e.dir ? (e.child_count != null ? `${e.child_count} 项` : '目录') : hostRemoteFmtSize(e.size) }}</td>
-                        <td>
-                          <button type="button" class="btn-text" @click="hostRemoteFsEnter(e)">{{ e.dir ? '进入' : '预览' }}</button>
-                        </td>
-                      </tr>
-                    </tbody>
-                  </table>
-                  <p v-else class="empty sm">点左侧盘符展开目录</p>
-                  <pre v-if="hostRemoteFsPreview" class="host-remote-pre">{{ hostRemoteFsPreview }}</pre>
-                </div>
-              </div>
-            </div>
-            <div v-show="hostRemoteSubTab === 'reg'" class="host-remote-panel hr-reg-panel">
-              <div class="host-remote-toolbar">
-                <select v-model="hostRemoteReg.hive" class="field">
-                  <option value="HKLM">HKLM</option>
-                  <option value="HKCU">HKCU</option>
-                  <option value="HKU">HKU</option>
-                  <option value="HKCR">HKCR</option>
-                </select>
-                <input v-model="hostRemoteReg.key" class="field mono grow" placeholder="SOFTWARE\..." @keyup.enter="hostRemoteRegLoad" />
-                <input v-model="hostRemoteReg.value" class="field" placeholder="值名（留空列全部）" @keyup.enter="hostRemoteRegLoad" />
-                <button type="button" class="btn sm" :disabled="!hostRemoteReg.key || hostRemoteBusy" @click="hostRemoteRegUp">上级</button>
-                <button type="button" class="btn sm primary" :disabled="!selected.online || hostRemoteBusy" @click="hostRemoteRegLoad">读取</button>
-              </div>
-              <div class="hr-reg-shortcuts">
-                <button
-                  v-for="s in HOST_REG_SHORTCUTS"
-                  :key="s.label"
-                  type="button"
-                  class="hr-reg-chip"
-                  @click="hostRemoteRegApplyShortcut(s)"
-                >{{ s.label }}</button>
-              </div>
-              <p v-if="hostRemoteRegBreadcrumb" class="hr-reg-crumb mono">{{ hostRemoteRegBreadcrumb }}</p>
-              <div v-if="hostRemoteRegResult" class="hr-reg-body">
-                <section v-if="hostRemoteRegSubkeys.length" class="hr-reg-section">
-                  <h4>子键 <span class="muted">({{ hostRemoteRegSubkeys.length }})</span></h4>
-                  <div class="hr-reg-subkey-list">
-                    <button
-                      v-for="sk in hostRemoteRegSubkeys"
-                      :key="sk"
-                      type="button"
-                      class="hr-reg-subkey"
-                      @click="hostRemoteRegOpenSubkey(sk)"
-                    >{{ sk }}</button>
-                  </div>
-                </section>
-                <section v-if="hostRemoteRegSingleValue" class="hr-reg-section">
-                  <h4>值 · {{ hostRemoteRegSingleValue.name }}</h4>
-                  <dl class="hr-reg-dl">
-                    <div><dt>类型</dt><dd>{{ hostRemoteRegSingleValue.type }}</dd></div>
-                    <div><dt>数据</dt><dd class="mono hr-reg-data">{{ hostRemoteRegSingleValue.data }}</dd></div>
-                  </dl>
-                </section>
-                <section v-else-if="hostRemoteRegValues.length" class="hr-reg-section">
-                  <h4>值 <span class="muted">({{ hostRemoteRegValues.length }}{{ hostRemoteRegResult.truncated ? '+' : '' }})</span></h4>
-                  <table class="host-remote-cmd-table hr-reg-val-table">
-                    <thead><tr><th>名称</th><th>类型</th><th>数据</th></tr></thead>
-                    <tbody>
-                      <tr v-for="v in hostRemoteRegValues" :key="v.name">
-                        <td class="mono">{{ v.name }}</td>
-                        <td>{{ v.type }}</td>
-                        <td class="mono hr-reg-data">{{ v.data || v.data_hex || '—' }}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </section>
-                <p v-if="hostRemoteRegResult.truncated" class="hint sm">值过多，仅显示部分</p>
-              </div>
-              <p v-else class="empty sm">只读查询，不会修改注册表</p>
-            </div>
-            <div v-show="hostRemoteSubTab === 'livequery'" class="host-remote-panel hr-lq-panel">
-              <p class="hint sm">
-                按需向<strong>在线终端</strong>拉取只读资产表（进程、服务、监听端口、任务等），类似 Osquery 的「选表查询」。
-                不是在终端里跑 Osquery / SQL；返回的是 Agent 现场采集结果。
-              </p>
-              <div class="host-remote-toolbar">
-                <select v-model="hostLiveQueryTable" class="field">
-                  <option v-for="t in hostLiveQueryTableOptions" :key="t.name" :value="t.name">
-                    {{ t.name }}<template v-if="t.osquery_analog"> · ≈ {{ t.osquery_analog }}</template>
-                  </option>
-                </select>
-                <input v-model.number="hostLiveQueryLimit" type="number" min="10" max="500" class="field" style="max-width:6rem" title="行数上限" />
-                <button type="button" class="btn sm primary" :disabled="!selected.online || hostRemoteBusy" @click="hostLiveQueryRun">查询</button>
-                <button type="button" class="btn sm" :disabled="!hostLiveQueryRows.length" @click="hostLiveQueryExport">导出 JSON</button>
-              </div>
-              <p v-if="hostLiveQueryMeta" class="hint sm mono">
-                {{ hostLiveQueryMeta.table }} · {{ hostLiveQueryMeta.row_count ?? hostLiveQueryRows.length }} 行 · {{ hostLiveQueryMeta.schema || 'forensic_v1' }}
-              </p>
-              <div v-if="hostLiveQueryRows.length" class="hr-lq-table-wrap">
-                <table class="host-remote-cmd-table hr-lq-table">
-                  <thead>
-                    <tr>
-                      <th v-for="col in hostLiveQueryCols" :key="col">{{ col }}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="(row, ri) in hostLiveQueryRows" :key="ri">
-                      <td v-for="col in hostLiveQueryCols" :key="col" class="mono sm">{{ hostLiveQueryCell(row, col) }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <p v-else class="empty sm">{{ selected.online ? '选择表并点击查询' : '终端离线' }}</p>
-              <div class="panel pad" style="margin-top:12px">
-                <div class="panel-hd" style="display:flex;justify-content:space-between;align-items:center">
-                  <h4>Live Query 审计</h4>
-                  <button type="button" class="btn sm" @click="loadLiveQueryAudit">刷新</button>
-                </div>
-                <p class="hint sm">谁查了什么（来自 agent_audit · command:live_query）</p>
-                <table v-if="liveQueryAuditItems.length">
-                  <thead><tr><th>时间</th><th>操作者</th><th>参数</th></tr></thead>
-                  <tbody>
-                    <tr v-for="a in liveQueryAuditItems" :key="a.id">
-                      <td class="sm">{{ fmtTime(a.created_at) }}</td>
-                      <td class="mono sm">{{ a.actor || '—' }}</td>
-                      <td class="mono sm">{{ a.detail }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-                <p v-else class="empty sm">暂无本机 Live Query 记录</p>
-              </div>
-            </div>
-            <div v-show="hostRemoteSubTab === 'cmd'" class="host-remote-panel">
-              <p class="hint sm">第二阶段：单条命令，Agent 侧白名单 + 危险关键字拦截；输出记录在下方与会话历史。</p>
-              <textarea v-model="hostRemoteCmdLine" class="field mono host-remote-cmd-in" rows="3" placeholder="dir C:\Users" />
-              <button type="button" class="btn sm primary" :disabled="!selected.online || hostRemoteBusy" @click="hostRemoteRunCmd">执行</button>
-              <pre v-if="hostRemoteCmdOut" class="host-remote-pre">{{ hostRemoteCmdOut }}</pre>
-              <div v-if="hostRemoteCmdLog.length" class="host-remote-cmd-log">
-                <h4>会话历史</h4>
-                <div v-for="(ln, i) in hostRemoteCmdLog" :key="i" class="host-remote-log-line">
-                  <em>{{ ln.at }}</em> <code>{{ ln.cmd }}</code>
-                </div>
-              </div>
-            </div>
-            <div v-show="hostRemoteSubTab === 'shell'" class="host-remote-panel hr-shell-panel">
-              <div class="hr-shell-layout">
-                <div class="hr-shell-card">
-                  <div class="hr-shell-hd">
-                    <div class="hr-shell-status">
-                      <i class="hr-shell-led" :class="hostRemoteShellPhase" />
-                      <span>{{ hostRemoteShellStatusLabel }}</span>
-                      <code v-if="hostRemoteShellId" class="mono hr-shell-sid">{{ hostRemoteShellId.slice(0, 12) }}…</code>
-                    </div>
-                    <div class="hr-shell-actions">
-                      <button
-                        type="button"
-                        class="btn sm primary"
-                        :disabled="hostRemoteShellConnectDisabled"
-                        @click="hostRemoteShellStart"
-                      >
-                        {{ hostRemoteShellPhase === 'connecting' ? '连接中…' : (hostRemoteShellPhase === 'live' ? '已连接' : '连接 Shell') }}
-                      </button>
-                      <button type="button" class="btn sm" :disabled="!hostRemoteShellId && hostRemoteShellPhase !== 'connecting'" @click="() => hostRemoteShellStop(false)">断开</button>
-                      <button type="button" class="btn sm" :disabled="!hostRemoteShellLines.length" @click="hostRemoteShellClear">清屏</button>
-                    </div>
-                  </div>
-                  <p v-if="hostRemoteShellHint" class="hr-shell-banner" :class="hostRemoteShellHintKind">{{ hostRemoteShellHint }}</p>
-                  <div ref="hostRemoteShellViewRef" class="hr-shell-body">
-                    <div v-if="!hostRemoteShellLines.length" class="hr-shell-empty">
-                      <p>尚未建立会话</p>
-                      <p class="muted">连接后输入命令；中文 Windows 输出已按 GBK 解码。右侧可点常用命令。</p>
-                      <p v-if="!isAdmin" class="warn-hint">当前账号非管理员，无法下发 Shell 指令，请使用 admin 登录。</p>
-                      <p v-else-if="!selected.online" class="warn-hint">终端离线，按钮不可用。</p>
-                    </div>
-                    <div
-                      v-for="(ln, i) in hostRemoteShellLines"
-                      :key="i"
-                      class="hr-shell-line"
-                      :class="ln.kind || 'out'"
-                    >{{ ln.text }}</div>
-                  </div>
-                  <div class="hr-shell-inputbar">
-                    <span class="hr-shell-prompt">&gt;</span>
-                    <input
-                      ref="hostRemoteShellInputRef"
-                      v-model="hostRemoteShellInput"
-                      class="field mono grow hr-shell-input"
-                      :disabled="!hostRemoteShellId || hostRemoteShellPhase === 'connecting'"
-                      placeholder="连接后输入命令，Enter 发送"
-                      @keyup.enter="hostRemoteShellSend"
-                    />
-                    <button
-                      type="button"
-                      class="btn sm primary"
-                      :disabled="!hostRemoteShellId || hostRemoteShellPhase === 'connecting'"
-                      @click="hostRemoteShellSend"
-                    >
-                      发送
-                    </button>
-                  </div>
-                </div>
-                <aside class="hr-shell-aside">
-                  <h4>常用命令</h4>
-                  <p class="hint sm">需先连接 Shell；危险命令仍会被 Agent 拦截。</p>
-                  <button
-                    v-for="c in HOST_SHELL_QUICK"
-                    :key="c"
-                    type="button"
-                    class="btn sm block hr-shell-quick"
-                    :disabled="!hostRemoteShellId || hostRemoteShellPhase === 'connecting'"
-                    @click="hostRemoteShellQuick(c)"
-                  >{{ c }}</button>
-                </aside>
-              </div>
-              <p class="hint sm hr-shell-foot">会话默认 15 分钟空闲超时，单 Agent 最多 3 路；轮询拉取输出（约 1–2 秒）。</p>
-            </div>
-            <div v-show="hostRemoteSubTab === 'ops'" class="host-remote-grid">
-              <section class="host-remote-card">
-                <h4>调查入口</h4>
-                <div class="host-remote-links">
-                  <button type="button" class="btn sm" @click="openSelectedHostThreats">本机威胁事件</button>
-                  <button type="button" class="btn sm" @click="openInvestigateForHost">日志调查</button>
-                  <button type="button" class="btn sm" @click="goMenu('timeline'); tlAgentId = selected?.agent_id || ''; loadTimeline()">主机时间线</button>
-                  <button type="button" class="btn sm primary" :disabled="!selected.online || hostRemoteBusy" @click="hostRemoteAction('refresh_modules')">立即刷新采集</button>
-                </div>
-              </section>
-              <section class="host-remote-card">
-                <h4>网络与采集</h4>
-                <p class="hint sm">隔离后仍保留 DNS/管理端通道，便于继续下发解除指令。</p>
-                <div class="host-remote-btns">
-                  <button type="button" class="btn sm danger-outline" :disabled="!selected.online || hostRemoteBusy" @click="hostRemoteAction('isolate_network')">网络隔离</button>
-                  <button type="button" class="btn sm" :disabled="!selected.online || hostRemoteBusy" @click="hostRemoteAction('unisolate_network')">解除隔离</button>
-                </div>
-              </section>
-              <section class="host-remote-card">
-                <h4>结束进程</h4>
-                <label class="hr-field">
-                  <span>PID</span>
-                  <input v-model="hostRemoteForm.pid" class="field" placeholder="如 9448" />
-                </label>
-                <button type="button" class="btn sm danger" :disabled="!selected.online || hostRemoteBusy" @click="hostRemoteAction('kill_process')">结束进程</button>
-              </section>
-              <section class="host-remote-card">
-                <h4>隔离文件</h4>
-                <label class="hr-field">
-                  <span>完整路径</span>
-                  <input v-model="hostRemoteForm.path" class="field mono" placeholder="C:\Users\...\file.exe" />
-                </label>
-                <button type="button" class="btn sm danger-outline" :disabled="!selected.online || hostRemoteBusy" @click="hostRemoteAction('quarantine_file')">隔离文件</button>
-              </section>
-              <section class="host-remote-card">
-                <h4>内存 YARA 扫描</h4>
-                <label class="hr-field">
-                  <span>PID（留空扫前 40 进程）</span>
-                  <input v-model="hostRemoteForm.scanPid" class="field" placeholder="可选" />
-                </label>
-                <button type="button" class="btn sm" :disabled="!selected.online || hostRemoteBusy" @click="hostRemoteAction('scan_memory')">开始扫描</button>
-              </section>
-              <section class="host-remote-card">
-                <h4>维护</h4>
-                <p class="hint sm">卸载会停止 Agent 服务；仅应急确认后使用。</p>
-                <button type="button" class="btn sm" :disabled="!selected.online" @click="uninstallHost(selected)">远程卸载 Agent</button>
-              </section>
-              <section class="host-remote-card wide">
-                <div class="host-remote-cmd-hd">
-                  <h4>指令记录</h4>
-                  <button type="button" class="btn sm" @click="loadHostRemoteCommands">刷新</button>
-                </div>
-                <table v-if="hostRemoteCommands.length" class="host-remote-cmd-table">
-                  <thead>
-                    <tr><th>时间</th><th>动作</th><th>状态</th><th>参数</th><th>结果</th><th></th></tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="c in hostRemoteCommands" :key="c.id">
-                      <td>{{ fmtTime(c.updated_at || c.created_at) }}</td>
-                      <td>{{ actionLabel(c.action) }}</td>
-                      <td><span class="cmd-st" :data-s="c.status">{{ cmdStatusLabel(c.status) }}</span></td>
-                      <td class="muted mono">{{ shortJson(c.params_json) }}</td>
-                      <td class="muted" :title="c.result_json">{{ friendlyCmdResult(c.action, c.result_json) }}</td>
-                      <td>
-                        <button
-                          v-if="c.action === 'quarantine_file' && c.status === 'done'"
-                          type="button"
-                          class="btn-text"
-                          @click="restoreQuarantined(c)"
-                        >回滚隔离</button>
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-                <p v-else class="empty sm">暂无远程指令记录</p>
-              </section>
-            </div>
-          </div>
-
-          <div v-if="hostTabGroup !== 'remote'" class="snap-flags">
-            <span v-for="f in snapStats.flags" :key="f.k" class="sflag" :data-t="f.tone">{{ f.label }}</span>
-            <span class="sflag muted">共 {{ snapStats.total }} 条 · 同步 {{ fmtTime(snap?.collected_at) }}</span>
-            <span v-if="columns.length" class="sflag muted">展示 {{ columns.length }} 列</span>
-          </div>
-          <div class="snap-viewbar" v-if="hostTabGroup !== 'remote' && module !== 'sysinfo' && hostTabGroup === 'runtime'">
-            <button type="button" class="tl-fchip" :class="{ on: snapView === 'all' }" @click="snapView = 'all'">全部</button>
-            <button type="button" class="tl-fchip" :class="{ on: snapView === 'risk' }" data-k="file" @click="snapView = 'risk'">
-              仅可疑 <em>{{ snapRiskCount }}</em>
-            </button>
-            <button type="button" class="tl-fchip" :class="{ on: snapView === 'hide_noise' }" @click="snapView = 'hide_noise'">
-              隐藏系统噪声
-            </button>
-            <span class="meta">运行态筛选 · 告警/时间线请到「检测」分区</span>
-          </div>
-          <div class="snap-viewbar" v-else-if="hostTabGroup !== 'remote' && module !== 'sysinfo' && hostTabGroup === 'inventory'">
-            <span class="meta">资产清单：软件 / 补丁 / 监听端口 / 用户 · 与检测态分离</span>
-          </div>
-
-          <div v-if="hostTabGroup !== 'remote'" class="snap-work has-detail">
-            <div class="panel snap-list">
-              <div class="panel-hd">
-                <div>
-                  <h3>{{ modLabel(module) }}</h3>
-                  <span class="meta" v-if="snap">
-                    最近同步 {{ fmtTime(snap.collected_at) }} · {{ filteredSnapRows.length }} / {{ (snap.items || []).length }} 条
-                    · {{ liveOk ? `已连接 · ${liveAgo}` : '同步中' }}
-                  </span>
-                </div>
+          </template>
+        </HostDetailHeader>
+        </template>
+        <template #navigation>
+          <HostInventoryNav :groups="HOST_TAB_GROUPS" :group="hostTabGroup" :modules="hostGroupMods" :current-module="module" :module-label="modLabel"
+            :flags="snapStats.flags" :total="snapStats.total" :collected-at="fmtTime(snap?.collected_at)" :column-count="columns.length"
+            @group="selectHostGroup" @module="loadSnap" />
+        </template>
+        <template #list>
+            <HostSnapshotList :current-module="module" :module-title="modLabel(module)" :snapshot="snap" :selected-row="snapRow"
+              :collected-at="fmtTime(snap?.collected_at)" :filtered-count="filteredSnapRows.length" :live-ok="liveOk" :live-ago="liveAgo"
+              :loading="snapLoading" :error="snapError" :status-message="snapStatusMessage" :truncated="snapModuleStatus?.status === 'possible_truncation'"
+              :columns="columns" :page-data="snapPagination" :page-size="snapPageSize" :column-label="colLabel" :cell="cell"
+              @select="snapRow = $event" @size-change="snapPageSize = $event; snapPage = 1" @page-change="snapPage = $event"
+              @refresh="loadSnap(module)" @request-collect="requestInventoryRefresh" @goto-policy="goMenu('policy')">
+              <template #search>
                 <input
                   v-if="module !== 'sysinfo'"
                   v-model="snapQ"
                   class="search"
                   placeholder="搜索名称 / 路径 / 命令 / DLL…"
                 />
-              </div>
-
-              <div v-if="snapLoading" class="empty">加载中…</div>
-              <div v-else-if="snapError" class="empty err">
-                <p>{{ snapError }}</p>
-                <p class="hint">终端需在线并完成至少一轮上报后才有该模块快照</p>
-              </div>
-              <div v-else-if="module === 'sysinfo'" class="sysinfo-grid">
-                <div v-for="(v, k) in (snap?.items?.[0] || {})" :key="k" class="si-item">
-                  <label>{{ colLabel(k) }}</label>
-                  <div>{{ cell({ [k]: v }, k) }}</div>
-                </div>
-                <p v-if="!(snap?.items || []).length" class="empty">暂无系统信息</p>
-              </div>
-              <div v-else class="table-scroll snap-table">
-                <table>
-                  <thead>
-                    <tr>
-                      <th v-for="c in columns" :key="c">{{ colLabel(c) }}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr
-                      v-for="(row, i) in filteredSnapRows"
-                      :key="i"
-                      class="row-click"
-                      :class="{ active: snapRow === row }"
-                      @click="snapRow = row"
-                    >
-                      <td v-for="c in columns" :key="c" :title="cell(row, c)">{{ cell(row, c) }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-                <p v-if="!(snap?.items || []).length" class="empty">该模块暂无数据（终端尚未上报或采集为空）</p>
-                <p v-else-if="!filteredSnapRows.length" class="empty">无匹配结果</p>
-              </div>
-            </div>
-
-            <aside class="panel snap-detail">
-              <template v-if="module === 'sysinfo' && (snap?.items?.[0])">
-                <div class="sd-hd">
-                  <div>
-                    <b>系统信息</b>
-                    <small>完整字段</small>
-                  </div>
-                </div>
-                <dl class="sd-dl">
-                  <div v-for="(v, k) in snap.items[0]" :key="k">
-                    <dt>{{ colLabel(k) }}</dt>
-                    <dd>{{ v == null || v === '' ? '—' : String(v) }}</dd>
-                  </div>
-                </dl>
               </template>
-              <template v-else-if="snapRow">
-                <div class="sd-hd">
-                  <div>
-                    <b>{{ rowTitle(snapRow) }}</b>
-                    <small>{{ modLabel(module) }} · 共 {{ Object.keys(snapRow).length }} 个字段</small>
-                  </div>
-                  <button type="button" class="icon-x" @click="snapRow = null">×</button>
-                </div>
-                <div class="sd-groups">
-                  <div v-for="g in detailGroups(snapRow)" :key="g.title" class="sd-group">
-                    <h4>{{ g.title }}</h4>
-                    <dl class="sd-dl compact-gap">
-                      <div v-for="(v, k) in g.fields" :key="k">
-                        <dt>{{ colLabel(k) }}</dt>
-                        <dd :title="String(v ?? '')">{{ formatDetail(v) }}</dd>
-                      </div>
-                    </dl>
-                  </div>
-                </div>
+            </HostSnapshotList>
+        </template>
+        <template #detail>
+            <HostSnapshotDetail :current-module="module" :system-info="snap?.items?.[0]" :row="snapRow" @close="snapRow = null">
+              <template #row-extra>
                 <div class="sd-actions" v-if="snapRow && (module === 'process' || module === 'file')">
-                  <button type="button" class="btn sm primary block" @click="hostRemoteFromRow(snapRow)">远程管理 →</button>
                 </div>
-                <div class="sd-actions" v-if="module === 'process' && snapRow">
-                  <h4>进程关系</h4>
-                  <dl class="sd-dl compact-gap">
-                    <div>
-                      <dt>父进程</dt>
-                      <dd>
-                        <button
-                          v-if="snapRow.parent_name || snapRow.ppid"
-                          type="button"
-                          class="btn-text"
-                          @click="jumpToPid(snapRow.ppid)"
-                        >{{ snapRow.parent_name || '—' }} ({{ snapRow.ppid }})</button>
-                        <span v-else>—</span>
-                      </dd>
-                    </div>
-                    <div v-if="snapRow.risk_tags">
-                      <dt>风险标签</dt>
-                      <dd>{{ snapRow.risk_tags }}</dd>
-                    </div>
-                    <div v-if="snapRow.module_count != null">
-                      <dt>模块数</dt>
-                      <dd>共 {{ snapRow.module_count }} · 第三方/可疑 {{ snapRow.module_third_count || processDlls.length }}</dd>
-                    </div>
-                  </dl>
-                  <div v-if="childProcesses.length" class="child-list">
-                    <small>子进程 ({{ childProcesses.length }})</small>
-                    <button
-                      v-for="c in childProcesses"
-                      :key="c.pid"
-                      type="button"
-                      class="child-row"
-                      @click="snapRow = c"
-                    >
-                      <b>{{ c.name }}</b>
-                      <em>PID {{ c.pid }}</em>
-                    </button>
-                  </div>
-                  <div v-if="processDlls.length" class="dll-list">
-                    <small>已加载 DLL（已过滤 System32）· {{ processDlls.length }} · 点击查看详情</small>
-                    <button
-                      v-for="(d, i) in processDlls"
-                      :key="i"
-                      type="button"
-                      class="dll-row"
-                      :class="{ hot: d.hot || d.unsigned, on: selectedDll === d }"
-                      @click="selectedDll = selectedDll === d ? null : d"
-                    >
-                      <b :title="d.path">{{ d.name || '—' }}</b>
-                      <em :title="d.path">{{ shortPath(d.path || '') }}</em>
-                      <span v-if="d.hot" class="sev" data-s="high">可疑路径</span>
-                      <span v-else-if="d.unsigned" class="sev" data-s="medium">未签名</span>
-                      <span v-else-if="d.signed" class="sev" data-s="info">{{ d.signed }}</span>
-                    </button>
-                    <div v-if="selectedDll" class="dll-detail">
-                      <h5>{{ selectedDll.name || '模块详情' }}</h5>
-                      <dl class="sd-dl compact-gap">
-                        <div><dt>模块名</dt><dd>{{ selectedDll.name || '—' }}</dd></div>
-                        <div><dt>完整路径</dt><dd class="mono" :title="selectedDll.path">{{ selectedDll.path || '—' }}</dd></div>
-                        <div><dt>签名</dt><dd>
-                          <span class="sev" :data-s="selectedDll.unsigned ? 'medium' : (selectedDll.signed === 'Valid' ? 'info' : 'low')">
-                            {{ selectedDll.signed || '—' }}
-                          </span>
-                        </dd></div>
-                        <div v-if="selectedDll.signer"><dt>签名者</dt><dd :title="selectedDll.signer">{{ selectedDll.signer }}</dd></div>
-                        <div v-if="selectedDll.company"><dt>公司</dt><dd>{{ selectedDll.company }}</dd></div>
-                        <div v-if="selectedDll.file_version"><dt>文件版本</dt><dd>{{ selectedDll.file_version }}</dd></div>
-                        <div v-if="selectedDll.size"><dt>大小</dt><dd>{{ fmtSize(selectedDll.size) }}</dd></div>
-                        <div v-if="selectedDll.sha256"><dt>SHA256</dt><dd class="mono" :title="selectedDll.sha256">{{ selectedDll.sha256 }}</dd></div>
-                        <div v-if="selectedDll.hot"><dt>风险</dt><dd><span class="sev" data-s="high">可疑路径</span></dd></div>
-                      </dl>
-                      <div class="row" style="margin-top:8px;gap:8px">
-                        <button v-if="selectedDll.path" type="button" class="btn sm" @click="copyText(selectedDll.path)">复制路径</button>
-                        <button v-if="selectedDll.sha256" type="button" class="btn sm" @click="copyText(selectedDll.sha256)">复制哈希</button>
-                      </div>
-                    </div>
-                  </div>
-                  <p v-else-if="snapRow.module_count" class="hint">该进程模块均为系统目录 DLL，或尚未完成模块采集（请「立即刷新」）。</p>
-                </div>
+                <HostProcessDetails v-if="module === 'process' && snapRow" :snap-row="snapRow" :child-processes="childProcesses" :process-dlls="processDlls" :selected-dll="selectedDll"
+                  :short-path="shortPath" :fmt-size="fmtSize" @pid="jumpToPid" @select-row="snapRow = $event" @select-dll="selectedDll = selectedDll === $event ? null : $event" @copy="copyText" />
                 <div class="sd-actions" v-if="(module === 'service' || module === 'task') && snapRow">
                   <h4>风险研判</h4>
                   <dl class="sd-dl compact-gap">
@@ -2976,20 +2227,9 @@
                   </button>
                 </div>
               </template>
-              <div v-else class="snap-sum">
-                <div class="sd-hd">
-                  <div>
-                    <b>{{ modLabel(module) }} 模块摘要</b>
-                    <small>{{ hostTabGroup === 'inventory' ? '资产字段概览' : '点击左侧行查看完整字段' }}</small>
-                  </div>
-                </div>
-                <div class="ss-kpis">
-                  <div><span>条目</span><strong>{{ snapStats.total }}</strong></div>
-                  <div v-if="snapStats.unsigned != null"><span>未签名</span><strong class="c-danger">{{ snapStats.unsigned }}</strong></div>
-                  <div v-if="snapStats.hotpath != null"><span>可疑路径</span><strong class="c-warn">{{ snapStats.hotpath }}</strong></div>
-                  <div v-if="snapStats.admins != null"><span>管理员身份</span><strong>{{ snapStats.admins }}</strong></div>
-                  <div v-if="snapStats.fields"><span>字段数</span><strong>{{ snapStats.fields }}</strong></div>
-                </div>
+              <template #summary>
+              <HostSnapshotSummary :stats="snapStats" :module-title="modLabel(module)" :inventory="hostTabGroup === 'inventory'" @select="snapRow = $event">
+                <template #detection>
                 <div v-if="hostTabGroup === 'runtime' && hostAlerts.length" class="ss-list">
                   <h4>检测入口</h4>
                   <button type="button" class="ss-row" @click="openSelectedHostThreats">
@@ -3003,118 +2243,174 @@
                     <small>打开检测 → 主机时间线</small>
                   </button>
                 </div>
-                <div v-if="snapStats.hotRows.length" class="ss-list">
-                  <h4>关注项</h4>
-                  <button
-                    v-for="(r, i) in snapStats.hotRows"
-                    :key="i"
-                    type="button"
-                    class="ss-row"
-                    @click="snapRow = r.row"
-                  >
-                    <span class="sev" :data-s="r.sev">{{ r.tag }}</span>
-                    <b>{{ r.title }}</b>
-                    <small>{{ r.sub }}</small>
-                  </button>
-                </div>
-                <div v-if="snapStats.sampleRows.length" class="ss-list">
-                  <h4>最近条目</h4>
-                  <button
-                    v-for="(r, i) in snapStats.sampleRows"
-                    :key="'s'+i"
-                    type="button"
-                    class="ss-row"
-                    @click="snapRow = r.row"
-                  >
-                    <span class="sev" data-s="info">条目</span>
-                    <b>{{ r.title }}</b>
-                    <small>{{ r.sub }}</small>
-                  </button>
-                </div>
-                <p v-else-if="!snapStats.hotRows.length" class="empty sm">本模块暂无高亮项，可在左侧点行查看详情</p>
+                </template>
+                <template #actions>
                 <div class="ss-acts">
                   <button type="button" class="btn sm" @click="openTimelineFor(selected.agent_id)">本机时间线</button>
                   <button type="button" class="btn sm" @click="openHostThreats(selected)">本机威胁</button>
                 </div>
-              </div>
-            </aside>
-          </div>
-        </div>
-      </section>
+                </template>
+              </HostSnapshotSummary>
+              </template>
+            </HostSnapshotDetail>
+        </template>
+      </HostDetailPage>
 
       <!-- ========== 部署 ========== -->
-      <section v-else-if="page === 'deploy'" class="page">
-        <header class="page-hd">
-          <div>
-            <h1>部署运营</h1>
-            <p class="desc">静默安装包内嵌平台地址与接入密钥</p>
+      <section v-else-if="page === 'deploy'" class="page page-stack deployment-page">
+        <ConsolePageHeader title="部署运营" description="按目标操作系统及 CPU 架构下载，安装包内嵌平台地址与接入密钥" />
+        <p v-if="dlBusy && dlProgress" class="deploy-feedback" role="status">{{ dlProgress }}</p>
+        <p v-if="dlError" class="err-text" role="alert">{{ dlError }}</p>
+
+        <article class="panel pad deploy-addr">
+          <label class="deploy-addr-label">安装包接入地址</label>
+          <code class="deploy-url">{{ deploymentAddress.effective_server_url || '尚未配置' }}</code>
+          <span class="pill" :class="{ on: deploymentAddress.server_url_source === 'configured' }">
+            {{ deploymentAddress.server_url_source === 'configured' ? '已配置' : '未就绪' }}
+          </span>
+          <div class="deploy-addr-acts">
+            <button
+              v-if="deploymentAddress.effective_server_url"
+              type="button"
+              class="btn sm"
+              @click="copyText(deploymentAddress.effective_server_url)"
+            >复制</button>
+            <button v-if="isAdmin" type="button" class="btn sm" @click="goMenu('settings')">修改地址</button>
+            <button type="button" class="btn sm" @click="refreshDeployAddress">刷新</button>
           </div>
-        </header>
-        <div class="deploy-grid">
-          <article class="panel pad">
-            <h3>下载安装包</h3>
-            <p>含 forensic-agent.exe、agent.json、install.vbs（用户态采集，不含内核驱动）；安装结束会弹窗提示结果。</p>
-            <div v-if="release" class="rel-box" :class="'rel-' + release.status">
-              <div class="rel-hd">
-                <span class="pill" :class="{ on: release.is_latest }">{{ releaseLabel }}</span>
-                <b v-if="release.version">v{{ release.version }}</b>
-                <span v-if="release.build_id" class="muted mono">{{ release.build_id }}</span>
-              </div>
-              <div v-if="release.exe_sha256" class="rel-line">SHA256 <code class="mono">{{ release.exe_sha256.slice(0, 24) }}…</code></div>
-              <div v-if="release.build_time" class="rel-line">构建时间 {{ release.build_time }}</div>
-              <div v-if="release.protocol_max" class="rel-line">协议 v{{ release.protocol_min }}–v{{ release.protocol_max }} · 能力 {{ (release.capabilities || []).length }} 项</div>
-              <div v-for="r in (release.reasons || [])" :key="r" class="rel-warn">{{ r }}</div>
+          <p v-if="deploymentAddress.server_url_error" class="hint deploy-addr-err">{{ deploymentAddress.server_url_error }}</p>
+        </article>
+
+        <div class="deploy-stack">
+          <article class="panel pad deploy-windows">
+            <div class="deploy-row-hd">
+              <h3>Windows 安装包</h3>
+              <label class="deploy-arch-inline">
+                架构
+                <select v-model="releaseArch" class="field" @change="loadRelease">
+                  <option value="amd64">x64</option>
+                  <option value="386">x86</option>
+                  <option value="arm64">ARM64</option>
+                </select>
+              </label>
+            </div>
+            <p class="hint">ZIP 含 <code>ForensicAgent-Setup.exe</code> / <code>install.vbs</code>，安装后注册服务并回连平台。</p>
+            <p v-if="releaseLoadError" class="err-text" role="alert">无法读取发布状态：{{ releaseLoadError }}</p>
+            <p v-else-if="!release" class="hint" role="status">正在读取发布状态…</p>
+            <ReleaseMetadata :release="release" :label="releaseLabel">
               <div class="rel-act">
                 <button type="button" class="btn" :disabled="releaseBusy || release.building || !release.go_available" @click="doBuildRelease">
                   {{ release.building ? '构建中…' : '重新构建 Agent' }}
                 </button>
+                <button type="button" class="btn primary" :disabled="!!windowsDownloadBlocked || dlBusy" @click="doDownload">
+                  {{ dlBusy ? '下载中…' : (release?.status === 'stale' ? '明确下载旧版本' : '下载 Windows 安装包') }}
+                </button>
                 <span v-if="!release.go_available" class="muted">服务器未检测到 Go</span>
+                <span v-else-if="!dlBusy && windowsDownloadBlocked" class="hint">{{ windowsDownloadBlocked }}</span>
               </div>
-            </div>
-            <button type="button" class="btn primary lg" :disabled="dlBusy" style="margin-top:12px" @click="doDownload">
-              {{ dlBusy ? '下载中…' : (release && !release.is_latest ? '仍然下载（非最新）' : '下载静默安装包') }}
-            </button>
-            <p v-if="dlBusy && dlProgress" class="meta" style="margin-top:8px">{{ dlProgress }}</p>
-            <p v-if="dlError" class="err-text">{{ dlError }}</p>
-          </article>
-          <article v-if="credSummary" class="panel pad">
-            <h3>终端凭据</h3>
-            <p>每台终端首次注册后获得专属凭据（仅存哈希），共享接入密钥只用于首次注册。</p>
-            <div class="rel-line">终端 {{ credSummary.total }} 台 · 已用专属凭据 <b>{{ credSummary.with_secret }}</b> · 已吊销 <b>{{ credSummary.revoked }}</b></div>
-            <div v-if="credSummary.total > credSummary.with_secret" class="rel-warn">
-              {{ credSummary.total - credSummary.with_secret }} 台仍是旧版终端（共享密钥），升级 Agent 后自动迁移
-            </div>
-            <div class="rel-act">
-              <button type="button" class="btn" :disabled="credBusy" @click="toggleSharedKey">
-                {{ credSummary.allow_shared_key ? '禁止共享密钥上报' : '允许共享密钥上报' }}
-              </button>
-              <span class="muted">{{ credSummary.allow_shared_key ? '当前：兼容旧终端' : '当前：仅专属凭据可上报' }}</span>
-            </div>
-          </article>
-          <article class="panel pad">
-            <h3>安装步骤</h3>
-            <ol>
-              <li>解压到目标机任意目录</li>
-              <li>右键 <code>install.vbs</code> → 以管理员身份运行</li>
-              <li>完成后查看弹窗与 install.log</li>
-              <li>服务 ForensicAgent 自动启动并回连</li>
-              <li>卸载：管理员运行 <code>uninstall.bat</code></li>
+            </ReleaseMetadata>
+            <ol class="deploy-steps-inline">
+              <li>解压后以管理员运行 <code>install.vbs</code> 或 <code>ForensicAgent-Setup.exe</code></li>
+              <li>查看 <code>install.log</code>；服务 <code>ForensicAgent</code> 自动启动</li>
+              <li>升级请覆盖安装完整包；卸载用 <code>uninstall.bat</code></li>
             </ol>
           </article>
+
+          <div class="deploy-grid deploy-grid-2">
+            <article class="panel pad linux-package">
+              <h3>Linux 安装包</h3>
+              <p class="hint">按架构下载 .tar.gz，适用于 systemd。</p>
+              <div class="linux-download-grid">
+                <button type="button" class="btn" :disabled="dlBusy || !isAdmin || !deploymentAddress.effective_server_url" @click="doDownloadLinux('amd64')">Linux x64</button>
+                <button type="button" class="btn" :disabled="dlBusy || !isAdmin || !deploymentAddress.effective_server_url" @click="doDownloadLinux('arm64')">Linux ARM64</button>
+                <button type="button" class="btn" :disabled="dlBusy || !isAdmin || !deploymentAddress.effective_server_url" @click="doDownloadLinux('loong64')">LoongArch64</button>
+                <button type="button" class="btn" :disabled="dlBusy || !isAdmin || !deploymentAddress.effective_server_url" @click="doDownloadLinux('riscv64')">RISC-V64</button>
+              </div>
+              <p class="hint">解压后 <code>sudo ./install.sh</code>，再 <code>systemctl status forensic-agent</code></p>
+            </article>
+
+            <article v-if="isAdmin" class="panel pad deploy-cred">
+              <h3>终端凭据 / 共享密钥</h3>
+              <p class="hint">专属凭据仅存哈希；共享接入密钥只用于首次注册。轮换后需重新下载安装包。</p>
+              <template v-if="credSummary">
+                <p class="deploy-cred-line">终端 <b>{{ credSummary.total }}</b> · 专属凭据 <b>{{ credSummary.with_secret }}</b> · 已吊销 <b>{{ credSummary.revoked }}</b></p>
+                <div v-if="credSummary.total > credSummary.with_secret" class="rel-warn">
+                  {{ credSummary.total - credSummary.with_secret }} 台仍是旧版终端（共享密钥），升级 Agent 后自动迁移
+                </div>
+                <div class="rel-act">
+                  <button type="button" class="btn" :disabled="credBusy" @click="toggleSharedKey">
+                    {{ credSummary.allow_shared_key ? '禁止共享密钥上报' : '允许共享密钥上报' }}
+                  </button>
+                  <button type="button" class="btn" :disabled="credBusy" @click="rotateKey">轮换接入密钥</button>
+                  <span class="muted">{{ credSummary.allow_shared_key ? '当前：兼容旧终端' : '当前：仅专属凭据可上报' }}</span>
+                </div>
+              </template>
+              <template v-else>
+                <p v-if="credLoadError" class="err-text" role="alert">{{ credLoadError }}</p>
+                <p v-else class="hint">正在加载凭据统计…</p>
+                <div class="rel-act">
+                  <button type="button" class="btn sm" :disabled="credBusy" @click="loadCredentials">重新加载</button>
+                  <button type="button" class="btn sm" :disabled="credBusy" @click="rotateKey">轮换接入密钥</button>
+                </div>
+              </template>
+            </article>
+          </div>
         </div>
+
+        <details class="panel pad ui-fold deploy-fold" open>
+          <summary class="ui-fold-sum"><span class="fold-caret" aria-hidden="true" /><span>上线诊断（最近终端）</span><em class="ui-fold-note">{{ agents.length }} 台</em></summary>
+          <p class="hint">四步确认：服务运行 → 注册成功 → 心跳正常 → 首批采集。</p>
+          <div v-if="!agents.length" class="empty-hint">暂无终端，下载安装包部署后可在此查看上线进度。</div>
+          <div v-else class="table-scroll">
+            <table class="diag-table">
+              <thead><tr><th>终端</th><th>上线进度</th><th>最近活动</th></tr></thead>
+              <tbody>
+                <tr v-for="a in agents.slice(0, 10)" :key="a.agent_id">
+                  <td class="diag-host-cell">
+                    <b>{{ a.hostname || a.agent_id }}</b>
+                    <span class="diag-host-meta mono">{{ a.os_family || '系统未知' }} · {{ a.version || '版本未知' }}</span>
+                  </td>
+                  <td>
+                    <div class="diag-steps">
+                      <span class="diag-step done" title="终端已在册"><i>✓</i>服务运行</span>
+                      <span class="diag-step" :class="a.agent_id ? 'done' : 'todo'"><i>{{ a.agent_id ? '✓' : '·' }}</i>注册成功</span>
+                      <span class="diag-step" :class="(a.online || a.last_heartbeat_at) ? 'done' : 'todo'"><i>{{ (a.online || a.last_heartbeat_at) ? '✓' : '·' }}</i>心跳正常</span>
+                      <span class="diag-step" :class="a.last_telemetry_at ? 'done' : 'warn'"><i>{{ a.last_telemetry_at ? '✓' : '!' }}</i>首批采集</span>
+                    </div>
+                  </td>
+                  <td class="diag-activity">
+                    <span>心跳 {{ a.last_heartbeat_at ? fmtTime(a.last_heartbeat_at) : '—' }} · {{ a.heartbeat_period_sec || '—' }}s</span>
+                    <span>遥测 {{ a.last_telemetry_at ? fmtTime(a.last_telemetry_at) : '尚未收到确认' }}</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <button type="button" class="btn sm" style="margin-top:10px" @click="goMenu('hosts')">查看所有终端</button>
+        </details>
+        <!-- 兜底：吃掉剩余高度，避免底部再透出灰底格子 -->
+        <div class="deploy-tail" aria-hidden="true"></div>
       </section>
 
       <!-- ========== Agent 规则管理 ========== -->
       <section v-else-if="page === 'rules'" class="page rules-page">
-        <header class="page-hd">
-          <div>
-            <h1>Agent 规则</h1>
-            <p class="desc">检出规则 / 内存 YARA / 告警加白（抑制误报，与检测规则分开管理）</p>
-          </div>
+        <ConsolePageHeader title="Agent 规则" description="检出规则 / 异常文件规则 / 日志规则 / 内存 YARA / 告警加白。异常文件规则保存后 sync 下发，可在「异常文件」页验证命中。">
           <div class="hd-right">
             <template v-if="rulesSection === 'detect'">
               <button type="button" class="btn" @click="loadRules">刷新</button>
               <button type="button" class="btn primary" @click="startCreateRule">新增规则</button>
+            </template>
+            <template v-else-if="rulesSection === 'abfile'">
+              <button type="button" class="btn" @click="loadRules">刷新</button>
+              <button type="button" class="btn primary" @click="startCreateAbfileRule">新增异常文件规则</button>
+            </template>
+            <template v-else-if="rulesSection === 'logrules'">
+              <button type="button" class="btn" :disabled="logRulesBusy" @click="loadLogRules(false)">
+                {{ logRulesBusy ? '加载中…' : '刷新' }}
+              </button>
+              <button type="button" class="btn primary" :disabled="logRulesBusy" @click="loadLogRules(true)" title="从磁盘重新扫描 YAML（改规则文件后用）">
+                重新索引
+              </button>
             </template>
             <template v-else-if="rulesSection === 'whitelist'">
               <button type="button" class="btn" @click="loadWhitelistOnly">刷新</button>
@@ -3130,7 +2426,7 @@
               {{ memoryYaraBusy ? '加载中…' : '刷新规则包' }}
             </button>
           </div>
-        </header>
+        </ConsolePageHeader>
 
         <nav class="rules-subnav" role="tablist" aria-label="规则分类">
           <button
@@ -3142,7 +2438,29 @@
             @click="rulesSection = 'detect'"
           >
             检出规则
-            <span class="rules-tab-meta">{{ agentRules.length }} 条</span>
+            <span class="rules-tab-meta">{{ detectRulesCount }} 条</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            class="rules-tab"
+            :class="{ on: rulesSection === 'abfile' }"
+            :aria-selected="rulesSection === 'abfile'"
+            @click="rulesSection = 'abfile'; loadRules()"
+          >
+            异常文件规则
+            <span class="rules-tab-meta">{{ abfileRules.length }} 条</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            class="rules-tab"
+            :class="{ on: rulesSection === 'logrules' }"
+            :aria-selected="rulesSection === 'logrules'"
+            @click="openRulesLogSection"
+          >
+            日志规则
+            <span v-if="logRulesPack?.ok" class="rules-tab-meta">{{ logRulesPack.loaded?.count || 0 }} 已加载</span>
           </button>
           <button
             type="button"
@@ -3344,39 +2662,48 @@
                 <div class="chip-row rules-filter-chips">
                   <button type="button" class="chip-btn" :class="{ on: rulesFilter === 'all' }" @click="rulesFilter = 'all'">全部</button>
                   <button type="button" class="chip-btn" :class="{ on: rulesFilter === 'sensor' }" @click="rulesFilter = 'sensor'">内置传感器</button>
-                  <button type="button" class="chip-btn" :class="{ on: rulesFilter === 'custom' }" @click="rulesFilter = 'custom'">快照规则</button>
+                  <button type="button" class="chip-btn" :class="{ on: rulesFilter === 'windows' }" @click="rulesFilter = 'windows'">Windows 规则</button>
+                  <button type="button" class="chip-btn" :class="{ on: rulesFilter === 'linux' }" @click="rulesFilter = 'linux'">Linux 规则 <small>{{ linuxRuleCount }}</small></button>
                   <button type="button" class="chip-btn" :class="{ on: rulesFilter === 'elastic' }" @click="rulesFilter = 'elastic'">Elastic</button>
                 </div>
               </div>
-              <div v-if="isAdmin" class="rules-bulk-bar">
-                <div class="rules-bulk-card">
-                  <span class="rules-bulk-card-hd">当前筛选</span>
-                  <div class="rules-bulk-pair">
-                    <button type="button" class="rbb on" :disabled="rulesBulkBusy || !filteredAgentRules.length" @click="bulkRulesEnabled(true)">
-                      {{ rulesBulkBusy ? '…' : '全部开启' }}
-                    </button>
-                    <button type="button" class="rbb off" :disabled="rulesBulkBusy || !filteredAgentRules.length" @click="bulkRulesEnabled(false)">
-                      全部关闭
-                    </button>
-                  </div>
-                </div>
-                <div class="rules-bulk-card elastic">
-                  <span class="rules-bulk-card-hd">Elastic</span>
-                  <div class="rules-bulk-actions">
-                    <div class="rules-bulk-pair" title="Elastic 快照规则">
-                      <em>快照</em>
-                      <button type="button" class="rbb on" :disabled="rulesBulkBusy" @click="bulkElasticRules(true)">开</button>
-                      <button type="button" class="rbb off" :disabled="rulesBulkBusy" @click="bulkElasticRules(false)">关</button>
-                    </div>
-                    <div class="rules-bulk-pair" title="Elastic EVM 规则">
-                      <em>EVM</em>
-                      <button type="button" class="rbb on" :disabled="rulesBulkBusy" @click="bulkElasticEvm(true)">开</button>
-                      <button type="button" class="rbb off" :disabled="rulesBulkBusy" @click="bulkElasticEvm(false)">关</button>
+              <p v-if="rulesFilter === 'linux'" class="hint linux-rule-review-note">规则启用状态不等于误报已验证。请结合实际业务证据人工复核告警；缺少误报说明或参考资料不代表规则错误。</p>
+              <details class="rules-bulk-fold">
+                <summary class="rules-fold-sum">
+                  <span class="fold-caret" aria-hidden="true" />
+                  <span>批量操作与端上开关</span>
+                  <em class="rules-fold-note">{{ filteredAgentRules.length }} 条可操作</em>
+                </summary>
+                <div v-if="isAdmin" class="rules-bulk-bar">
+                  <div class="rules-bulk-card">
+                    <span class="rules-bulk-card-hd">当前筛选</span>
+                    <div class="rules-bulk-pair">
+                      <button type="button" class="rbb on" :disabled="rulesBulkBusy || !filteredAgentRules.length" @click="bulkRulesEnabled(true)">
+                        {{ rulesBulkBusy ? '…' : '全部开启' }}
+                      </button>
+                      <button type="button" class="rbb off" :disabled="rulesBulkBusy || !filteredAgentRules.length" @click="bulkRulesEnabled(false)">
+                        全部关闭
+                      </button>
                     </div>
                   </div>
+                  <div class="rules-bulk-card elastic">
+                    <span class="rules-bulk-card-hd">Elastic</span>
+                    <div class="rules-bulk-actions">
+                      <div class="rules-bulk-pair" title="Elastic 快照规则">
+                        <em>快照</em>
+                        <button type="button" class="rbb on" :disabled="rulesBulkBusy" @click="bulkElasticRules(true)">开</button>
+                        <button type="button" class="rbb off" :disabled="rulesBulkBusy" @click="bulkElasticRules(false)">关</button>
+                      </div>
+                      <div class="rules-bulk-pair" title="Elastic EVM 规则">
+                        <em>EVM</em>
+                        <button type="button" class="rbb on" :disabled="rulesBulkBusy" @click="bulkElasticEvm(true)">开</button>
+                        <button type="button" class="rbb off" :disabled="rulesBulkBusy" @click="bulkElasticEvm(false)">关</button>
+                      </div>
+                    </div>
+                  </div>
                 </div>
-              </div>
-              <p v-else class="hint sm rules-bulk-hint">批量开启/关闭需管理员账号；单条规则可用左侧「启用」开关（若账号有权限）。</p>
+                <p v-else class="hint sm rules-bulk-hint">批量开启/关闭需管理员账号；单条规则可用左侧「启用」开关（若账号有权限）。</p>
+              </details>
             </div>
             <div class="table-scroll">
               <table>
@@ -3391,9 +2718,12 @@
                     <th>操作</th>
                   </tr>
                 </thead>
-                <tbody>
+                <tbody v-for="group in groupedAgentRules" :key="group.key">
+                  <tr class="rule-platform-heading" :data-platform="group.key">
+                    <td colspan="7"><strong>{{ group.label }}</strong> <span>{{ group.rows.length }} 条</span></td>
+                  </tr>
                   <tr
-                    v-for="r in filteredAgentRules"
+                    v-for="r in group.rows"
                     :key="r.id"
                     class="row-click"
                     :class="{ active: editingRule?.id === r.id && !ruleCreating }"
@@ -3414,7 +2744,7 @@
                       <span v-else-if="isElasticRule(r)" class="pill on accent">
                         {{ r.rule_channel === 'evm' || /\.(evm|fim)$/i.test(String(r.id || '')) ? 'Elastic EVM' : 'Elastic 快照' }}
                       </span>
-                      <span v-else class="pill">快照规则</span>
+                      <span v-else class="pill">{{ isLinuxRule(r) ? 'Linux 规则' : 'Windows 规则' }}</span>
                     </td>
                     <td><span class="sev" :data-s="r.severity">{{ sevLabel(r.severity) }}</span></td>
                     <td class="muted">
@@ -3622,6 +2952,125 @@
           </aside>
         </div>
 
+        <div v-show="rulesSection === 'abfile'" class="rules-layout">
+          <div class="panel fill">
+            <div class="abfile-result-note" role="note">
+              <span>规则保存后经 sync 下发到终端（EVM / FIM 路径）；异常文件页按规则标注命中。查询命中 ≠ 已生成告警。</span>
+              <button type="button" class="btn sm" @click="goMenu('abnormal-files')">查看异常文件</button>
+            </div>
+            <div class="panel-hd">
+              <h3>异常文件规则 ({{ abfileRules.length }})</h3>
+              <span class="meta">匹配新增文件的路径 / 文件名 / 扩展名</span>
+            </div>
+            <p class="hint sm" style="padding:0 14px 8px;margin:0">
+              路径前缀：<code class="mono">C:\Users\Public\</code> = 含子目录；
+              末尾多一个 <code class="mono">\</code> = 仅该目录一层。特征可填 <code class="mono">*</code>。
+            </p>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>启用</th>
+                    <th>标题</th>
+                    <th>严重级别</th>
+                    <th>路径前缀</th>
+                    <th>扩展名</th>
+                    <th>特征</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="r in abfileRules"
+                    :key="r.id"
+                    class="row-click"
+                    :class="{ on: editingRule?.id === r.id }"
+                    @click="startEditRule(r)"
+                  >
+                    <td @click.stop>
+                      <input type="checkbox" :checked="r.enabled !== false" @change="toggleRule(r, $event.target.checked)" />
+                    </td>
+                    <td>{{ r.title }}</td>
+                    <td><span class="sev" :data-s="r.severity">{{ sevLabel(r.severity) }}</span></td>
+                    <td class="mono muted">{{ (r.path_prefixes || []).join(', ') || '—' }}</td>
+                    <td class="mono muted">{{ (r.file_exts || []).join(',') || '不限' }}</td>
+                    <td class="mono muted">{{ (r.patterns || []).slice(0, 2).join(' · ') || '—' }}</td>
+                    <td>
+                      <button type="button" class="btn-text sm" @click.stop="startEditRule(r)">编辑</button>
+                      <button v-if="isAdmin" type="button" class="btn-text sm danger" @click.stop="removeRule(r)">删除</button>
+                    </td>
+                  </tr>
+                  <tr v-if="!abfileRules.length">
+                    <td colspan="7" class="empty">暂无异常文件规则，点右上角「新增异常文件规则」</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <aside class="panel rule-editor" v-if="ruleCreating || (editingRule && isAbfileRule(editingRule))">
+            <div class="panel-hd bare">
+              <h3>{{ ruleCreating ? '新增异常文件规则' : '编辑异常文件规则' }}</h3>
+            </div>
+            <div class="rule-form">
+              <label>
+                <span>标题 *</span>
+                <input v-model="ruleForm.title" class="field" placeholder="例如：Temp 目录投放 exe" />
+              </label>
+              <label>
+                <span>严重级别</span>
+                <select v-model="ruleForm.severity" class="field">
+                  <option value="critical">严重</option>
+                  <option value="high">高危</option>
+                  <option value="medium">中危</option>
+                  <option value="low">低危</option>
+                </select>
+              </label>
+              <label>
+                <span>路径前缀（可选，多条逗号分隔）</span>
+                <input v-model="ruleForm.pathPrefixesText" class="field" placeholder="C:\Users\Public\  或  仅根：C:\Users\Public\\" />
+              </label>
+              <label>
+                <span>文件扩展名</span>
+                <input v-model="ruleForm.fileExtsText" class="field" placeholder="exe,dll,ps1,bat" @change="syncFileExtsFromText" />
+              </label>
+              <label>
+                <span>签名条件</span>
+                <select v-model="ruleForm.signedFilter" class="field">
+                  <option value="">不限</option>
+                  <option value="unsigned">仅未签名</option>
+                  <option value="signed">仅有效签名</option>
+                </select>
+              </label>
+              <label>
+                <span>匹配特征（路径/文件名，一行一条；可填 *）</span>
+                <textarea v-model="ruleForm.patternsText" class="field area" rows="5" placeholder="*&#10;\\Temp\\&#10;\\Downloads\\" />
+              </label>
+              <label>
+                <span>匹配方式</span>
+                <select v-model="ruleForm.match" class="field">
+                  <option value="substring">子串</option>
+                  <option value="regex">正则</option>
+                  <option value="exact">精确</option>
+                </select>
+              </label>
+              <label>
+                <span>说明</span>
+                <input v-model="ruleForm.note" class="field" placeholder="可选" />
+              </label>
+              <label class="chk-inline">
+                <input type="checkbox" v-model="ruleForm.enabled" /> 启用
+              </label>
+              <p v-if="ruleFormError" class="err-text">{{ ruleFormError }}</p>
+              <div class="row rule-editor-actions">
+                <button type="button" class="btn primary" :disabled="ruleSaving" @click="saveRuleForm">
+                  {{ ruleSaving ? '保存中…' : '保存' }}
+                </button>
+                <button type="button" class="btn" @click="cancelRuleForm">取消</button>
+              </div>
+            </div>
+          </aside>
+        </div>
+
         <div v-show="rulesSection === 'whitelist'" class="rules-layout wl-layout">
           <div class="panel fill pad">
             <h3 style="margin:0 0 4px">告警加白（抑制规则）</h3>
@@ -3681,15 +3130,105 @@
               <li>「限定告警标题」可填 <code class="mono">*</code> 或关键词，避免一条加白误伤其它规则。</li>
               <li>「范围」留空 = 全部终端；也可在威胁详情里对单台加白。</li>
             </ul>
-            <h4 style="margin:16px 0 8px">类型说明</h4>
-            <dl class="wl-kind-dl">
-              <div v-for="(lb, k) in ALLOW_KIND_LABELS" :key="'wlh-'+k">
-                <dt>{{ lb }}</dt>
-                <dd>{{ wlKindHint(k) }}</dd>
-              </div>
-            </dl>
+            <details class="ui-fold wl-kind-fold">
+              <summary class="rules-fold-sum">
+                <span class="fold-caret" aria-hidden="true" />
+                <span>类型说明</span>
+                <em class="rules-fold-note">{{ Object.keys(ALLOW_KIND_LABELS).length }} 种</em>
+              </summary>
+              <dl class="wl-kind-dl">
+                <div v-for="(lb, k) in ALLOW_KIND_LABELS" :key="'wlh-'+k">
+                  <dt>{{ lb }}</dt>
+                  <dd>{{ wlKindHint(k) }}</dd>
+                </div>
+              </dl>
+            </details>
             <p class="hint sm" style="margin-top:14px">当前 {{ whitelistEnabledCount }}/{{ whitelist.length }} 条启用 · 命中次数在列表中可审计。</p>
           </aside>
+        </div>
+
+        <div v-show="rulesSection === 'logrules'" class="logrules-layout">
+          <p v-if="logRulesErr" class="err-text">{{ logRulesErr }}</p>
+          <div v-else-if="logRulesPack?.ok" class="logrules-body">
+            <div class="logrules-head">
+              <div class="mem-yara-top">
+                <div class="mem-yara-stats">
+                  <div class="mem-yara-stat">
+                    <label>已加载</label>
+                    <b>{{ logRulesPack.loaded?.count || 0 }}</b>
+                  </div>
+                  <div class="mem-yara-stat">
+                    <label>无 EventID</label>
+                    <b>{{ logRulesPack.loaded?.no_eid || 0 }}</b>
+                  </div>
+                  <div class="mem-yara-stat">
+                    <label>解析错误</label>
+                    <b>{{ logRulesPack.loaded?.errors || 0 }}</b>
+                  </div>
+                  <div class="mem-yara-stat">
+                    <label>匹配门槛</label>
+                    <b>{{ logRulesPack.loaded?.min_level || 'low' }}+</b>
+                  </div>
+                </div>
+                <p class="hint sm" style="margin:8px 0 0">{{ logRulesPack.note }}</p>
+              </div>
+              <div class="mem-yara-toggles" style="margin-top:12px">
+                <div
+                  v-for="r in (logRulesPack.roots || [])"
+                  :key="r.id"
+                  class="mem-yara-tog"
+                  :class="{ off: r.enabled === false }"
+                >
+                  <span>
+                    {{ logRulesPack.group_labels?.[r.id] || r.label || r.id }}
+                    <em class="muted sm"> · {{ r.file_count || 0 }} 文件{{ r.present ? '' : ' · 目录缺失' }}</em>
+                  </span>
+                  <label class="switch mem-yara-switch" @click.stop>
+                    <input
+                      type="checkbox"
+                      :disabled="!isAdmin || logRulesControlsBusy || !r.present"
+                      :checked="r.enabled !== false"
+                      @change="setLogRulesGroup(r.id, $event.target.checked)"
+                    />
+                    <i aria-hidden="true" />
+                  </label>
+                </div>
+              </div>
+              <div class="logrules-meta" v-if="logRulesPack.loaded?.by_source">
+                <h4>来源分布</h4>
+                <div class="logrules-chips">
+                  <span v-for="(n, k) in logRulesPack.loaded.by_source" :key="k" class="chip soft">{{ k }} {{ n }}</span>
+                </div>
+                <h4 style="margin-top:10px">级别分布</h4>
+                <div class="logrules-chips">
+                  <span v-for="(n, k) in logRulesPack.loaded.by_level" :key="k" class="chip soft">{{ k }} {{ n }}</span>
+                </div>
+              </div>
+            </div>
+            <div class="logrules-sample">
+              <header class="ai-panel-hd">
+                <h4>规则样例</h4>
+                <span class="muted sm">前 {{ (logRulesPack.sample || []).length }} 条 · 可滚动</span>
+              </header>
+              <div class="logrules-table-wrap">
+                <table class="ai-mini-tbl">
+                  <thead><tr><th>标题</th><th>级别</th><th>来源</th><th>EventID</th></tr></thead>
+                  <tbody>
+                    <tr v-for="(r, i) in (logRulesPack.sample || [])" :key="i">
+                      <td :title="r.title">{{ r.title || '—' }}</td>
+                      <td>{{ r.level || '—' }}</td>
+                      <td class="mono">{{ r.source_group || '—' }}</td>
+                      <td class="mono">{{ (r.event_ids || []).join(', ') || '—' }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+          <div v-else class="empty">
+            <p>{{ logRulesBusy ? '正在加载日志规则…' : '日志规则加载中…' }}</p>
+            <button v-if="!logRulesBusy" type="button" class="btn sm primary" @click="loadLogRules(false)">立即加载</button>
+          </div>
         </div>
 
         <div v-show="rulesSection === 'memory'" class="mem-yara-layout">
@@ -3879,752 +3418,11 @@
         </div>
       </section>
 
-      <!-- ========== AI 分析 ========== -->
-      <section v-else-if="page === 'ai-analyze'" class="page ai-page">
-        <header class="page-hd">
-          <div>
-            <h1>AI 分析</h1>
-            <p class="desc">Agentic SOC 风格 · Team Leader 调度多 Agent · 感知—调查—研判—处置建议（人工审核）</p>
-          </div>
-          <div class="hd-right">
-            <button type="button" class="btn sm" :disabled="aiHostsLoading" @click="loadAiAnalyzePage({ force: true })">
-              {{ aiHostsLoading ? '刷新中…' : '刷新终端' }}
-            </button>
-            <button
-              v-if="isAdmin"
-              type="button"
-              class="btn sm primary"
-              :disabled="aiBusy"
-              @click="setupLocalAiModel()"
-            >同步本地模型</button>
-          </div>
-        </header>
-
-        <div class="ai-status-bar panel pad">
-          <div class="ai-status-main">
-            <span class="pill" :class="aiStatusInfo.configured ? 'ok' : 'warn'">
-              {{ aiStatusInfo.configured ? '模型已就绪' : '模型未配置' }}
-            </span>
-            <span class="mono muted">{{ aiStatusInfo.base_url || '—' }}</span>
-            <span class="mono">{{ aiStatusInfo.model || '—' }}</span>
-            <span class="muted">来源 {{ aiStatusInfo.source || '—' }} · 超时 {{ aiStatusInfo.timeout || 120 }}s</span>
-          </div>
-          <div class="ai-status-skills muted">
-            Skill 根目录：<code class="mono">{{ aiStatusInfo.skills_root || 'skills' }}</code>
-            · 库内索引 {{ aiStatusInfo.skills_total || aiSkillsMeta.total_indexed || '—' }}
-            · EDR 相关 {{ aiStatusInfo.skills_edr || aiSkillsMeta.edr_relevant || aiSkills.length }}
-            · 列表展示 {{ aiSkills.length }}
-          </div>
-        </div>
-
-        <div class="ai-layout">
-          <aside class="ai-host-pane panel">
-            <div class="panel-hd">
-              <h3>在线终端 <em>{{ aiOnlineHosts.length }}</em></h3>
-              <label class="ai-only-online">
-                <input type="checkbox" v-model="aiOnlyOnline" /> 仅在线
-                <span v-if="aiHostsLoading" class="muted sm">同步中</span>
-              </label>
-            </div>
-            <div class="ai-host-list">
-              <button
-                v-for="h in aiVisibleHosts"
-                :key="h.agent_id"
-                type="button"
-                class="ai-host-row"
-                :class="{ on: aiSelectedId === h.agent_id, offline: !h.online }"
-                :disabled="aiBusy && aiSelectedId === h.agent_id"
-                @click="runAiAnalyze(h)"
-              >
-                <span class="ai-host-dot" :class="{ on: h.online }" />
-                <span class="ai-host-meta">
-                  <b>{{ h.hostname || h.agent_id }}</b>
-                  <small class="mono">{{ h.ip || h.last_ip || '—' }} · {{ h.online ? '在线' : '离线' }}</small>
-                </span>
-                <span class="ai-host-badges">
-                  <em v-if="h.open_threat_count" class="pill danger">威胁 {{ h.open_threat_count }}</em>
-                  <em v-else-if="h.threat_count" class="pill soft">历史 {{ h.threat_count }}</em>
-                </span>
-              </button>
-              <p v-if="!aiVisibleHosts.length && aiHostsLoading" class="empty sm">正在拉取在线终端…</p>
-              <p v-else-if="!aiVisibleHosts.length" class="empty sm">暂无终端，请先部署 Agent 或点「刷新终端」</p>
-            </div>
-          </aside>
-
-          <main class="ai-result-pane panel">
-            <div class="panel-hd">
-              <h3>
-                研判结果
-                <template v-if="aiSelectedHost"> · {{ aiSelectedHost.hostname || aiSelectedHost.agent_id }}</template>
-              </h3>
-              <span v-if="aiRefining" class="pill warn">模型精炼中…</span>
-              <span v-else-if="aiResult" class="muted">{{ aiResult.mode }} · {{ aiResult.elapsed_ms || 0 }} ms</span>
-            </div>
-
-            <div v-if="aiBusy && !aiResult" class="ai-busy">
-              <div class="ai-spinner" />
-              <p>正在快速汇总快照 / 威胁事件 / 日志…</p>
-              <p class="muted sm">约 1 秒内先出启发式结论，随后自动精炼。</p>
-            </div>
-
-            <div v-else-if="aiErrorText" class="ai-empty">
-              <p class="hint warn">分析失败：{{ aiErrorText }}</p>
-              <p class="muted">可再次点击左侧终端重试；若模型超时，仍会尽量返回启发式结论。</p>
-            </div>
-
-            <div v-else-if="aiResult" class="ai-result-body">
-              <div class="ai-hero">
-                <div class="ai-hero-verdict">
-                  <span class="ai-verdict" :data-v="aiResult.result?.verdict || ''">{{ aiResult.result?.verdict || '待研判' }}</span>
-                  <div class="ai-hero-meta">
-                    <b :class="'sev-' + String(aiResult.result?.risk_level || '').toLowerCase()">
-                      {{ aiResult.result?.risk_level || '—' }} · {{ aiResult.result?.risk_score ?? '—' }}
-                    </b>
-                    <small class="mono muted">{{ aiResult.mode }} · {{ aiResult.model || 'Agent Team' }} · {{ aiResult.elapsed_ms || 0 }} ms</small>
-                  </div>
-                </div>
-                <div class="ai-hero-stats">
-                  <button type="button" class="ai-hero-stat" @click="aiTab = 'threats'">
-                    <label>威胁</label>
-                    <b>{{ (aiResult.result?.threat_events || []).length || aiResult.pack_stats?.threat_events || 0 }}</b>
-                  </button>
-                  <button type="button" class="ai-hero-stat" @click="aiTab = 'logs'">
-                    <label>日志 / 规则</label>
-                    <b>{{ aiResult.pack_stats?.security_logs || 0 }} / {{ aiResult.pack_stats?.log_rule_hits || 0 }}</b>
-                  </button>
-                  <button type="button" class="ai-hero-stat" @click="aiTab = 'entity'">
-                    <label>实体</label>
-                    <b>{{ (aiResult.result?.entities || []).length }}</b>
-                  </button>
-                  <button type="button" class="ai-hero-stat" @click="aiTab = 'resp'">
-                    <label>处置建议</label>
-                    <b>{{ (aiResult.result?.dispositions || []).length }}</b>
-                  </button>
-                </div>
-              </div>
-
-              <p class="ai-scope-banner" v-if="aiResult.result?.data_scope">
-                <b>分析范围</b>
-                <span>{{ aiResult.result.data_scope.note }}</span>
-                <em class="muted">
-                  快照 {{ (aiResult.result.data_scope.snapshots || []).length }} 类 ·
-                  威胁 {{ aiResult.result.data_scope.threat_events || 0 }} ·
-                  时间线 {{ aiResult.result.data_scope.timeline || 0 }} ·
-                  调查日志 {{ aiResult.result.data_scope.investigate_logs || 0 }} ·
-                  规则命中 {{ aiResult.result.data_scope.log_rule_hits || 0 }}
-                </em>
-              </p>
-
-              <nav class="ai-tabs">
-                <button type="button" :class="{ on: aiTab === 'overview' }" @click="aiTab = 'overview'">概览</button>
-                <button type="button" :class="{ on: aiTab === 'chain' }" @click="aiTab = 'chain'">
-                  攻击链路
-                  <em v-if="aiResult.result?.attack_graph?.stage_count">{{ aiResult.result.attack_graph.stage_count }}</em>
-                </button>
-                <button type="button" :class="{ on: aiTab === 'threats' }" @click="aiTab = 'threats'">
-                  AI 研判事件
-                  <em v-if="(aiResult.result?.threat_events || []).length">{{ (aiResult.result.threat_events || []).length }}</em>
-                </button>
-                <button type="button" :class="{ on: aiTab === 'think' }" @click="aiTab = 'think'">
-                  AI 思维链
-                  <em v-if="(aiResult.result?.thinking_chain || []).length">{{ (aiResult.result.thinking_chain || []).length }}</em>
-                </button>
-                <button type="button" :class="{ on: aiTab === 'logs' }" @click="aiTab = 'logs'">
-                  日志取证
-                  <em v-if="(aiResult.result?.forensics_logs || aiResult.result?.security_logs || []).length">
-                    {{ (aiResult.result?.forensics_logs || aiResult.result?.security_logs || []).length }}
-                  </em>
-                </button>
-                <button type="button" :class="{ on: aiTab === 'entity' }" @click="aiTab = 'entity'">实体</button>
-                <button type="button" :class="{ on: aiTab === 'report' }" @click="aiTab = 'report'">报告</button>
-                <button type="button" :class="{ on: aiTab === 'resp' }" @click="aiTab = 'resp'">处置</button>
-              </nav>
-
-              <div v-show="aiTab === 'overview'" class="ai-tab-pane ai-overview">
-                <div v-if="(aiResult.result?.team?.agents || []).length" class="ai-team-strip">
-                  <div
-                    v-for="a in aiResult.result.team.agents"
-                    :key="a.id"
-                    class="ai-team-pill"
-                    :title="a.summary"
-                  >
-                    <i />
-                    <span>
-                      <b>{{ a.name }}</b>
-                      <small>{{ a.role }}</small>
-                    </span>
-                    <em>{{ a.status === 'done' ? '完成' : a.status }}</em>
-                  </div>
-                </div>
-
-                <div class="ai-board">
-                  <section class="ai-board-main">
-                    <div class="ai-panel">
-                      <header class="ai-panel-hd">
-                        <h4>AI 研判事件</h4>
-                        <button type="button" class="btn-text sm" @click="aiTab = 'threats'">全部 →</button>
-                      </header>
-                      <div v-if="(aiResult.result?.threat_events || []).length" class="ai-threat-preview">
-                        <button
-                          v-for="(ev, i) in (aiResult.result.threat_events || []).slice(0, 6)"
-                          :key="ev.id || i"
-                          type="button"
-                          class="ai-threat-row"
-                          @click="aiThreatIdx = i; aiTab = 'threats'"
-                        >
-                          <span class="pill" :data-ai="ev.ai?.conclusion || ''">{{ ev.ai?.conclusion || '待研判' }}</span>
-                          <span class="ai-threat-row-body">
-                            <b>{{ ev.title || '未命名告警' }}</b>
-                            <small>{{ (ev.ai?.reasoning && ev.ai.reasoning[0]) || ev.ai?.note || '—' }}</small>
-                          </span>
-                          <em class="muted sm">{{ ev.ai?.confidence != null ? ev.ai.confidence + '%' : '' }}</em>
-                        </button>
-                      </div>
-                      <p v-else class="ai-panel-empty">暂无 AI 研判事件</p>
-                    </div>
-
-                    <div class="ai-panel">
-                      <header class="ai-panel-hd">
-                        <h4>攻击时间线</h4>
-                        <span class="muted sm">威胁 + 安全日志</span>
-                      </header>
-                      <ol v-if="(aiResult.result?.attack_timeline || []).length" class="ai-rail">
-                        <li v-for="(t, i) in aiResult.result.attack_timeline.slice(0, 10)" :key="i">
-                          <span class="ai-rail-dot" :data-k="t.kind || ''" />
-                          <div>
-                            <div class="ai-rail-top">
-                              <time>{{ t.ts || '—' }}</time>
-                              <span class="pill soft">{{ t.kind }}</span>
-                            </div>
-                            <b>{{ t.title }}</b>
-                            <small v-if="t.detail">{{ t.detail }}</small>
-                          </div>
-                        </li>
-                      </ol>
-                      <p v-else class="ai-panel-empty">暂无攻击时间线节点</p>
-                    </div>
-                  </section>
-
-                  <aside class="ai-board-side">
-                    <div class="ai-panel">
-                      <header class="ai-panel-hd"><h4>调查流水线</h4></header>
-                      <ol v-if="(aiResult.result?.pipeline || []).length" class="ai-steps">
-                        <li v-for="(p, i) in aiResult.result.pipeline" :key="i">
-                          <span class="ai-step-no">{{ i + 1 }}</span>
-                          <div>
-                            <b>{{ p.stage }}</b>
-                            <span>{{ p.goal }}</span>
-                            <small v-if="typeof p.output === 'string'">{{ p.output }}</small>
-                            <small v-else-if="p.output?.what">{{ p.output.what }}</small>
-                            <em v-if="(p.deliverables || []).length">{{ (p.deliverables || []).join(' · ') }}</em>
-                          </div>
-                        </li>
-                      </ol>
-                      <p v-else class="ai-panel-empty">暂无流水线</p>
-                    </div>
-
-                    <div v-if="aiResult.result?.alert_meta" class="ai-panel">
-                      <header class="ai-panel-hd"><h4>告警基本信息</h4></header>
-                      <dl class="ai-meta-compact">
-                        <div><dt>来源</dt><dd>{{ aiResult.result.alert_meta.source || '—' }}</dd></div>
-                        <div><dt>分析规则</dt><dd>{{ aiResult.result.alert_meta.analysis_rule || '—' }}</dd></div>
-                        <div><dt>关联告警</dt><dd>{{ aiResult.result.alert_meta.related_alerts ?? '—' }}</dd></div>
-                        <div><dt>资产</dt><dd>{{ aiResult.result.alert_meta.hostname || '—' }}</dd></div>
-                        <div class="full"><dt>ATT&CK</dt><dd>{{ (aiResult.result.alert_meta.attck_stages || []).join(' · ') || '—' }}</dd></div>
-                        <div class="full" v-if="aiResult.result?.root_cause"><dt>根因</dt><dd>{{ aiResult.result.root_cause }}</dd></div>
-                      </dl>
-                    </div>
-
-                    <div class="ai-panel ai-quick">
-                      <header class="ai-panel-hd"><h4>快捷入口</h4></header>
-                      <div class="ai-quick-row">
-                        <button type="button" @click="aiTab = 'think'">思维链 {{ (aiResult.result?.thinking_chain || []).length }}</button>
-                        <button type="button" @click="aiTab = 'logs'">日志 {{ (aiResult.result?.security_logs || []).length }}</button>
-                        <button type="button" @click="aiTab = 'report'">报告</button>
-                        <button type="button" @click="aiTab = 'resp'">处置 {{ (aiResult.result?.dispositions || []).length }}</button>
-                      </div>
-                    </div>
-                  </aside>
-                </div>
-              </div>
-
-              <div v-show="aiTab === 'chain'" class="ai-tab-pane ai-chain-pane">
-                <div class="ai-section-hd">
-                  <div>
-                    <label>攻击链路图</label>
-                    <span class="muted sm">{{ aiResult.result?.attack_graph?.summary || '将主机 → 各 ATT&CK 阶段 → 证据串联' }}</span>
-                  </div>
-                  <button type="button" class="btn-text sm" @click="aiTab = 'logs'">日志取证 →</button>
-                </div>
-                <div v-if="(aiResult.result?.attack_graph?.nodes || []).length" class="ai-chain-board">
-                  <div class="ai-chain-flow">
-                    <template v-for="(n, i) in aiResult.result.attack_graph.nodes" :key="n.id">
-                      <div
-                        class="ai-chain-node"
-                        :class="[n.type, { on: aiChainNodeId === n.id }]"
-                        @click="aiChainNodeId = n.id"
-                      >
-                        <span class="ai-chain-badge">{{ n.type === 'host' ? '主机' : (i) }}</span>
-                        <b>{{ n.label }}</b>
-                        <small v-if="n.sub">{{ n.sub }}</small>
-                        <em v-if="n.count">{{ n.count }} 证据</em>
-                      </div>
-                      <div
-                        v-if="i < aiResult.result.attack_graph.nodes.length - 1"
-                        class="ai-chain-arrow"
-                        aria-hidden="true"
-                      >→</div>
-                    </template>
-                  </div>
-                  <div class="ai-chain-detail" v-if="aiChainNode">
-                    <header>
-                      <h4>{{ aiChainNode.label }}</h4>
-                      <span class="muted sm">{{ aiChainNode.sub || aiChainNode.type }}</span>
-                    </header>
-                    <div v-if="(aiChainNode.items || []).length" class="ai-chain-items">
-                      <article v-for="(it, ii) in aiChainNode.items" :key="ii" class="ai-chain-item" :data-k="it.kind">
-                        <div class="ai-chain-item-top">
-                          <span class="pill soft">{{ it.kind }}</span>
-                          <time>{{ it.ts || '—' }}</time>
-                        </div>
-                        <b>{{ it.title }}</b>
-                        <p>{{ it.detail || '—' }}</p>
-                      </article>
-                    </div>
-                    <p v-else class="muted">该节点无挂接明细证据</p>
-                    <div class="ai-threat-actions">
-                      <button type="button" class="btn sm" @click="aiTab = 'threats'">看 AI 研判事件</button>
-                      <button type="button" class="btn sm" @click="aiTab = 'entity'">看实体</button>
-                    </div>
-                  </div>
-                </div>
-                <div v-else class="ai-panel-empty fill">暂无线路节点。请确认 Agent 已回传威胁/日志后再分析。</div>
-              </div>
-
-              <div v-show="aiTab === 'threats'" class="ai-tab-pane">
-                <div class="ai-threats-head">
-                  <label>AI 研判事件（本地 Agent / 模型结论，非原始告警照搬）</label>
-                  <span class="muted sm">
-                    {{ (aiResult.result?.threat_events || []).length }} 条 ·
-                    主机结论 {{ aiResult.result?.verdict || '—' }} ·
-                    点行看推理与处置建议
-                  </span>
-                </div>
-                <div class="ai-threats-layout">
-                  <div class="ai-threats-list">
-                    <table class="ai-mini-tbl">
-                      <thead>
-                        <tr>
-                          <th>AI 结论</th>
-                          <th>置信</th>
-                          <th>原告警</th>
-                          <th>角色</th>
-                          <th>阶段</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr
-                          v-for="(ev, i) in (aiResult.result?.threat_events || [])"
-                          :key="ev.id || i"
-                          :class="{ on: aiThreatIdx === i }"
-                          @click="aiThreatIdx = i"
-                        >
-                          <td>
-                            <span class="pill" :data-ai="ev.ai?.conclusion || ''">{{ ev.ai?.conclusion || '待研判' }}</span>
-                          </td>
-                          <td class="mono">{{ ev.ai?.confidence != null ? ev.ai.confidence + '%' : '—' }}</td>
-                          <td :title="ev.title">
-                            <b class="ai-threat-title">{{ ev.title || '未命名告警' }}</b>
-                            <small class="muted">EDR {{ ev.severity || '—' }} · {{ ev.process_name || ev.path || ev.etype || '' }}</small>
-                          </td>
-                          <td>
-                            <span class="pill soft" :data-role="ev.ai?.role || ''">{{ ev.ai?.role || '—' }}</span>
-                          </td>
-                          <td>{{ ev.ai?.chain_stage || '—' }}</td>
-                        </tr>
-                        <tr v-if="!(aiResult.result?.threat_events || []).length">
-                          <td colspan="5" class="muted">暂无可供 AI 研判的威胁；请确认终端已上报告警。</td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-                  <aside v-if="aiThreatCard" class="ai-threat-card">
-                    <div class="ai-threat-card-top">
-                      <span class="pill" :data-ai="aiThreatCard.ai?.conclusion || ''">{{ aiThreatCard.ai?.conclusion || '待研判' }}</span>
-                      <b v-if="aiThreatCard.ai?.confidence != null">置信 {{ aiThreatCard.ai.confidence }}%</b>
-                    </div>
-                    <h4>{{ aiThreatCard.title || '研判详情' }}</h4>
-                    <p class="muted sm">原 EDR #{{ aiThreatCard.id || '—' }} · {{ aiThreatCard.severity || '—' }} · {{ aiThreatCard.etype || '—' }}</p>
-                    <div class="ai-think-block">
-                      <label>AI 结论说明</label>
-                      <p>{{ aiThreatCard.ai?.note || '暂无' }}</p>
-                    </div>
-                    <div class="ai-think-block" v-if="(aiThreatCard.ai?.reasoning || []).length">
-                      <label>AI 推理过程</label>
-                      <ul>
-                        <li v-for="(r, ri) in aiThreatCard.ai.reasoning" :key="ri">{{ r }}</li>
-                      </ul>
-                    </div>
-                    <div class="ai-think-block">
-                      <label>处置建议</label>
-                      <p>{{ aiThreatCard.ai?.recommendation || '—' }}</p>
-                    </div>
-                    <div class="ai-think-block" v-if="(aiThreatCard.ai?.attck || []).length">
-                      <label>关联 ATT&CK</label>
-                      <p>{{ (aiThreatCard.ai.attck || []).join(' · ') }}</p>
-                    </div>
-                    <div class="ai-think-block" v-if="(aiThreatCard.ai?.entities || []).length">
-                      <label>关联实体</label>
-                      <ul>
-                        <li v-for="(en, ei) in aiThreatCard.ai.entities" :key="ei">
-                          [{{ en.type }}/{{ en.risk }}] <code>{{ en.value }}</code>
-                        </li>
-                      </ul>
-                    </div>
-                    <div class="ai-think-block" v-if="(aiThreatCard.ai?.signals || []).length">
-                      <label>命中信号</label>
-                      <p>{{ (aiThreatCard.ai.signals || []).join(' · ') }}</p>
-                    </div>
-                    <div class="ai-think-block">
-                      <label>原始证据（EDR）</label>
-                      <p class="mono sm">{{ aiThreatCard.matched || aiThreatCard.summary || '—' }}</p>
-                      <p v-if="aiThreatCard.command_line" class="mono sm">{{ aiThreatCard.command_line }}</p>
-                    </div>
-                    <div class="ai-threat-actions">
-                      <button type="button" class="btn sm" @click="aiTab = 'think'">看 AI 思维链</button>
-                      <button type="button" class="btn sm" @click="aiTab = 'resp'">去处置</button>
-                      <button type="button" class="btn sm" @click="goMenu('events')">原始威胁事件</button>
-                    </div>
-                  </aside>
-                </div>
-              </div>
-
-              <div v-show="aiTab === 'think'" class="ai-tab-pane">
-                <div class="ai-think-banner">
-                  <b>AI ReAct 思维链</b>
-                  <span class="muted sm">每步含线索 / 假设 / 推理 / 观察，并挂接本机告警与日志证据；模型精炼后会追加一步。</span>
-                </div>
-                <div v-if="(aiResult.result?.thinking_chain || []).length" class="ai-think">
-                  <div class="ai-think-layout">
-                    <aside class="ai-think-steps">
-                      <button
-                        v-for="(s, i) in aiResult.result.thinking_chain"
-                        :key="s.id || i"
-                        type="button"
-                        class="ai-think-step"
-                        :class="{ on: aiThinkIdx === i, llm: s.phase === '模型精炼' }"
-                        @click="aiThinkIdx = i"
-                      >
-                        <b>{{ i + 1 }}. {{ s.title }}</b>
-                        <small>{{ s.phase }} · {{ s.agent }}</small>
-                      </button>
-                    </aside>
-                    <div v-if="aiThinkStep" class="ai-think-detail">
-                      <h4>{{ aiThinkStep.title }}</h4>
-                      <p class="muted sm">{{ aiThinkStep.phase }} · {{ aiThinkStep.agent }}</p>
-                      <div class="ai-think-block"><label>线索摘要</label><p>{{ aiThinkStep.clue || '—' }}</p></div>
-                      <div class="ai-think-block"><label>初始假设</label><p>{{ aiThinkStep.hypothesis || '—' }}</p></div>
-                      <div class="ai-think-block">
-                        <label>推理过程</label>
-                        <ul><li v-for="(r, ri) in (aiThinkStep.reasoning || [])" :key="ri">{{ r }}</li></ul>
-                      </div>
-                      <div class="ai-think-block"><label>观察结果</label><p>{{ aiThinkStep.observation || '—' }}</p></div>
-                      <div class="ai-think-block" v-if="(aiThinkStep.evidence || []).length">
-                        <label>本步 AI 证据</label>
-                        <ul class="ai-evidence-list">
-                          <li v-for="(ev, ei) in aiThinkStep.evidence" :key="ei">{{ ev }}</li>
-                        </ul>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-                <p v-else class="muted">暂无思维链</p>
-              </div>
-
-              <div v-show="aiTab === 'logs'" class="ai-tab-pane ai-logs-pane">
-                <div class="ai-section-hd">
-                  <div>
-                    <label>日志取证</label>
-                    <span class="muted sm">Agent 回传时间线 / 调查日志（含重点安全样本）· 点击分类筛选</span>
-                  </div>
-                  <span class="muted sm">
-                    规则库 {{ aiResult.pack_stats?.log_rules_indexed || 0 }} ·
-                    命中 {{ (aiResult.result?.log_rule_hits || []).length }}
-                  </span>
-                </div>
-                <div class="ai-log-cats">
-                  <button
-                    type="button"
-                    class="chip soft"
-                    :class="{ on: !aiLogCat }"
-                    @click="aiLogCat = ''"
-                  >全部 {{ aiForensicsLogs.length }}</button>
-                  <button
-                    v-for="(n, k) in aiLogCategoryMap"
-                    :key="k"
-                    type="button"
-                    class="chip soft"
-                    :class="{ on: aiLogCat === k }"
-                    @click="aiLogCat = (aiLogCat === k ? '' : k)"
-                  >{{ k }} {{ n }}</button>
-                  <span v-if="!Object.keys(aiLogCategoryMap).length" class="muted">分类为空</span>
-                </div>
-                <div class="ai-log-board">
-                  <div class="ai-log-main">
-                    <header class="ai-panel-hd">
-                      <h4>回传日志 {{ aiLogCat ? '· ' + aiLogCat : '' }}</h4>
-                      <span class="muted sm">{{ aiFilteredForensicsLogs.length }} 条</span>
-                    </header>
-                    <div class="ai-log-table-wrap">
-                      <table class="ai-mini-tbl">
-                        <thead>
-                          <tr><th>时间</th><th>类型</th><th>分类</th><th>摘要 / 命令行</th></tr>
-                        </thead>
-                        <tbody>
-                          <tr
-                            v-for="(l, i) in aiFilteredForensicsLogs.slice(0, 80)"
-                            :key="i"
-                            :class="{ on: aiLogIdx === i }"
-                            @click="aiLogIdx = i"
-                          >
-                            <td class="muted">{{ l.ts || '—' }}</td>
-                            <td class="mono">{{ l.etype || '—' }}</td>
-                            <td>
-                              <button type="button" class="chip soft sm" @click.stop="aiLogCat = l.category || ''">
-                                {{ l.category || 'other' }}
-                              </button>
-                            </td>
-                            <td :title="l.command_line || l.summary">{{ l.summary || l.command_line || '—' }}</td>
-                          </tr>
-                          <tr v-if="!aiFilteredForensicsLogs.length">
-                            <td colspan="4" class="muted">当前分类无日志。可切「全部」，或确认 Agent 已上报 Winlog / 持久化 / 进程事件。</td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    </div>
-                    <aside v-if="aiLogCard" class="ai-log-card">
-                      <b>{{ aiLogCard.etype || '日志' }}</b>
-                      <p class="muted sm">{{ aiLogCard.ts || '—' }} · {{ aiLogCard.category || 'other' }}</p>
-                      <p>{{ aiLogCard.summary || '—' }}</p>
-                      <p v-if="aiLogCard.command_line" class="mono sm">{{ aiLogCard.command_line }}</p>
-                      <p v-if="aiLogCard.path" class="mono sm">{{ aiLogCard.path }}</p>
-                    </aside>
-                  </div>
-                  <div class="ai-log-side">
-                    <header class="ai-panel-hd">
-                      <h4>日志规则命中</h4>
-                      <span class="muted sm">对照 log_rules / logrules</span>
-                    </header>
-                    <div class="ai-log-table-wrap">
-                      <table class="ai-mini-tbl">
-                        <thead><tr><th>规则</th><th>来源</th><th>证据</th></tr></thead>
-                        <tbody>
-                          <tr v-for="(h, i) in (aiResult.result?.log_rule_hits || []).slice(0, 40)" :key="i">
-                            <td>{{ h.rule_title || '—' }}</td>
-                            <td class="mono">{{ h.source || h.match || '—' }}</td>
-                            <td :title="h.evidence">{{ h.evidence || h.etype || '—' }}</td>
-                          </tr>
-                          <tr v-if="!(aiResult.result?.log_rule_hits || []).length">
-                            <td colspan="3" class="muted">暂无规则命中（增强对照，分析不依赖此项）。</td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div v-show="aiTab === 'entity'" class="ai-tab-pane ai-entity-pane">
-                <div class="ai-section-hd">
-                  <div>
-                    <label>实体研判</label>
-                    <span class="muted sm">
-                      共 {{ (aiResult.result?.entities || []).length }} ·
-                      恶意 {{ aiEntityStats.malicious }} ·
-                      可疑 {{ aiEntityStats.suspicious }} ·
-                      IoC {{ (aiResult.result?.iocs || []).length }}
-                    </span>
-                  </div>
-                  <button type="button" class="btn-text sm" @click="aiTab = 'resp'">去处置 →</button>
-                </div>
-                <div v-if="(aiResult.result?.entities || []).length" class="ai-entity-board">
-                  <div class="ai-entity-list">
-                    <button
-                      v-for="(e, i) in aiResult.result.entities"
-                      :key="i"
-                      type="button"
-                      class="ai-entity-row"
-                      :class="{ on: aiEntityIdx === i }"
-                      :data-risk="e.risk || ''"
-                      @click="aiEntityIdx = i"
-                    >
-                      <span class="ai-entity-type">{{ e.type || 'obj' }}</span>
-                      <span class="ai-entity-main">
-                        <b :title="e.value">{{ e.value || '—' }}</b>
-                        <small>{{ e.reason || e.analysis?.conclusion || '—' }}</small>
-                      </span>
-                      <span class="pill" :data-risk="e.risk">{{ e.risk || '—' }}</span>
-                    </button>
-                  </div>
-                  <aside v-if="aiEntityCard" class="ai-entity-detail">
-                    <div class="ai-entity-detail-top">
-                      <span class="pill" :data-risk="aiEntityCard.risk">{{ aiEntityCard.risk || '—' }}</span>
-                      <em>{{ aiEntityCard.type || 'entity' }}</em>
-                      <span v-if="aiEntityCard.action" class="chip soft">剧本 {{ aiEntityCard.action }}</span>
-                    </div>
-                    <h4 class="mono">{{ aiEntityCard.value }}</h4>
-                    <div class="ai-entity-grid">
-                      <div class="ai-entity-box">
-                        <label>基本信息</label>
-                        <dl>
-                          <div><dt>PID</dt><dd>{{ aiEntityCard.analysis?.basic?.pid ?? aiEntityCard.pid ?? '—' }}</dd></div>
-                          <div><dt>路径</dt><dd class="mono">{{ aiEntityCard.analysis?.basic?.path || aiEntityCard.path || '—' }}</dd></div>
-                          <div class="full" v-if="aiEntityCard.analysis?.basic?.command_line || aiEntityCard.command_line">
-                            <dt>命令行</dt>
-                            <dd class="mono">{{ aiEntityCard.analysis?.basic?.command_line || aiEntityCard.command_line }}</dd>
-                          </div>
-                        </dl>
-                      </div>
-                      <div class="ai-entity-box">
-                        <label>研判过程</label>
-                        <ol>
-                          <li v-for="(p, pi) in (aiEntityCard.analysis?.process || ['暂无过程说明'])" :key="pi">{{ p }}</li>
-                        </ol>
-                      </div>
-                      <div class="ai-entity-box accent">
-                        <label>研判结论</label>
-                        <p>{{ aiEntityCard.analysis?.conclusion || aiEntityCard.reason || '—' }}</p>
-                      </div>
-                      <div class="ai-entity-box advice">
-                        <label>处置建议</label>
-                        <p>{{ aiEntityCard.analysis?.advice || '—' }}</p>
-                      </div>
-                    </div>
-                    <div v-if="(aiResult.result?.iocs || []).length" class="ai-ioc-strip">
-                      <label>相关 IoC</label>
-                      <div class="ai-ioc-chips">
-                        <span v-for="(x, i) in aiResult.result.iocs.slice(0, 12)" :key="i" class="chip soft">
-                          <b>{{ x.type }}</b> {{ x.value }}
-                        </span>
-                      </div>
-                    </div>
-                    <div class="ai-threat-actions">
-                      <button type="button" class="btn sm" @click="aiTab = 'threats'">看 AI 研判事件</button>
-                      <button type="button" class="btn sm" @click="aiTab = 'resp'">去处置</button>
-                    </div>
-                  </aside>
-                </div>
-                <div v-else class="ai-panel-empty fill">暂无实体。分析完成后会从威胁/日志抽出进程、文件、IP、注册表等。</div>
-              </div>
-
-              <div v-show="aiTab === 'report'" class="ai-tab-pane ai-report-pane">
-                <div class="ai-section-hd">
-                  <div>
-                    <label>调查报告</label>
-                    <span class="muted sm">
-                      {{ aiResult.result?.verdict || '—' }} ·
-                      {{ aiResult.result?.risk_level || '—' }} /
-                      {{ aiResult.result?.risk_score ?? '—' }} ·
-                      {{ aiResult.llm_refined || aiResult.result?.llm_refined ? '模型已精炼' : (aiResult.mode || 'Agent Team') }}
-                    </span>
-                  </div>
-                  <div class="ai-report-actions">
-                    <button type="button" class="btn-text sm" @click="aiTab = 'think'">思维链</button>
-                    <button type="button" class="btn-text sm" @click="aiTab = 'resp'">处置 →</button>
-                  </div>
-                </div>
-                <div class="ai-report-board">
-                  <article class="ai-md ai-report-doc" v-html="aiMarkdownHtml" />
-                  <aside class="ai-report-side">
-                    <div class="ai-report-card verdict" :data-v="aiResult.result?.verdict || ''">
-                      <label>AI 定性</label>
-                      <b>{{ aiResult.result?.verdict || '待研判' }}</b>
-                      <small>风险 {{ aiResult.result?.risk_level || '—' }} · {{ aiResult.result?.risk_score ?? '—' }}/100</small>
-                    </div>
-                    <div class="ai-report-card" v-if="aiResult.result?.root_cause">
-                      <label>根因摘要</label>
-                      <p>{{ aiResult.result.root_cause }}</p>
-                    </div>
-                    <div class="ai-report-card" v-if="(aiResult.result?.highlights || []).length">
-                      <label>关键证据</label>
-                      <ul>
-                        <li v-for="(h, i) in aiResult.result.highlights.slice(0, 8)" :key="i">{{ h }}</li>
-                      </ul>
-                    </div>
-                    <div class="ai-report-card" v-if="(aiResult.skills_used || []).length">
-                      <label>使用 Skill</label>
-                      <div class="ai-ioc-chips">
-                        <span v-for="s in aiResult.skills_used" :key="s.id" class="chip soft" :title="(s.why || []).join('；')">
-                          {{ s.name || s.id }}
-                        </span>
-                      </div>
-                    </div>
-                    <div class="ai-report-card" v-if="(aiResult.result?.iocs || []).length">
-                      <label>IoC</label>
-                      <ul class="ai-ioc-list">
-                        <li v-for="(x, i) in aiResult.result.iocs.slice(0, 10)" :key="i">
-                          <b>{{ x.type }}</b> <code>{{ x.value }}</code>
-                        </li>
-                      </ul>
-                    </div>
-                    <p v-if="aiResult.error" class="hint warn">模型回退：{{ aiResult.error }}</p>
-                  </aside>
-                </div>
-              </div>
-
-              <div v-show="aiTab === 'resp'" class="ai-tab-pane">
-                <div v-if="(aiResult.result?.dispositions || []).length" class="ai-disp">
-                  <label>推荐处置 <em class="muted">（需人工审核）</em></label>
-                  <div class="ai-disp-list">
-                    <div v-for="(d, i) in aiResult.result.dispositions" :key="i" class="ai-disp-row">
-                      <div>
-                        <b>{{ d.label }}</b>
-                        <span class="mono">{{ d.target }}</span>
-                        <small>{{ d.reason }}</small>
-                      </div>
-                      <button
-                        v-if="d.action && d.action !== 'review'"
-                        type="button"
-                        class="btn sm danger-outline"
-                        :disabled="aiDispBusy"
-                        @click="runAiDisposition(d)"
-                      >审核并下发</button>
-                      <button v-else type="button" class="btn sm" @click="goMenu('events')">去威胁事件</button>
-                    </div>
-                  </div>
-                </div>
-                <div v-if="(aiResult.result?.hardening || []).length" class="ai-hard">
-                  <label>体系化加固建议</label>
-                  <ul>
-                    <li v-for="(h, i) in aiResult.result.hardening" :key="i">
-                      <b>{{ h.title }}</b>
-                      <span>{{ h.detail }}</span>
-                    </li>
-                  </ul>
-                </div>
-              </div>
-            </div>
-
-            <div v-else class="ai-empty">
-              <p>请选择左侧<strong>在线终端</strong>，点击后自动开始分析。</p>
-              <p class="muted">分析内容包含：Agent 实时快照（进程/服务/任务/启动项/网络/文件等）、威胁事件，以及近 24 小时终端日志（登录/PowerShell/计划任务/服务/注册表/外联等）。</p>
-            </div>
-          </main>
-        </div>
-      </section>
-
       <!-- ========== ATT&CK 看板 ========== -->
       <section v-else-if="page === 'attck'" class="page attck-page">
-        <header class="page-hd">
-          <div>
-            <h1>ATT&CK 看板</h1>
-            <p class="desc">与威胁事件同源映射 · 热力总览 · 告警下钻</p>
-          </div>
+        <ConsolePageHeader title="ATT&CK 看板" description="与威胁事件同源映射 · 热力总览 · 告警下钻">
           <div class="hd-right">
-            <span class="live-hint" :class="{ on: liveOk }">
-              <i class="live-dot" />
-              {{ liveOk ? `已连接 · ${liveAgo}` : '连接中…' }}
-            </span>
+            <LiveConnectionBadge :connected="liveOk" :age="liveAgo" />
             <select v-model="attckAgent" class="search sev-filter" @change="loadAttckBoard">
               <option value="">全部主机</option>
               <option v-for="a in agents" :key="a.agent_id" :value="a.agent_id">{{ a.hostname || short(a.agent_id) }}</option>
@@ -4637,126 +3435,14 @@
             </select>
             <button type="button" class="btn ghost-btn" @click="loadAttckBoard">立即同步</button>
           </div>
-        </header>
+        </ConsolePageHeader>
 
-        <div class="ov-kpis ak-kpis">
-          <article class="kpi click" @click="goMenu('events')">
-            <span>威胁事件</span>
-            <strong class="c-danger">{{ attckTotal }}</strong>
-            <em>不含已加白 / 无需处置</em>
-          </article>
-          <article class="kpi click" @click="goMenu('events')">
-            <span>未处置</span>
-            <strong class="c-warn">{{ attckOpen }}</strong>
-            <em>待研判处置</em>
-          </article>
-          <article class="kpi">
-            <span>高危 / 严重</span>
-            <strong class="c-danger">{{ attckHigh }}</strong>
-            <em>优先响应</em>
-          </article>
-          <article class="kpi">
-            <span>覆盖战术</span>
-            <strong class="c-ink">{{ attckCovered }}<small class="kpi-den">/{{ attckHeat.length || 12 }}</small></strong>
-            <em>MITRE ATT&CK 战术</em>
-          </article>
-          <article class="kpi">
-            <span>命中技术</span>
-            <strong class="c-ink">{{ attckTop.length }}</strong>
-            <em>{{ attckUnmapped ? `另有 ${attckUnmapped} 条未映射` : '技术去重' }}</em>
-          </article>
-        </div>
+        <AttckSummaryCards :total="attckTotal" :open="attckOpen" :high="attckHigh" :covered="attckCovered"
+          :tactic-count="attckHeat.length" :technique-count="attckTop.length" :unmapped="attckUnmapped" @events="goMenu('events')" />
 
-        <div class="ak-board">
-          <div class="panel ak-chain">
-            <div class="panel-hd">
-              <div>
-                <h3>攻击链路</h3>
-                <span class="meta">12 战术矩阵 · 点选筛选下方技术与告警</span>
-              </div>
-              <button v-if="attckSel.tactic || attckSel.tech" type="button" class="btn-text" @click="clearAttckSel">清除筛选</button>
-            </div>
-            <div class="ak-steps">
-              <button
-                v-for="(t, i) in attckHeat"
-                :key="t.tactic"
-                type="button"
-                class="ak-step"
-                :class="{ hit: t.count, on: attckSel.tactic === t.tactic }"
-                :style="attckStepStyle(t)"
-                @click="selectAttckTactic(t.tactic)"
-              >
-                <div class="ak-step-top">
-                  <span class="ak-no">{{ String(i + 1).padStart(2, '0') }}</span>
-                  <b>{{ t.name }}</b>
-                </div>
-                <div class="ak-step-bot">
-                  <strong>{{ t.count || 0 }}</strong>
-                  <em>
-                    <template v-if="t.techniques.length">{{ t.techniques.length }} 项技术<template v-if="t.high"> · 高危 {{ t.high }}</template></template>
-                    <template v-else>未发现</template>
-                  </em>
-                </div>
-              </button>
-            </div>
-          </div>
-
-          <div class="ak-mid">
-            <div class="panel ak-tech">
-              <div class="panel-hd">
-                <div>
-                  <h3>技术分布</h3>
-                  <span class="meta">{{ attckSelTacticName ? `战术：${attckSelTacticName}` : '全部战术' }} · 点击筛选告警</span>
-                </div>
-              </div>
-              <div v-if="attckTechList.length" class="ak-tech-list">
-                <button
-                  v-for="t in attckTechList"
-                  :key="t.id"
-                  type="button"
-                  class="ak-tech-row"
-                  :class="{ on: attckSel.tech === t.id }"
-                  @click="selectAttckTech(t)"
-                >
-                  <code>{{ t.id }}</code>
-                  <span class="ak-tech-name" :title="t.name">{{ t.name || '—' }}</span>
-                  <span class="ak-tac">{{ t.tactic_name || attckSelTacticName || '—' }}</span>
-                  <i class="rank-bar"><i :style="{ width: attckRankPct(t.count) + '%' }" /></i>
-                  <strong>{{ t.count }}</strong>
-                </button>
-              </div>
-              <p v-else class="empty sm">{{ attckSel.tactic ? '该战术下暂无命中技术' : '暂无命中技术' }}</p>
-            </div>
-
-            <div class="panel ak-hosts">
-              <div class="panel-hd">
-                <div>
-                  <h3>告警主机</h3>
-                  <span class="meta">点击只看该主机</span>
-                </div>
-                <button v-if="attckAgent" type="button" class="btn-text" @click="attckAgent = ''; loadAttckBoard()">全部主机</button>
-              </div>
-              <div v-if="attckHosts.length" class="attck-rank">
-                <button
-                  v-for="(h, i) in attckHosts"
-                  :key="h.host || h.agent_id || i"
-                  type="button"
-                  class="rank-row"
-                  :class="{ on: attckAgent && attckAgent === h.agent_id }"
-                  @click="filterAttckByHost(h)"
-                >
-                  <em>{{ i + 1 }}</em>
-                  <div class="rank-main">
-                    <b>{{ h.host || h.hostname || short(h.agent_id) }}</b>
-                    <i class="rank-bar host"><i :style="{ width: attckHostPct(h.count) + '%' }" /></i>
-                  </div>
-                  <strong>{{ h.count }}</strong>
-                </button>
-              </div>
-              <p v-else class="empty sm">暂无</p>
-            </div>
-          </div>
-        </div>
+        <AttckOverviewBoard :attck-sel="attckSel" :attck-heat="attckHeat" :attck-tech-list="attckTechList" :attck-sel-tactic-name="attckSelTacticName"
+          :attck-agent="attckAgent" :attck-hosts="attckHosts" :attck-step-style="attckStepStyle" :attck-rank-pct="attckRankPct" :attck-host-pct="attckHostPct" :short="short"
+          @clear-selection="clearAttckSel" @select-tactic="selectAttckTactic" @select-technique="selectAttckTech" @clear-host="attckAgent = ''; loadAttckBoard()" @select-host="filterAttckByHost" />
 
         <div class="panel attck-recent">
           <div class="panel-hd">
@@ -4855,69 +3541,196 @@
         </div>
       </section>
 
-      <!-- ========== IOC ========== -->
-      <section v-else-if="page === 'ioc'" class="page">
-        <header class="page-hd">
-          <div>
-            <h1>威胁情报 IOC</h1>
-            <p class="desc">本地自定义 IOC + 情报库 ioc_data.db 精确匹配（哈希 / IP / 域名）</p>
-          </div>
+      <!-- ========== 威胁情报（独立模块） ========== -->
+      <section v-else-if="page === 'ioc'" class="page page-stack intel-page">
+        <ConsolePageHeader title="威胁情报" description="查看已加载情报库内容、试查命中，并维护本地自定义 IOC">
           <button type="button" class="btn" @click="loadIoc">刷新</button>
-        </header>
-        <div class="panel pad ioc-lib" v-if="iocLib">
+        </ConsolePageHeader>
+
+        <div class="panel pad ioc-lib">
           <div class="ioc-lib-row">
             <div>
-              <b>情报库</b>
-              <p class="muted mono">{{ iocLib.path || 'ioc/ioc_data.db' }}</p>
+              <b>情报库状态</b>
+              <p class="muted mono">{{ iocLib?.path || 'ioc_data.db' }}</p>
             </div>
             <div class="ioc-lib-stat">
-              <span>条目 <b>{{ fmtNum(iocLib.count) }}</b></span>
+              <span>库内条目 <b>{{ fmtNum(iocLib?.count) }}</b></span>
               <span>本地启用 <b>{{ iocLibLocal }}</b></span>
-              <span :class="iocLib.exists === false ? 'off' : 'on'">{{ iocLib.exists === false ? '未找到' : '已加载' }}</span>
+              <span :class="iocLib?.exists === false ? 'off' : 'on'">{{ iocLib?.exists === false ? '未找到' : '已加载' }}</span>
             </div>
           </div>
-          <p class="hint" v-if="iocLib.hint">{{ iocLib.hint }}</p>
-        </div>
-        <div class="panel pad">
-          <h3 style="margin:0 0 10px">本地自定义 IOC</h3>
-          <div class="hunt-bar">
-            <select v-model="iocType" class="search sev-filter">
-              <option value="hash">hash</option>
-              <option value="domain">domain</option>
-              <option value="ip">ip</option>
-              <option value="path">path</option>
-              <option value="process">process</option>
-              <option value="cmdline">cmdline</option>
-            </select>
-            <button type="button" class="btn primary" @click="doImportIoc">批量导入</button>
+          <p class="hint" v-if="iocLib?.hint">{{ iocLib.hint }}</p>
+          <div v-if="iocLib?.by_type && Object.keys(iocLib.by_type).length" class="ioc-type-chips">
+            <button
+              v-for="(n, t) in iocLib.by_type"
+              :key="t"
+              type="button"
+              class="ioc-type-chip"
+              :class="{ on: iocLibPreviewType === t }"
+              @click="iocLibPreviewType = (iocLibPreviewType === t ? '' : t); loadIocLibPreview(true)"
+            >{{ t || '未知' }} <em>{{ fmtNum(n) }}</em></button>
           </div>
-          <textarea v-model="iocText" class="field" rows="5" placeholder="每行一个 IOC；也可 type:value，如 domain:evil.com" />
-          <table v-if="iocItems.length" style="margin-top:14px">
-            <thead><tr><th>类型</th><th>值</th><th>级别</th><th>命中</th><th>备注</th><th></th></tr></thead>
-            <tbody>
-              <tr v-for="x in iocItems" :key="x.id">
-                <td>{{ x.ioc_type }}</td>
-                <td class="mono">{{ x.value }}</td>
-                <td><span class="sev" :data-s="x.severity">{{ sevLabel(x.severity) }}</span></td>
-                <td>{{ x.hits || 0 }}</td>
-                <td>{{ x.note || '—' }}</td>
-                <td><button type="button" class="btn-text" style="color:var(--danger)" @click="delIoc(x.id)">删除</button></td>
-              </tr>
-            </tbody>
-          </table>
-          <p v-else class="empty sm">暂无本地 IOC（情报库仍会自动匹配时间线哈希/IP）</p>
+        </div>
+
+        <div class="intel-split">
+          <div class="panel pad">
+            <div class="panel-hd bare" style="margin-bottom:10px">
+              <h3 style="margin:0">情报库样例</h3>
+              <div class="hunt-bar" style="margin:0">
+                <select v-model="iocLibPreviewType" class="search sev-filter" @change="loadIocLibPreview(true)">
+                  <option value="">全部类型</option>
+                  <option value="file_hash">file_hash</option>
+                  <option value="ip">ip</option>
+                  <option value="domain">domain</option>
+                  <option value="url">url</option>
+                </select>
+                <button type="button" class="btn sm" :disabled="iocLibPreviewBusy || iocLibPreviewOffset <= 0" @click="iocLibPreviewOffset = Math.max(0, iocLibPreviewOffset - 40); loadIocLibPreview()">上一页</button>
+                <button type="button" class="btn sm" :disabled="iocLibPreviewBusy || (iocLibPreviewOffset + 40) >= Math.min(iocLibPreviewTotal, 100)" @click="iocLibPreviewOffset = Math.min(60, iocLibPreviewOffset + 40); loadIocLibPreview()">下一页</button>
+              </div>
+            </div>
+            <p class="muted sm" style="margin:0 0 8px">可读窗口前 {{ Math.min(iocLibPreviewTotal, 100) }} 条（库内约 {{ fmtNum(iocLibPreviewDbTotal) }}）· 偏移 {{ iocLibPreviewOffset }} · 禁止整库导出</p>
+            <div class="table-scroll" style="max-height:360px">
+              <table v-if="iocLibPreviewRows.length">
+                <thead><tr><th>类型</th><th>值</th><th>家族/标签</th><th>来源</th></tr></thead>
+                <tbody>
+                  <tr v-for="row in iocLibPreviewRows" :key="row.id">
+                    <td>{{ row.type || '—' }}</td>
+                    <td class="mono">{{ row.value }}</td>
+                    <td>{{ row.malware || '—' }}</td>
+                    <td class="muted">{{ row.source || '—' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-else class="empty sm">{{ iocLibPreviewBusy ? '加载中…' : '暂无样例（检查 ioc_data.db 是否就绪）' }}</p>
+            </div>
+          </div>
+
+          <div class="panel pad">
+            <h3 style="margin:0 0 10px">情报库试查</h3>
+            <p class="hint" style="margin:0 0 10px">输入完整 Hash / IP / 域名做精确匹配，确认库内是否已收录。</p>
+            <div class="hunt-bar">
+              <select v-model="iocLookupType" class="search sev-filter">
+                <option value="">自动</option>
+                <option value="hash">hash</option>
+                <option value="ip">ip</option>
+                <option value="domain">domain</option>
+              </select>
+              <input v-model="iocLookupQ" class="search grow" placeholder="完整值…" @keyup.enter="doIocLookup" />
+              <button type="button" class="btn primary" :disabled="iocLookupBusy" @click="doIocLookup">{{ iocLookupBusy ? '查询中…' : '试查' }}</button>
+            </div>
+            <table v-if="iocLookupHits.length" style="margin-top:12px">
+              <thead><tr><th>类型</th><th>值</th><th>家族</th><th>来源</th></tr></thead>
+              <tbody>
+                <tr v-for="(h, i) in iocLookupHits" :key="i">
+                  <td>{{ h.type || '—' }}</td>
+                  <td class="mono">{{ h.value }}</td>
+                  <td>{{ h.malware || '—' }}</td>
+                  <td class="muted">{{ h.source || '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel pad fill-rest ioc-local-panel">
+          <h3 style="margin:0 0 6px">本地自定义 IOC</h3>
+          <p class="hint" style="margin:0 0 14px">
+            填「匹配值」即可：进程名 / Hash / IP / 域名会<strong>自动识别类型</strong>，命中时间线后出告警。
+            「显示名称」只给人看，不参与匹配。
+          </p>
+
+          <div v-if="isAdmin" class="ioc-add-form">
+            <label class="ioc-field grow">
+              <span>匹配值 <em>必填 · 实际拿来比对的内容</em></span>
+              <input
+                v-model="iocForm.value"
+                class="field"
+                placeholder="例：evil.exe  /  1.2.3.4  /  bad.com  /  md5或sha256"
+                @input="onIocValueInput"
+                @keyup.enter="doAddIoc"
+              />
+            </label>
+            <label class="ioc-field">
+              <span>类型 <em>{{ iocDetectHint }}</em></span>
+              <select v-model="iocForm.type" class="field">
+                <option value="auto">自动识别</option>
+                <option value="process">进程名</option>
+                <option value="hash">文件哈希</option>
+                <option value="ip">IP</option>
+                <option value="domain">域名</option>
+                <option value="path">路径 / URL</option>
+                <option value="cmdline">命令行</option>
+              </select>
+            </label>
+            <label class="ioc-field">
+              <span>显示名称 <em>可选</em></span>
+              <input v-model="iocForm.name" class="field" placeholder="如：木马投放器、家族名…" @keyup.enter="doAddIoc" />
+            </label>
+            <label class="ioc-field">
+              <span>级别</span>
+              <select v-model="iocForm.severity" class="field">
+                <option value="critical">危急</option>
+                <option value="high">高</option>
+                <option value="medium">中</option>
+                <option value="low">低</option>
+              </select>
+            </label>
+            <div class="ioc-add-acts">
+              <button type="button" class="btn primary" :disabled="!iocForm.value.trim() || iocAddBusy" @click="doAddIoc">
+                {{ iocAddBusy ? '添加中…' : '添加 IOC' }}
+              </button>
+            </div>
+            <p v-if="iocForm.value.trim()" class="ioc-preview">
+              将按 <b>{{ iocTypeLabel(iocResolvedType) }}</b> 匹配
+              <code>{{ iocPreviewValue }}</code>
+              <template v-if="iocForm.name.trim()"> · 名称 {{ iocForm.name.trim() }}</template>
+            </p>
+          </div>
+          <p v-else class="hint">仅管理员可维护本地 IOC；只读/分析员可浏览情报库与试查。</p>
+
+          <details v-if="isAdmin" class="ioc-batch">
+            <summary>批量导入（高级）</summary>
+            <p class="hint">每行一个；可不写类型（自动识别）。也可 <code>process:evil.exe</code> 或库格式 <code>type,value,source,malware</code>。</p>
+            <div class="hunt-bar">
+              <select v-model="iocType" class="search sev-filter">
+                <option value="auto">行内自动识别</option>
+                <option value="process">默认进程名</option>
+                <option value="hash">默认哈希</option>
+                <option value="domain">默认域名</option>
+                <option value="ip">默认 IP</option>
+                <option value="path">默认路径</option>
+                <option value="cmdline">默认命令行</option>
+              </select>
+              <button type="button" class="btn sm" :disabled="!iocLibPreviewRows.length" @click="fillIocFormatFromLib">填入库样例</button>
+              <button type="button" class="btn" @click="doImportIoc">批量导入</button>
+            </div>
+            <textarea v-model="iocText" class="field" rows="4" placeholder="evil.exe&#10;process:bad.bat&#10;1.2.3.4&#10;file_hash,495c65…,MalwareBazaar,elf" />
+          </details>
+
+          <div class="fill-rest-body">
+            <table v-if="iocItems.length">
+              <thead><tr><th>类型</th><th>匹配值</th><th>名称 / 备注</th><th>级别</th><th>命中</th><th v-if="isAdmin"></th></tr></thead>
+              <tbody>
+                <tr v-for="x in iocItems" :key="x.id">
+                  <td>{{ iocTypeLabel(x.ioc_type) }}</td>
+                  <td class="mono">{{ x.value }}</td>
+                  <td>{{ x.note || '—' }}</td>
+                  <td><span class="sev" :data-s="x.severity">{{ sevLabel(x.severity) }}</span></td>
+                  <td>{{ x.hits || 0 }}</td>
+                  <td v-if="isAdmin"><button type="button" class="btn-text" style="color:var(--danger)" @click="delIoc(x.id)">删除</button></td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-else class="empty sm ioc-empty">暂无本地 IOC。添加进程名/Hash/IP 后，时间线上出现相同内容即告警。</p>
+          </div>
         </div>
       </section>
 
       <!-- ========== 灰度升级 ========== -->
-      <section v-else-if="page === 'upgrade'" class="page">
-        <header class="page-hd">
-          <div>
-            <h1>灰度升级</h1>
-            <p class="desc">上传 Agent 二进制 → 选择终端推送 upgrade 指令（校验 sha256 后替换）</p>
-          </div>
+      <section v-else-if="page === 'upgrade'" class="page page-stack upgrade-page">
+        <ConsolePageHeader title="灰度升级" description="上传 Agent 二进制 → 选择终端推送 upgrade 指令（校验 sha256 后替换）">
           <button type="button" class="btn" @click="loadUpgradePage">刷新</button>
-        </header>
+        </ConsolePageHeader>
         <div class="deploy-grid">
           <article class="panel pad">
             <h3>上传升级包</h3>
@@ -4951,14 +3764,14 @@
             </div>
             <div class="up-hosts">
               <label v-for="a in agents" :key="a.agent_id" class="chk">
-                <input type="checkbox" :value="a.agent_id" v-model="upAgentIds" />
+                <input type="checkbox" :value="a.agent_id" v-model="upAgentIds" :disabled="String(a.os_family || '').toLowerCase() === 'linux'" />
                 {{ a.hostname || short(a.agent_id) }}
-                <em class="muted">{{ a.version || '?' }} {{ a.online ? '在线' : '离线' }}</em>
+                <em class="muted">{{ a.version || '?' }} {{ a.online ? '在线' : '离线' }}<template v-if="String(a.os_family || '').toLowerCase() === 'linux'"> · 暂不支持远程升级</template></em>
               </label>
             </div>
             <div class="row" style="margin-top:12px">
-              <button type="button" class="btn" @click="upAgentIds = agents.map(a => a.agent_id)">全选</button>
-              <button type="button" class="btn" @click="upAgentIds = agents.filter(a => a.online).map(a => a.agent_id)">仅在线</button>
+              <button type="button" class="btn" @click="upAgentIds = agents.filter(a => String(a.os_family || '').toLowerCase() !== 'linux').map(a => a.agent_id)">全选可升级终端</button>
+              <button type="button" class="btn" @click="upAgentIds = agents.filter(a => a.online && String(a.os_family || '').toLowerCase() !== 'linux').map(a => a.agent_id)">仅在线</button>
               <button type="button" class="btn primary" :disabled="upPushBusy || !upPkgId || !upAgentIds.length" @click="doPushUpgrade">
                 {{ upPushBusy ? '推送中…' : `灰度推送 (${upAgentIds.length})` }}
               </button>
@@ -5062,18 +3875,12 @@
 
       <!-- ========== 行为序列 ========== -->
       <section v-else-if="page === 'seq'" class="page seq-page">
-        <header class="page-hd">
-          <div>
-            <h1>行为序列规则</h1>
-            <p class="desc">
-              在主机时间线的时间窗口内，按顺序命中多步行为（如「Word 创建 → PowerShell 出现」），用于发现单条特征看不出的攻击链。
-            </p>
-          </div>
+        <ConsolePageHeader title="行为序列规则" description="在主机时间线的时间窗口内，按顺序命中多步行为（如「Word 创建 → PowerShell 出现」），用于发现单条特征看不出的攻击链。">
           <div class="hd-right">
             <button type="button" class="btn" @click="loadSeqRules">刷新</button>
             <button type="button" class="btn primary" @click="startCreateSeq">新增序列</button>
           </div>
-        </header>
+        </ConsolePageHeader>
 
         <div class="seq-explain panel pad">
           <b>什么是行为序列？</b>
@@ -5221,69 +4028,32 @@
       </section>
 
       <!-- ========== 终端分组 ========== -->
-      <section v-else-if="page === 'groups'" class="page">
-        <header class="page-hd">
-          <div>
-            <h1>终端分组</h1>
-            <p class="desc">按业务分组管理终端（财务 / 研发等）</p>
-          </div>
-        </header>
-        <div class="panel pad">
+      <GroupPage v-else-if="page === 'groups'" :items="groupItems">
+        <template #form>
           <div class="hunt-bar">
             <input v-model="groupName" class="search" placeholder="分组名" />
             <input v-model="groupIds" class="search grow" placeholder="agent_id，逗号分隔" />
             <button type="button" class="btn primary" @click="saveGroup">保存分组</button>
           </div>
-          <div class="host-cards padded" v-if="groupItems.length">
-            <div v-for="g in groupItems" :key="g.id" class="host-card rich tile">
-              <div class="hc-top"><b>{{ g.name }}</b><span class="pill">{{ (g.agent_ids||[]).length }} 台</span></div>
-              <div class="hc-meta"><span>{{ (g.agent_ids||[]).join(', ') || '—' }}</span></div>
-              <small class="muted">{{ g.note || '' }}</small>
-            </div>
-          </div>
-          <p v-else class="empty sm">暂无分组</p>
-        </div>
-      </section>
+        </template>
+      </GroupPage>
 
       <!-- ========== 处置审计 ========== -->
-      <section v-else-if="page === 'audit'" class="page">
-        <header class="page-hd">
-          <div>
-            <h1>处置审计</h1>
-            <p class="desc">谁在何时对哪台终端下发了什么动作</p>
-          </div>
+      <AuditPage v-else-if="page === 'audit'" :items="auditItems" :fmt-time="fmtTime" :short="short">
+        <template #refresh>
           <button type="button" class="btn" @click="loadAudit">刷新</button>
-        </header>
-        <div class="panel pad">
-          <table v-if="auditItems.length">
-            <thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>终端</th><th>详情</th></tr></thead>
-            <tbody>
-              <tr v-for="a in auditItems" :key="a.id">
-                <td>{{ fmtTime(a.created_at) }}</td>
-                <td>{{ a.actor || '—' }}</td>
-                <td>{{ a.action }}</td>
-                <td>{{ short(a.agent_id) }}</td>
-                <td class="muted" :title="a.detail">{{ (a.detail || '').slice(0, 100) }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <p v-else class="empty">暂无审计记录</p>
-        </div>
-      </section>
+        </template>
+      </AuditPage>
 
       <!-- ========== 配置 ========== -->
-      <section v-else-if="page === 'settings'" class="page settings-page">
-        <header class="page-hd">
-          <div>
-            <h1>接入与地址</h1>
-            <p class="desc">终端回连地址 · 接入密钥 · 实时规则启停</p>
-          </div>
+      <section v-else-if="page === 'settings'" class="page page-stack settings-page">
+        <ConsolePageHeader title="平台配置" description="接入地址 · 大模型（本地/在线）· 实时规则启停">
           <div class="hd-right">
             <button type="button" class="btn sm" @click="goMenu('deploy')">部署下载</button>
             <button type="button" class="btn sm" @click="goMenu('upgrade')">灰度升级</button>
             <button type="button" class="btn sm" @click="setSection('rules')">规则管理</button>
           </div>
-        </header>
+        </ConsolePageHeader>
 
         <div class="settings-stack">
           <div class="panel pad settings-addr">
@@ -5297,17 +4067,145 @@
                 <button type="button" class="btn" @click="rotateKey">轮换接入密钥</button>
               </div>
             </div>
-            <p class="hint">填终端能访问到的 EDR 后台地址（勿用 127.0.0.1）。留空则按当前浏览器地址生成安装包。轮换密钥后需重新下载安装包。</p>
+            <p class="hint">填终端能访问到的 EDR 后台地址（勿用 127.0.0.1）。未明确配置时禁止生成安装包。轮换密钥后需重新下载安装包。</p>
           </div>
 
-          <div v-if="isAdmin" class="panel pad">
-            <h3 style="margin:0 0 8px;font-size:15px">运维</h3>
+          <div class="panel pad settings-ai-panel">
+            <div class="settings-ai-hd">
+              <div>
+                <h3 style="margin:0 0 4px;font-size:15px">模型配置</h3>
+                <p class="hint sm" style="margin:0">可保存多套本地/在线模型，切换「使用」；保存后可「测试连接」确认可用性。</p>
+              </div>
+              <span class="pill" :class="aiModelForm.has_key || aiStatusInfo.configured ? 'ok' : 'warn'">
+                {{ aiProfiles.length ? `${aiProfiles.length} 套` : (aiModelForm.has_key || aiStatusInfo.configured ? '已配置' : '未配置') }}
+              </span>
+            </div>
+
+            <div v-if="aiProfiles.length" class="settings-ai-profiles">
+              <button
+                v-for="p in aiProfiles"
+                :key="p.id"
+                type="button"
+                class="settings-ai-profile"
+                :class="{ on: p.id === aiModelForm.id, active: p.active }"
+                @click="selectAiProfile(p)"
+              >
+                <b>{{ p.name || p.model || '未命名' }}</b>
+                <small class="mono">{{ p.provider_mode === 'local' ? '本地' : '在线' }} · {{ p.model || '—' }}</small>
+                <em v-if="p.active" class="pill ok sm">使用中</em>
+              </button>
+              <button
+                v-if="isAdmin"
+                type="button"
+                class="settings-ai-profile add"
+                @click="startNewAiProfile"
+              >+ 新增模型</button>
+            </div>
+
+            <div class="settings-ai-modes">
+              <button
+                type="button"
+                class="chip-btn"
+                :class="{ on: aiModelForm.provider_mode === 'local' }"
+                :disabled="!isAdmin"
+                @click="applyAiModelPreset('local')"
+              >本地模型</button>
+              <button
+                type="button"
+                class="chip-btn"
+                :class="{ on: aiModelForm.provider_mode === 'online' }"
+                :disabled="!isAdmin"
+                @click="applyAiModelPreset('online')"
+              >在线模型</button>
+              <button
+                v-for="p in AI_ONLINE_PRESETS"
+                :key="p.id"
+                type="button"
+                class="chip-btn ghost"
+                :disabled="!isAdmin || aiModelForm.provider_mode !== 'online'"
+                @click="applyAiOnlineVendor(p)"
+              >{{ p.label }}</button>
+            </div>
+            <div class="settings-ai-grid">
+              <label>
+                <span>显示名称</span>
+                <input
+                  v-model="aiModelForm.name"
+                  class="field"
+                  :disabled="!isAdmin"
+                  :placeholder="aiModelForm.provider_mode === 'local' ? '如：内网 Qwen' : '如：DeepSeek 生产'"
+                />
+              </label>
+              <label>
+                <span>超时（秒）</span>
+                <input v-model.number="aiModelForm.timeout" class="field" type="number" min="30" max="600" :disabled="!isAdmin" />
+              </label>
+              <label>
+                <span>Base URL</span>
+                <input
+                  v-model="aiModelForm.base_url"
+                  class="field mono"
+                  :disabled="!isAdmin"
+                  :placeholder="aiModelForm.provider_mode === 'local' ? 'http://192.168.x.x:8085/v1' : 'https://api.openai.com/v1'"
+                />
+              </label>
+              <label>
+                <span>模型名</span>
+                <input
+                  v-model="aiModelForm.model"
+                  class="field mono"
+                  :disabled="!isAdmin"
+                  :placeholder="aiModelForm.provider_mode === 'local' ? 'qwen3… / llama…' : 'gpt-4o-mini / deepseek-chat'"
+                />
+              </label>
+              <label class="span-2">
+                <span>API Key {{ aiModelForm.has_key ? `（当前 ${aiModelForm.api_key_masked || '已保存'}）` : '' }}</span>
+                <input
+                  v-model="aiModelForm.api_key"
+                  class="field mono"
+                  type="password"
+                  autocomplete="new-password"
+                  :disabled="!isAdmin"
+                  :placeholder="aiModelForm.has_key ? '留空则保持原密钥' : (aiModelForm.provider_mode === 'local' ? '本地网关可随意填写' : 'sk-…')"
+                />
+              </label>
+            </div>
+            <div v-if="isAdmin" class="settings-ai-acts">
+              <button type="button" class="btn primary" :disabled="aiModelSaving || aiModelTesting" @click="saveAiModelConfig">
+                {{ aiModelSaving ? '保存中…' : (aiModelForm.is_new ? '新增并启用' : '保存') }}
+              </button>
+              <button
+                v-if="aiModelForm.id && !aiModelForm.is_new && !aiModelForm.active"
+                type="button"
+                class="btn sm"
+                :disabled="aiModelSaving || aiModelTesting"
+                @click="activateAiModelProfile(aiModelForm.id)"
+              >设为使用</button>
+              <button type="button" class="btn sm" :disabled="aiModelSaving || aiModelTesting" @click="testAiModelConfig">
+                {{ aiModelTesting ? '测试中…' : '测试连接' }}
+              </button>
+              <button
+                v-if="aiModelForm.id && !aiModelForm.is_new && aiProfiles.length > 1"
+                type="button"
+                class="btn sm danger-ghost"
+                :disabled="aiModelSaving || aiModelTesting"
+                @click="deleteAiModelProfile(aiModelForm.id)"
+              >删除</button>
+              <button type="button" class="btn sm" :disabled="aiModelSaving || aiModelTesting" @click="loadAiModelConfig">刷新</button>
+              <span v-if="aiModelTestMsg" class="muted sm" :class="{ ok: aiModelTestOk, err: aiModelTestOk === false }">{{ aiModelTestMsg }}</span>
+              <span v-else class="muted sm">密钥加密存储；测试会向模型发一条极短请求。</span>
+            </div>
+            <p v-else class="hint sm">仅管理员可修改模型配置。</p>
+          </div>
+
+          <details v-if="isAdmin" class="panel pad ui-fold settings-fold">
+            <summary class="ui-fold-sum"><span class="fold-caret" aria-hidden="true" /><span>运维</span><em class="ui-fold-note">高级</em></summary>
             <label class="chk">
               <input type="checkbox" :checked="autoEnrichOnLoad" @change="setAutoEnrichOnLoad($event.target.checked)" />
               刷新威胁列表时自动 enrich 详情（最多 120 条，仅管理员）
             </label>
             <p class="hint sm">补全历史告警命令行/PTM 链；大库时可能增加 SQLite 写入，按需开启。</p>
-          </div>
+          </details>
 
           <div class="panel settings-rules-panel">
             <div class="panel-hd">
@@ -5322,7 +4220,8 @@
               <div class="chip-row">
                 <button type="button" class="chip-btn" :class="{ on: settingsRulesFilter === 'all' }" @click="settingsRulesFilter = 'all'">全部</button>
                 <button type="button" class="chip-btn" :class="{ on: settingsRulesFilter === 'sensor' }" @click="settingsRulesFilter = 'sensor'">内置传感器</button>
-                <button type="button" class="chip-btn" :class="{ on: settingsRulesFilter === 'custom' }" @click="settingsRulesFilter = 'custom'">快照规则</button>
+                <button type="button" class="chip-btn" :class="{ on: settingsRulesFilter === 'windows' }" @click="settingsRulesFilter = 'windows'">Windows 规则</button>
+                <button type="button" class="chip-btn" :class="{ on: settingsRulesFilter === 'linux' }" @click="settingsRulesFilter = 'linux'">Linux 规则</button>
                 <button type="button" class="chip-btn" @click="loadSettings(); loadRules()">刷新</button>
               </div>
             </div>
@@ -5352,7 +4251,7 @@
                     </td>
                     <td>
                       <span class="pill" :class="{ on: r.builtin || r.source === 'sensor' }">
-                        {{ (r.builtin || r.source === 'sensor') ? '内置传感器' : '快照规则' }}
+                        {{ (r.builtin || r.source === 'sensor') ? '内置传感器' : (isLinuxRule(r) ? 'Linux 规则' : 'Windows 规则') }}
                       </span>
                     </td>
                     <td><span class="sev" :data-s="r.severity">{{ sevLabel(r.severity) }}</span></td>
@@ -5377,72 +4276,30 @@
       </section>
 
       <!-- ========== 账号管理 ========== -->
-      <section v-else-if="page === 'accounts'" class="page">
-        <header class="page-hd">
-          <div>
-            <h1>账号管理</h1>
-            <p class="desc">EDR 后台独立账号，与分析平台账号互不相通</p>
-          </div>
+      <AccountsPage v-else-if="page === 'accounts'" :items="edrUsers" :self-id="user?.id" :fmt-epoch="fmtEpoch">
+        <template #header-actions>
           <div class="hd-right">
             <button type="button" class="btn primary" @click="openUserForm()">新建账号</button>
           </div>
-        </header>
-        <div class="panel pad">
-          <div v-if="edrUsers.length" class="table-scroll">
-          <table class="acct-table">
-            <thead>
-              <tr><th>账号</th><th>角色</th><th>状态</th><th>最近登录</th><th>操作</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="u in edrUsers" :key="u.id">
-                <td>
-                  <div class="acct-name">
-                    <span class="ru-avatar sm">{{ (u.display_name || u.username || '?').slice(0, 1).toUpperCase() }}</span>
-                    <div>
-                      <strong>{{ u.display_name || u.username }}</strong>
-                      <small>{{ u.username }}<i v-if="u.id === user?.id" class="acct-me">我</i></small>
-                    </div>
-                  </div>
-                </td>
-                <td>
+        </template>
+        <template #role="{ account: u }">
                   <select class="field sm" :value="u.role" :disabled="u.id === user?.id" @change="changeUserRole(u, $event.target.value)">
                     <option v-for="(lb, k) in roleLabels" :key="k" :value="k">{{ lb }}</option>
                   </select>
-                </td>
-                <td>
-                  <span class="pill" :class="{ on: u.enabled }">{{ u.enabled ? '启用' : '已禁用' }}</span>
-                  <span v-if="u.must_change" class="pill warn">待改密</span>
-                </td>
-                <td class="muted">
-                  {{ u.last_login_at ? fmtEpoch(u.last_login_at) : '从未登录' }}
-                  <small v-if="u.last_login_ip" class="acct-ip">{{ u.last_login_ip }}</small>
-                </td>
-                <td class="ops">
+        </template>
+        <template #actions="{ account: u }">
                   <template v-if="u.id !== user?.id">
                     <button type="button" class="btn-text" @click="toggleUserEnabled(u)">{{ u.enabled ? '禁用' : '启用' }}</button>
                     <button type="button" class="btn-text" @click="openResetPw(u)">重置密码</button>
                     <button type="button" class="btn-text" style="color:var(--danger)" @click="removeUser(u)">删除</button>
                   </template>
                   <button v-else type="button" class="btn-text" @click="openPwDialog">修改密码</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-          </div>
-          <p v-else class="empty">暂无账号</p>
-          <p class="hint">角色说明：管理员可处置终端、改规则与配置、管理账号；分析员与只读账号仅可查看。</p>
-        </div>
-      </section>
+        </template>
+      </AccountsPage>
 
       <!-- ========== 通知渠道 ========== -->
-      <section v-else-if="page === 'notify'" class="page">
-        <header class="page-hd">
-          <div>
-            <h1>通知渠道</h1>
-            <p class="desc">新威胁事件达到级别阈值时推送（同主机同标题 10 分钟内只推一次）</p>
-          </div>
-        </header>
-        <div class="panel pad settings">
+      <NotificationPage v-else-if="page === 'notify'" :result="notifyTestResult">
+        <template #form>
           <label class="chk"><input type="checkbox" v-model="notifyForm.enabled" /> 启用通知</label>
           <label>
             <span>最低级别</span>
@@ -5472,205 +4329,190 @@
             <button type="button" class="btn primary" :disabled="saving" @click="saveNotify">保存</button>
             <button type="button" class="btn" @click="doTestNotify">发送测试消息</button>
           </div>
-          <div v-if="notifyTestResult" class="notify-results">
-            <p v-if="notifyTestResult.error" class="err-text">{{ notifyTestResult.error }}</p>
-            <p v-for="r in notifyTestResult.results || []" :key="r.channel" :class="r.ok ? 'hint' : 'err-text'">
-              {{ ({ webhook: 'Webhook', feishu: '飞书', dingtalk: '钉钉' })[r.channel] || r.channel }}：
-              {{ r.ok ? `成功（HTTP ${r.status}）` : `失败：${r.error}` }}
-            </p>
-          </div>
-        </div>
-      </section>
+        </template>
+      </NotificationPage>
 
       <!-- ========== 存储与保留 ========== -->
-      <section v-else-if="page === 'storage'" class="page">
-        <header class="page-hd">
-          <div>
-            <h1>存储与保留</h1>
-            <p class="desc">SQLite 存近期热数据；MySQL 双写保留 4 倍时长作历史检索层；保留期在「EDR 策略」中设置</p>
-          </div>
+      <StoragePage v-else-if="page === 'storage'" :info="storeInfo" :hits="storeHits" :fmt-num="fmtNum" :fmt-time="fmtTime" :short="short">
+        <template #refresh>
           <button type="button" class="btn" @click="loadStorage">刷新</button>
-        </header>
-        <div class="host-summary" v-if="storeInfo">
-          <div class="hs"><span>SQLite 时间线</span><b>{{ fmtNum(storeInfo.sqlite_timeline) }}</b></div>
-          <div class="hs"><span>SQLite 事件</span><b>{{ fmtNum(storeInfo.sqlite_events) }}</b></div>
-          <div class="hs on"><span>MySQL 时间线</span><b>{{ storeInfo.mysql?.available ? fmtNum(storeInfo.mysql.timeline) : '不可用' }}</b></div>
-          <div class="hs on"><span>MySQL 事件</span><b>{{ storeInfo.mysql?.available ? fmtNum(storeInfo.mysql.events) : '不可用' }}</b></div>
-        </div>
-        <div class="panel pad" v-if="storeInfo">
-          <p>
-            时间线保留 <b>{{ storeInfo.retention?.timeline_days }}</b> 天 ·
-            已关闭事件保留 <b>{{ storeInfo.retention?.events_days }}</b> 天 ·
-            MySQL 双写 <b>{{ storeInfo.retention?.mysql_dual_write ? '开' : '关' }}</b>
-          </p>
-          <p class="hint">后台每小时自动清理一次；未关闭的威胁事件永不清理。</p>
+        </template>
+        <template #retention-actions>
           <button type="button" class="btn danger-outline" @click="doPurge">立即按保留期清理</button>
-        </div>
-        <div class="panel pad" style="margin-top:14px">
-          <h3>历史时间线检索（MySQL）</h3>
+        </template>
+        <template #search>
           <div class="hunt-bar">
             <input v-model="storeQ" class="search grow" placeholder="关键字：进程名 / IP / 路径…" @keyup.enter="doStoreSearch" />
             <button type="button" class="btn primary" @click="doStoreSearch">检索</button>
           </div>
-          <table v-if="storeHits.length" style="margin-top:12px">
-            <thead><tr><th>时间</th><th>主机</th><th>类型</th><th>摘要</th></tr></thead>
-            <tbody>
-              <tr v-for="(h, i) in storeHits" :key="i">
-                <td>{{ fmtTime(h.ts) }}</td>
-                <td>{{ h.hostname || short(h.agent_id) }}</td>
-                <td class="mono">{{ h.etype }}</td>
-                <td>{{ h.summary }}</td>
-              </tr>
-            </tbody>
-          </table>
+        </template>
+      </StoragePage>
+
+      <!-- ========== EDR 策略 ========== -->
+      <section v-else-if="page === 'policy'" class="page page-stack policy-page">
+        <ConsolePageHeader title="EDR 策略" :description="`热更新采集周期、处置开关、时间线；白名单降低误报（rev ${policyRev}）`">
+          <button type="button" class="btn primary" :disabled="saving" @click="savePolicy">保存策略</button>
+        </ConsolePageHeader>
+        <div class="policy-stack">
+          <details class="panel pad settings ui-fold policy-fold" open>
+            <summary class="ui-fold-sum"><span class="fold-caret" aria-hidden="true" /><span>响应与防护</span><em class="ui-fold-note">处置开关 · 自保护 · FIM</em></summary>
+            <div class="policy-fold-body">
+              <label class="chk"><input type="checkbox" v-model="policyForm.response_enabled" /> 允许远程处置（威胁页：隔离/杀进程/隔离文件）</label>
+              <label class="chk"><input type="checkbox" v-model="policyForm.self_protect" /> 自保护（忽略普通 net stop + 收紧状态目录）</label>
+              <label class="chk"><input type="checkbox" v-model="policyForm.fim_enabled" /> 文件完整性监控（hosts / 计划任务 / 启动目录 / System32 / 驱动 / 公共目录）</label>
+              <label v-if="policyForm.fim_enabled">
+                <span>FIM 自定义目录（每行一个，末尾加 <code>|r</code> 表示递归）</span>
+                <textarea v-model="policyForm.fim_paths_text" class="field" rows="3" placeholder="D:\app\bin&#10;D:\web\wwwroot|r" />
+              </label>
+            </div>
+          </details>
+
+          <details class="panel pad settings ui-fold policy-fold">
+            <summary class="ui-fold-sum"><span class="fold-caret" aria-hidden="true" /><span>时间线与传感器</span><em class="ui-fold-note">进程 / 文件 / 网络 · Winlog · 日志 tail</em></summary>
+            <div class="policy-fold-body">
+              <label class="chk"><input type="checkbox" v-model="policyForm.timeline_process" /> 上报进程时间线</label>
+              <label class="chk"><input type="checkbox" v-model="policyForm.timeline_file" /> 上报文件时间线</label>
+              <label class="chk"><input type="checkbox" v-model="policyForm.timeline_network" /> 上报网络外联时间线</label>
+              <label>
+                <span>定向日志 tail（<code>log_tail_paths</code>）</span>
+                <textarea v-model="policyForm.log_tail_paths_text" class="field mono" rows="2" placeholder="C:\ProgramData\YourApp\app.log" />
+                <p class="hint sm">每行一个<strong>文件</strong>绝对路径，最多 20 条；写入时间线 <code>log_tail_line</code>。</p>
+              </label>
+              <label>
+                <span>Winlog 通道模式</span>
+                <select v-model="policyForm.winevent_channel_mode" class="field">
+                  <option value="all">全部通道</option>
+                  <option value="critical">critical 默认集</option>
+                  <option value="high_sens">高敏（critical + BITS/AppLocker/…）</option>
+                  <option value="custom">自定义列表</option>
+                </select>
+              </label>
+              <label v-if="policyForm.winevent_channel_mode === 'custom' || policyForm.winevent_channel_mode === 'critical' || policyForm.winevent_channel_mode === 'high_sens'">
+                <span>Winlog 通道 ID（每行一个；critical/high_sens 下为追加）</span>
+                <textarea v-model="policyForm.winevent_channels_text" class="field mono" rows="2" placeholder="firewall&#10;bits&#10;applocker" />
+              </label>
+            </div>
+          </details>
+
+          <details class="panel pad settings ui-fold policy-fold">
+            <summary class="ui-fold-sum"><span class="fold-caret" aria-hidden="true" /><span>周期与保留</span><em class="ui-fold-note">心跳 · 采集间隔 · 留存 · MySQL</em></summary>
+            <div class="policy-fold-body policy-grid-2">
+              <label>
+                <span>心跳间隔（秒）</span>
+                <input v-model.number="policyForm.heartbeat_sec" type="number" min="3" max="120" class="field" />
+              </label>
+              <label>
+                <span>进程采集周期（秒）</span>
+                <input v-model.number="policyForm.intervals_sec.process" type="number" min="3" max="300" class="field" />
+              </label>
+              <label>
+                <span>网络采集周期（秒）</span>
+                <input v-model.number="policyForm.intervals_sec.network" type="number" min="3" max="300" class="field" />
+              </label>
+              <label>
+                <span>文件采集周期（秒）</span>
+                <input v-model.number="policyForm.intervals_sec.file" type="number" min="5" max="600" class="field" />
+              </label>
+              <label>
+                <span>时间线保留（天）</span>
+                <input v-model.number="policyForm.timeline_retain_days" type="number" min="1" max="365" class="field" />
+              </label>
+              <label>
+                <span>已关闭事件保留（天）</span>
+                <input v-model.number="policyForm.events_retain_days" type="number" min="7" max="730" class="field" />
+              </label>
+              <label class="chk policy-span-2"><input type="checkbox" v-model="policyForm.mysql_dual_write" /> MySQL 双写（历史检索层）</label>
+            </div>
+          </details>
+
+          <details class="panel pad settings ui-fold policy-fold">
+            <summary class="ui-fold-sum"><span class="fold-caret" aria-hidden="true" /><span>告警加白</span><em class="ui-fold-note">{{ whitelist.length }} 条</em></summary>
+            <div class="policy-fold-body">
+              <p class="muted" style="margin:0 0 10px;font-size:12px">
+                命中的告警不再产生。值支持 * 通配；路径、注册表键以 \ 结尾表示整个目录 / 子键。也可在威胁事件里点「加白」。
+              </p>
+              <div class="hunt-bar">
+                <select v-model="wlKind" class="search sev-filter">
+                  <option v-for="(lb, k) in ALLOW_KIND_LABELS" :key="k" :value="k">{{ lb }}</option>
+                </select>
+                <input v-model="wlValue" class="search grow" placeholder="匹配值，如 C:\Tools\*.exe" />
+                <input v-model="wlRule" class="search" style="max-width:200px" placeholder="限定告警标题（可选，支持 *）" />
+                <input v-model="wlNote" class="search" style="max-width:160px" placeholder="备注" />
+                <button type="button" class="btn" @click="addWl">添加</button>
+              </div>
+              <table v-if="whitelist.length" style="margin-top:12px">
+                <thead><tr><th>类型</th><th>值</th><th>限定告警</th><th>范围</th><th>命中</th><th>最近命中</th><th>备注</th><th>状态</th><th></th></tr></thead>
+                <tbody>
+                  <tr v-for="w in whitelist" :key="w.id" :class="{ 'wl-off': !w.enabled }">
+                    <td>{{ ALLOW_KIND_LABELS[w.kind] || w.kind }}</td>
+                    <td class="mono wl-val" :title="w.value">{{ w.value }}</td>
+                    <td class="wl-val" :title="w.rule">{{ w.rule || '全部' }}</td>
+                    <td>{{ w.agent_id ? agentLabel(w.agent_id) : '全部终端' }}</td>
+                    <td>{{ w.hits || 0 }}</td>
+                    <td>{{ w.last_hit_at ? fmtTime(w.last_hit_at) : '—' }}</td>
+                    <td>{{ w.note || '—' }}</td>
+                    <td>
+                      <button type="button" class="btn-text" @click="toggleWl(w)">{{ w.enabled ? '启用中' : '已停用' }}</button>
+                    </td>
+                    <td><button type="button" class="btn-text" style="color:var(--danger)" @click="delWl(w.id)">删除</button></td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-else class="empty sm">暂无加白条目</p>
+            </div>
+          </details>
+
+          <details class="panel pad settings ui-fold policy-fold" open>
+            <summary class="ui-fold-sum"><span class="fold-caret" aria-hidden="true" /><span>下发状态与历史</span><em class="ui-fold-note">rev {{ policyRollout?.rev ?? policyRev }}</em></summary>
+            <div class="policy-fold-body">
+              <p class="muted" style="margin:0 0 10px;font-size:12px">终端先整体校验再生效；最短试用 20 秒且至少 3 次成功心跳后记为 LKG。试用期资源超限或反复重启会自动回滚。</p>
+              <div v-if="policyRollout" class="health-chips">
+                <span class="hchip">已生效 {{ policyRollout.summary.applied }}</span>
+                <span class="hchip">试用中 {{ policyRollout.summary.probation }}</span>
+                <span class="hchip">待生效 {{ policyRollout.summary.pending }}</span>
+                <span class="hchip" :class="{ warn: policyRollout.summary.rejected }">已拒绝 {{ policyRollout.summary.rejected }}</span>
+                <span class="hchip" :class="{ warn: policyRollout.summary.rolled_back }">已回滚 {{ policyRollout.summary.rolled_back }}</span>
+                <span class="hchip">旧版不回报 {{ policyRollout.summary.legacy }}</span>
+              </div>
+              <table v-if="policyRollout?.problems?.length" style="margin-top:10px">
+                <thead><tr><th>主机</th><th>状态</th><th>当前生效</th><th>原因</th></tr></thead>
+                <tbody>
+                  <tr v-for="p in policyRollout.problems" :key="p.agent_id">
+                    <td>{{ p.hostname || short(p.agent_id) }}</td>
+                    <td>{{ POLICY_STATUS_LABELS[p.status] || p.status }}</td>
+                    <td>rev {{ p.applied_rev || '默认' }}</td>
+                    <td class="muted">{{ p.error || '—' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <h3 style="margin:16px 0 8px;font-size:14px">版本历史</h3>
+              <table v-if="policyHistory.length">
+                <thead><tr><th>rev</th><th>时间</th><th>操作人</th><th>说明</th><th></th></tr></thead>
+                <tbody>
+                  <tr v-for="h in policyHistory" :key="h.rev">
+                    <td class="mono">{{ h.rev }}<em v-if="h.rev === policyRev" class="pill on" style="margin-left:4px">当前</em></td>
+                    <td class="muted">{{ fmtTime(h.created_at) }}</td>
+                    <td>{{ h.actor || '—' }}</td>
+                    <td class="muted">{{ h.note || '—' }}</td>
+                    <td>
+                      <button v-if="isAdmin && h.rev !== policyRev" type="button" class="btn-text" @click="doPolicyRollback(h.rev)">回滚到此版本</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-else class="empty sm">暂无历史版本</p>
+            </div>
+          </details>
         </div>
       </section>
 
-      <!-- ========== EDR 策略 ========== -->
-      <section v-else-if="page === 'policy'" class="page">
-        <header class="page-hd">
-          <div>
-            <h1>EDR 策略</h1>
-            <p class="desc">热更新采集周期、处置开关、时间线；白名单降低误报（rev {{ policyRev }}）</p>
-          </div>
-          <button type="button" class="btn primary" :disabled="saving" @click="savePolicy">保存策略</button>
-        </header>
-        <div class="ov-grid" style="min-height:auto">
-          <div class="panel pad settings">
-            <h3 style="margin:0 0 12px">全局策略</h3>
-            <label class="chk"><input type="checkbox" v-model="policyForm.response_enabled" /> 允许远程处置</label>
-            <label class="chk"><input type="checkbox" v-model="policyForm.remote_ops_enabled" /> 允许远程运维（读注册表/文件/命令/Shell）</label>
-            <label class="chk"><input type="checkbox" v-model="policyForm.remote_ops_read_only" /> 远程运维只读（禁止 run_cmd；Shell 仅允许 dir/ipconfig 等调查命令）</label>
-            <label class="chk"><input type="checkbox" v-model="policyForm.remote_ops_run_cmd" /> 允许白名单命令（run_cmd）</label>
-            <label class="chk"><input type="checkbox" v-model="policyForm.remote_ops_shell" /> 允许交互式 Shell 会话</label>
-            <label class="chk"><input type="checkbox" v-model="policyForm.timeline_process" /> 上报进程时间线</label>
-            <label class="chk"><input type="checkbox" v-model="policyForm.timeline_file" /> 上报文件时间线</label>
-            <label class="chk"><input type="checkbox" v-model="policyForm.timeline_network" /> 上报网络外联时间线</label>
-            <label class="chk"><input type="checkbox" v-model="policyForm.self_protect" /> 自保护（忽略普通 net stop + 收紧状态目录）</label>
-            <label class="chk"><input type="checkbox" v-model="policyForm.fim_enabled" /> 文件完整性监控（hosts / 计划任务 / 启动目录 / System32 / 驱动 / 公共目录）</label>
-            <label v-if="policyForm.fim_enabled">
-              <span>FIM 自定义目录（每行一个，末尾加 <code>|r</code> 表示递归）</span>
-              <textarea v-model="policyForm.fim_paths_text" class="field" rows="3" placeholder="D:\app\bin&#10;D:\web\wwwroot|r" />
-            </label>
-            <label>
-              <span>定向日志 tail（<code>log_tail_paths</code>，非 Filebeat filestream）</span>
-              <textarea v-model="policyForm.log_tail_paths_text" class="field mono" rows="2" placeholder="C:\ProgramData\YourApp\app.log" />
-              <p class="hint sm">每行一个<strong>文件</strong>绝对路径，最多 20 条；写入时间线 <code>log_tail_line</code>。</p>
-            </label>
-            <label>
-              <span>Winlog 通道模式</span>
-              <select v-model="policyForm.winevent_channel_mode" class="field">
-                <option value="all">全部通道</option>
-                <option value="critical">critical 默认集</option>
-                <option value="high_sens">高敏（critical + BITS/AppLocker/…）</option>
-                <option value="custom">自定义列表</option>
-              </select>
-            </label>
-            <label v-if="policyForm.winevent_channel_mode === 'custom' || policyForm.winevent_channel_mode === 'critical' || policyForm.winevent_channel_mode === 'high_sens'">
-              <span>Winlog 通道 ID（每行一个；critical/high_sens 下为追加）</span>
-              <textarea v-model="policyForm.winevent_channels_text" class="field mono" rows="2" placeholder="firewall&#10;bits&#10;applocker" />
-            </label>
-            <label>
-              <span>心跳间隔（秒）</span>
-              <input v-model.number="policyForm.heartbeat_sec" type="number" min="3" max="120" class="field" />
-            </label>
-            <label>
-              <span>进程采集周期（秒）</span>
-              <input v-model.number="policyForm.intervals_sec.process" type="number" min="3" max="300" class="field" />
-            </label>
-            <label>
-              <span>网络采集周期（秒）</span>
-              <input v-model.number="policyForm.intervals_sec.network" type="number" min="3" max="300" class="field" />
-            </label>
-            <label>
-              <span>文件采集周期（秒）</span>
-              <input v-model.number="policyForm.intervals_sec.file" type="number" min="5" max="600" class="field" />
-            </label>
-            <label>
-              <span>时间线保留（天）</span>
-              <input v-model.number="policyForm.timeline_retain_days" type="number" min="1" max="365" class="field" />
-            </label>
-            <label>
-              <span>已关闭事件保留（天）</span>
-              <input v-model.number="policyForm.events_retain_days" type="number" min="7" max="730" class="field" />
-            </label>
-            <label class="chk"><input type="checkbox" v-model="policyForm.mysql_dual_write" /> MySQL 双写（历史检索层）</label>
-          </div>
-          <div class="panel pad settings">
-            <h3 style="margin:0 0 4px">告警加白</h3>
-            <p class="muted" style="margin:0 0 10px;font-size:12px">
-              命中的告警不再产生（所有检测来源统一生效）。值支持 * 通配；路径、注册表键以 \ 结尾表示整个目录 / 子键。也可在威胁事件里直接点「加白」。
-            </p>
-            <div class="hunt-bar">
-              <select v-model="wlKind" class="search sev-filter">
-                <option v-for="(lb, k) in ALLOW_KIND_LABELS" :key="k" :value="k">{{ lb }}</option>
-              </select>
-              <input v-model="wlValue" class="search grow" placeholder="匹配值，如 C:\Tools\*.exe" />
-              <input v-model="wlRule" class="search" style="max-width:200px" placeholder="限定告警标题（可选，支持 *）" />
-              <input v-model="wlNote" class="search" style="max-width:160px" placeholder="备注" />
-              <button type="button" class="btn" @click="addWl">添加</button>
-            </div>
-            <table v-if="whitelist.length" style="margin-top:12px">
-              <thead><tr><th>类型</th><th>值</th><th>限定告警</th><th>范围</th><th>命中</th><th>最近命中</th><th>备注</th><th>状态</th><th></th></tr></thead>
-              <tbody>
-                <tr v-for="w in whitelist" :key="w.id" :class="{ 'wl-off': !w.enabled }">
-                  <td>{{ ALLOW_KIND_LABELS[w.kind] || w.kind }}</td>
-                  <td class="mono wl-val" :title="w.value">{{ w.value }}</td>
-                  <td class="wl-val" :title="w.rule">{{ w.rule || '全部' }}</td>
-                  <td>{{ w.agent_id ? agentLabel(w.agent_id) : '全部终端' }}</td>
-                  <td>{{ w.hits || 0 }}</td>
-                  <td>{{ w.last_hit_at ? fmtTime(w.last_hit_at) : '—' }}</td>
-                  <td>{{ w.note || '—' }}</td>
-                  <td>
-                    <button type="button" class="btn-text" @click="toggleWl(w)">{{ w.enabled ? '启用中' : '已停用' }}</button>
-                  </td>
-                  <td><button type="button" class="btn-text" style="color:var(--danger)" @click="delWl(w.id)">删除</button></td>
-                </tr>
-              </tbody>
-            </table>
-            <p v-else class="empty sm">暂无加白条目</p>
-          </div>
-          <div class="panel pad settings">
-            <h3 style="margin:0 0 6px">终端生效情况（rev {{ policyRollout?.rev ?? policyRev }}）</h3>
-            <p class="muted" style="margin:0 0 10px;font-size:12px">终端先整体校验再生效，试用 60 秒通过后记为 LKG；试用期资源超限或反复重启会自动回滚到上一个 LKG。</p>
-            <div v-if="policyRollout" class="health-chips">
-              <span class="hchip">已生效 {{ policyRollout.summary.applied }}</span>
-              <span class="hchip">试用中 {{ policyRollout.summary.probation }}</span>
-              <span class="hchip">待生效 {{ policyRollout.summary.pending }}</span>
-              <span class="hchip" :class="{ warn: policyRollout.summary.rejected }">已拒绝 {{ policyRollout.summary.rejected }}</span>
-              <span class="hchip" :class="{ warn: policyRollout.summary.rolled_back }">已回滚 {{ policyRollout.summary.rolled_back }}</span>
-              <span class="hchip">旧版不回报 {{ policyRollout.summary.legacy }}</span>
-            </div>
-            <table v-if="policyRollout?.problems?.length" style="margin-top:10px">
-              <thead><tr><th>主机</th><th>状态</th><th>当前生效</th><th>原因</th></tr></thead>
-              <tbody>
-                <tr v-for="p in policyRollout.problems" :key="p.agent_id">
-                  <td>{{ p.hostname || short(p.agent_id) }}</td>
-                  <td>{{ POLICY_STATUS_LABELS[p.status] || p.status }}</td>
-                  <td>rev {{ p.applied_rev || '默认' }}</td>
-                  <td class="muted">{{ p.error || '—' }}</td>
-                </tr>
-              </tbody>
-            </table>
-            <h3 style="margin:16px 0 8px">版本历史</h3>
-            <table v-if="policyHistory.length">
-              <thead><tr><th>rev</th><th>时间</th><th>操作人</th><th>说明</th><th></th></tr></thead>
-              <tbody>
-                <tr v-for="h in policyHistory" :key="h.rev">
-                  <td class="mono">{{ h.rev }}<em v-if="h.rev === policyRev" class="pill on" style="margin-left:4px">当前</em></td>
-                  <td class="muted">{{ fmtTime(h.created_at) }}</td>
-                  <td>{{ h.actor || '—' }}</td>
-                  <td class="muted">{{ h.note || '—' }}</td>
-                  <td>
-                    <button v-if="isAdmin && h.rev !== policyRev" type="button" class="btn-text" @click="doPolicyRollback(h.rev)">回滚到此版本</button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-            <p v-else class="empty sm">暂无历史版本</p>
-          </div>
-        </div>
-      </section>
+      <!-- 兜底：任何未命中分支的 page 都不再白屏（旧缓存 / 未知页面） -->
+      <ConsoleExceptionPage
+        v-else
+        :code="404"
+        @home="goMenu('overview')"
+        @back="goMenu('overview')"
+      />
     </div>
 
     <!-- 告警加白 -->
@@ -5765,74 +4607,97 @@
 </template>
 
 <script setup>
-import { computed, defineComponent, h, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { paginateSnapshotRows } from './sectionPagination.js'
+import { NAV_STORE_KEY, NAV_SECTIONS, encodeNavState, decodeNavState, sectionTitleFor, visibleMenuGroups, defaultPageForSection, railItems } from './consoleNavigation.js'
+import { canRespondRole, ROLE_LABELS } from './roleAccess.js'
+import { useNavigationMenu } from './composables/useNavigationMenu.js'
+import { useConsoleChrome } from './composables/useConsoleChrome.js'
+import { useWorkspaceTabs } from './composables/useWorkspaceTabs.js'
+import { breadcrumbsFor } from './consolePageCatalog.js'
+import ConsoleWorkbenchBar from './ConsoleWorkbenchBar.vue'
+import ConsoleThemeDrawer from './ConsoleThemeDrawer.vue'
+import ConsoleWatermark from './ConsoleWatermark.vue'
+import ConsoleExceptionPage from './ConsoleExceptionPage.vue'
+import ConsoleGlobalSearch from './ConsoleGlobalSearch.vue'
+import { useOverviewDisplay } from './composables/useOverviewDisplay.js'
+import { useErrorToast } from './composables/useErrorToast.js'
+import { LABELS, COL_LABELS, modLabel, colLabel, statusLabel, sevLabel, short, shortPath, shortHash, cell, fmtTime, fmtEpoch, fmtNum, fmtSize } from './consoleDisplay.js'
+import HostDetailHeader from './HostDetailHeader.vue'
+import HostDetailPage from './HostDetailPage.vue'
+import HostProcessDetails from './HostProcessDetails.vue'
+import HostInventoryNav from './HostInventoryNav.vue'
+import HostSnapshotList from './HostSnapshotList.vue'
+import HostSnapshotDetail from './HostSnapshotDetail.vue'
+import HostSnapshotSummary from './HostSnapshotSummary.vue'
+import OverviewPage from './OverviewPage.vue'
+import ReleaseMetadata from './ReleaseMetadata.vue'
+import { deferredConsolePage } from './deferredConsolePage.js'
+import LiveConnectionBadge from './LiveConnectionBadge.vue'
+import ConsolePageHeader from './ConsolePageHeader.vue'
+import ConsoleListPager from './ConsoleListPager.vue'
+import ConsoleNavigationShell from './ConsoleNavigationShell.vue'
+import ConsoleToastStack from './ConsoleToastStack.vue'
+import SampleInboxPanel from './SampleInboxPanel.vue'
+import { useNotifyCenter } from './composables/useNotifyCenter.js'
+import AttckSummaryCards from './AttckSummaryCards.vue'
+import AttckOverviewBoard from './AttckOverviewBoard.vue'
+import { latestRequest } from './latestRequest.js'
 import {
-  agentProtocol, agentRuleStats, addIoc, addWhitelist, attackStory, attckBoard,
+  agentProtocol, agentRuleStats, addIoc, detectIoc, addWhitelist, attackStory, attckBoard,
   bulkAgentRulesEnabled, bulkElasticEvmEnabled, getElasticDetectionRuleDetail,
   createAgentCommand, createAgentRule,
   deleteAgent, deleteAgentRule, deleteEvent, deleteIoc, deleteUpgradePackage, deleteWhitelist,
   eventAllowCandidates, setWhitelistEnabled, deleteEventsBulk,
-  downloadInstallPackage, getAgentRelease, buildAgentRelease, getAgentSyncManifest, bumpAgentSync,
+  downloadInstallPackage, downloadLinuxInstallPackage, getAgentRelease, buildAgentRelease, getAgentSyncManifest, bumpAgentSync,
   getAgentIntegrations, saveAgentIntegrations, getMemoryYaraRules, saveMemoryYaraControls,
+  getLogRulesPack, saveLogRulesControls,
   getAgentCredentials, setSharedKeyPolicy, revokeAgent, getProcessEntity, huntDns,
   getPolicyHistory, getPolicyRollout, rollbackPolicy,
-  getAgentPolicy, getAgentTags, getEvent, enrichEventDetail, getNotifyConfig, getSnapshot, huntAgents, importIoc, iocLibStatus,
+  getAgentPolicy, getAgentTags, getEvent, enrichEventDetail, getNotifyConfig, getSnapshot, huntAgents, importIoc, iocLibStatus, iocLibPreview, lookupIocLib,
   listProcessEntities,
   investigateLogDetail, investigateLogs, threatProcessTree,
   setNotifyConfig, storePurge, storeSearch, storeStats, testNotify,
   listAgentAudit, listAgentCommands, listAllAgentCommands, listAgentGroups, listAgents, listEvents, listIoc,
   listSeqRules, listTimeline, listUpgradePackages, listWhitelist, patchAgentRule, pushUpgradePackage,
-  getEdrOverview, enrichEventDetails, getFleetDrift, downloadAgentDiagnostics, listAgentDiagnostics, getRelatedEvents,
+  getEdrOverview, enrichEventDetails, getFleetDrift, downloadAgentDiagnostics, downloadAgentSample, listAgentDiagnostics, getRelatedEvents,
   setAgentPolicy, setAgentTags,
   subscribeAgentStream, updateAgentRule, uploadUpgradePackage, upsertAgentGroup, upsertSeqRule, deleteSeqRule,
   edrChangePassword, edrCreateUser, edrDeleteUser, edrGetSettings, edrListUsers, edrResetPassword,
   edrSaveSettings, edrUpdateUser, rotateEnrollKey,
-  aiStatus, aiSetupLocal, aiListSkills, aiListHosts, aiAnalyzeHost,
+  aiStatus, aiSaveConfig, aiActivateProfile, aiDeleteProfile, aiTestConfig, aiListSkills, aiListHosts, aiAnalyzeHost,
 } from './api'
+import { useHunt } from './composables/useHunt.js'
+import { useThreatCases } from './composables/useThreatCases.js'
+import { useResponseOps } from './composables/useResponseOps.js'
+import PlatformExtras from './PlatformExtras.vue'
+import { graphParentChain } from './graphParentChain.js'
+import { filterAgentRules, filterSettingsRules, groupAgentRules, isAbfileRule, isElasticRule, isLinuxRule, linuxRuleCountsOf, ruleBulkTargets } from './agentRulesHelpers.js'
+import {
+  healthChips as fleetHealthChips,
+  captureStatusOf as fleetCaptureStatusOf,
+  hostSensorsPanel as fleetHostSensorsPanel,
+  captureCaptureHint as fleetCaptureCaptureHint,
+  hostQuickStats as fleetHostQuickStats,
+} from './agentFleetHealth.js'
+
+const HostsPage = deferredConsolePage(() => import('./HostsPage.vue'))
+const StoragePage = deferredConsolePage(() => import('./StoragePage.vue'))
+const AuditPage = deferredConsolePage(() => import('./AuditPage.vue'))
+const GroupPage = deferredConsolePage(() => import('./GroupPage.vue'))
+const NotificationPage = deferredConsolePage(() => import('./NotificationPage.vue'))
+const AccountsPage = deferredConsolePage(() => import('./AccountsPage.vue'))
 
 const props = defineProps({ user: { type: Object, default: null } })
 const emit = defineEmits(['logout', 'user-updated'])
 const isAdmin = computed(() => props.user?.role === 'admin')
+const canRespond = computed(() => canRespondRole(props.user?.role))
 const userInitial = computed(() => String(props.user?.display_name || props.user?.username || '?').slice(0, 1).toUpperCase())
 const userMenuOpen = ref(false)
 
-const LABELS = {
-  sysinfo: '系统', process: '进程', service: '服务', task: '计划任务',
-  startup: '启动项', network: '网络', listen: '监听端口',
-  software: '已装软件', hotfix: '补丁', file: '文件', user: '用户', driver: '驱动',
-  browser: '浏览器记录',
-}
 const HOST_TAB_GROUPS = [
   { id: 'runtime', label: '运行态', mods: ['process', 'network', 'service', 'task', 'startup', 'file'] },
-  { id: 'inventory', label: '资产清单', mods: ['software', 'hotfix', 'driver', 'listen', 'user', 'sysinfo', 'browser'] },
-  { id: 'remote', label: '远程管理', mods: [] },
-]
-const HOST_REMOTE_TABS = [
-  { id: 'ops', label: '应急处置', hint: '隔离 / 杀进程 / 指令审计' },
-  { id: 'livequery', label: 'Live Query', hint: 'Osquery 式只读表' },
-  { id: 'files', label: '文件浏览', hint: '只读列目录与读文件' },
-  { id: 'reg', label: '注册表', hint: '只读查询键值' },
-  { id: 'cmd', label: '白名单命令', hint: '单条 cmd，带白名单校验' },
-  { id: 'shell', label: '交互 Shell', hint: 'cmd 会话，轮询输出' },
-]
-const LIVE_QUERY_TABLES_DEFAULT = [
-  { name: 'processes', osquery_analog: 'processes' },
-  { name: 'services', osquery_analog: 'services' },
-  { name: 'listening_ports', osquery_analog: 'listening_ports' },
-  { name: 'scheduled_tasks', osquery_analog: 'scheduled_tasks' },
-  { name: 'startup_items', osquery_analog: 'startup_items' },
-  { name: 'users', osquery_analog: 'users' },
-  { name: 'network_connections', osquery_analog: 'process_open_sockets' },
-  { name: 'drivers', osquery_analog: 'drivers' },
-  { name: 'installed_software', osquery_analog: 'programs' },
-  { name: 'hotfixes', osquery_analog: 'patches' },
-]
-const HOST_SHELL_QUICK = ['ipconfig', 'whoami', 'systeminfo', 'tasklist', 'dir', 'netstat -ano']
-const HOST_REG_SHORTCUTS = [
-  { label: 'Run', hive: 'HKLM', key: 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run' },
-  { label: 'RunOnce', hive: 'HKLM', key: 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce' },
-  { label: 'IFEO', hive: 'HKLM', key: 'SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options' },
-  { label: 'Services', hive: 'HKLM', key: 'SYSTEM\\CurrentControlSet\\Services' },
+  { id: 'inventory', label: '资产清单', mods: ['software', 'hotfix', 'driver', 'listen', 'netif', 'groups', 'firewall', 'shares', 'certs', 'usb', 'user', 'sysinfo'] },
 ]
 const FILE_EXT_OPTIONS = [
   'exe', 'dll', 'sys', 'scr', 'bat', 'cmd', 'ps1', 'vbs', 'js', 'msi', 'jar',
@@ -5987,133 +4852,106 @@ const FIELD_BY_MODULE = {
   file: ['name', 'path', 'directory', 'ext'],
   user: ['name', 'session', 'state'],
 }
-const COL_LABELS = {
-  name: '名称', display_name: '显示名', status: '状态', path: '路径',
-  pid: 'PID', ppid: '父PID', command: '命令', command_line: '命令行',
-  task_name: '任务名', author: '作者', next_run: '下次运行', last_run: '上次运行',
-  last_result: '上次结果', working_directory: '工作目录', execute: '执行程序', arguments: '参数',
-  triggers: '触发器', description: '描述', account: '运行账户', start_type: '启动类型',
-  exit_code: '退出码', user: '用户', session_id: '会话', create_time: '创建时间',
-  memory_mb: '内存(MB)', handles: '句柄数',
-  local: '本地', remote: '远程', proto: '协议', state: '连接状态',
-  location: '位置', caption: '系统', hostname: '主机名', domain: '域',
-  agent_ver: 'Agent 版本', build: '内部版本', collected_at: '采集时间',
-  goarch: '架构', goos: '操作系统',
-  ext: '扩展名', size: '大小(字节)', size_kb: '大小(KB)', modified: '修改时间',
-  created: '创建时间', directory: '所在目录', session: '会话名',
-  enabled: '启用', last_logon: '上次登录', password_required: '需密码',
-  principal: 'SID', source: '来源', manufacturer: '厂商', model: '型号',
-  total_ram_mb: '内存(MB)', last_boot: '上次开机', install_date: '安装日期',
-  version: '版本', ip: 'IP', num_cpu: 'CPU 核数', os_family: '系统族',
-  parent_name: '父进程', parent_path: '父路径', uptime: '运行时长', uptime_sec: '运行秒数',
-  signed: '签名状态', signer: '签名者', sha256: 'SHA256', company: '公司名',
-  file_version: '文件版本', process_name: '进程名',
-  risk_score: '风险分', risk_tags: '风险标签', noise: '系统噪声',
-  module_count: '模块总数', module_third_count: '第三方DLL', modules_summary: '已加载DLL',
-  modules: '模块列表',
-  publisher: '发布者', arch: '位数', install_path: '安装路径', uninstall: '卸载命令',
-  kb: '补丁号', installed_on: '安装时间', installed_by: '安装者', inventory: '清单类型',
-  process_guid: '进程GUID', parent_guid: '父进程GUID', elevated: '已提权', integrity: '完整性级别',
-  script_block: '脚本块', payload: '载荷',
-  module: '模块', module_name: '模块名', host_process: '宿主进程', process_path: '进程路径',
-  image: '映像路径',
-  hive: 'Hive', key: '完整路径', reg_key: '注册表键', value_name: '值名', value: '写入值', old_value: '原值',
-  value_type: '值类型', change: '变更类型', label: '监控点', category: '类别', watch: '监控规则', user_sid: '用户 SID',
-  etype: '事件类型', event_id: '事件 ID', channel: '日志通道', script_block_id: '脚本块 ID',
-  target_path: '目标进程', target_pid: '目标 PID', access: '访问权限', start_address: '起始地址', call_trace: '调用栈',
-  member: '成员', group: '组', by: '操作者', logon_type: '登录类型', substatus: '子状态码', target: '目标服务器',
-  privileges: '特权', process: '进程', task: '任务', content: '任务定义',
-  ioc_value: '情报值', ioc_type: '情报类型', malware: '恶意家族', intel_source: '情报来源', matched_from: '匹配字段',
-  trigger: '触发事件', lib: '情报库', ioc_id: '情报 ID',
-  remote_ip: '远程 IP', remote_port: '远程端口', old_sha256: '原 SHA256', old_size: '原大小(字节)',
-  query: '查询域名', qtype: '记录类型码', qtype_name: '记录类型', status_name: '解析结果', answers: '解析地址',
-  cnames: 'CNAME', dga_score: 'DGA 分数', nx_count: '失败数', window_sec: '统计窗口(秒)', samples: '样本域名',
-  entity_id: '进程实体', parent_create_time: '父进程创建时间', duration_sec: '存活(秒)', from: '原值', to: '新值',
-}
 
-const HostTable = defineComponent({
-  name: 'HostTable',
-  props: { rows: { type: Array, default: () => [] } },
-  emits: ['view', 'remove'],
-  setup(props, { emit }) {
-    return () => h('div', { class: 'table-scroll' }, [
-      h('table', [
-        h('thead', [h('tr', ['主机', '系统', 'IP', '状态', '最近心跳', '版本', '操作'].map((t) => h('th', t)))]),
-        h('tbody', (props.rows || []).map((a) => h('tr', [
-          h('td', { class: 'strong' }, a.hostname || '—'),
-          h('td', a.os_family || '—'),
-          h('td', a.ip || '—'),
-          h('td', [h('span', { class: ['pill', a.online ? 'on' : ''] }, a.online ? '在线' : '离线')]),
-          h('td', a.last_seen || '—'),
-          h('td', a.version || '—'),
-          h('td', { class: 'ops' }, [
-            h('button', { type: 'button', class: 'link', onClick: () => emit('view', a) }, '查看主机'),
-            h('button', { type: 'button', class: 'link danger', onClick: () => emit('remove', a) }, '删除'),
-          ]),
-        ]))),
-      ]),
-      !(props.rows || []).length ? h('p', { class: 'empty' }, '暂无终端，请先下载安装包部署') : null,
-    ])
-  },
-})
 
-const I = {
-  grid: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
-  detect: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/></svg>',
-  rules: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1.2" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.2" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.2" fill="currentColor" stroke="none"/></svg>',
-  asset: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 20h8M12 18v2"/></svg>',
-  deploy: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12M8 11l4 4 4-4"/><path d="M5 19h14"/></svg>',
-  config: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
-  ai: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l2.2 4.5L19 9l-4.2 2.1L12 16l-2.8-4.9L5 9l4.8-1.5L12 3z"/><circle cx="12" cy="19" r="1.6"/></svg>',
-}
-const railItems = [
-  { id: 'overview', label: '数据概览', short: '概览', ico: I.grid },
-  { id: 'detect', label: '检测响应', short: '检测', ico: I.detect },
-  { id: 'ai', label: 'AI 分析', short: 'AI', ico: I.ai },
-  { id: 'rules', label: '规则管理', short: '规则', ico: I.rules },
-  { id: 'asset', label: '终端资产', short: '资产', ico: I.asset },
-  { id: 'deploy', label: '部署运营', short: '部署', ico: I.deploy },
-  { id: 'config', label: '平台配置', short: '配置', ico: I.config },
-]
 
 const section = ref('overview')
-const menuPinned = ref(false)
-const menuHover = ref(false)
-let menuLeaveTimer = null
-const menuVisible = computed(() => menuPinned.value || menuHover.value)
-function onNavEnter() {
-  if (menuLeaveTimer) {
-    clearTimeout(menuLeaveTimer)
-    menuLeaveTimer = null
-  }
-  menuHover.value = true
+const { menuPinned, menuHover, menuVisible, onNavEnter, onNavLeave } = useNavigationMenu()
+const sideMenuOpen = computed(() => menuVisible.value && section.value !== 'overview')
+const {
+  density, theme, radius, fontScale, watermark, themeDrawerOpen,
+  toggleDensity, toggleTheme, setTheme, setDensity, setRadius, setFontScale, setWatermark,
+  openThemeDrawer, closeThemeDrawer,
+} = useConsoleChrome()
+function onToggleTheme() {
+  toggleTheme()
+  // 强制同步到 <html>，并给可见反馈，避免「点了没反应」的观感
+  try {
+    document.documentElement.dataset.theme = theme.value
+  } catch { /* ignore */ }
+  okMsg.value = theme.value === 'dark' ? '已切换为深色模式' : '已切换为浅色模式'
+  setTimeout(() => { if (okMsg.value.startsWith('已切换')) okMsg.value = '' }, 1800)
 }
-function onNavLeave() {
-  if (menuLeaveTimer) clearTimeout(menuLeaveTimer)
-  menuLeaveTimer = setTimeout(() => {
-    menuHover.value = false
-    menuLeaveTimer = null
-  }, 180)
+function onToggleThemeFromMenu() {
+  userMenuOpen.value = false
+  onToggleTheme()
+}
+function onToggleDensityFromMenu() {
+  userMenuOpen.value = false
+  toggleDensity()
+  okMsg.value = density.value === 'compact' ? '已切换为紧凑密度' : '已切换为标准密度'
+  setTimeout(() => { if (okMsg.value.startsWith('已切换')) okMsg.value = '' }, 1800)
+}
+async function onOpenThemeFromMenu() {
+  userMenuOpen.value = false
+  sampleInboxOpen.value = false
+  await nextTick()
+  openThemeDrawer()
+}
+function onThemeDrawerSetTheme(next) {
+  setTheme(next)
+  try {
+    document.documentElement.dataset.theme = theme.value
+  } catch { /* ignore */ }
 }
 const page = ref('overview')
-/** 从威胁视图返回时回到「威胁事件」或「恶意文件」列表 */
-const eventListReturnPage = ref('events')
-const NAV_STORE_KEY = 'edr_admin_nav'
-const NAV_PAGES = new Set([
-  'overview', 'events', 'malware', 'behaviors', 'attck', 'investigate', 'timeline',
-  'hunt', 'dns', 'ioc', 'rules', 'seq', 'hosts', 'groups', 'deploy', 'upgrade',
-  'audit', 'settings', 'policy', 'notify', 'storage', 'accounts', 'threat-view',
-  'ai-analyze',
-])
-const pendingThreatRestoreId = ref(null)
+const globalSearchOpen = ref(false)
+const workbenchCrumbs = computed(() => breadcrumbsFor(section.value, page.value, isAdmin.value))
+const {
+  tabItems, showTabs, closeTab, closeOtherTabs, closeAllTabs, activateTab, setShowTabs,
+} = useWorkspaceTabs({
+  page,
+  isAdmin,
+  goMenu: (id) => goMenu(id),
+})
+function onGlobalSearchHotkey(e) {
+  if ((e.ctrlKey || e.metaKey) && String(e.key || '').toLowerCase() === 'k') {
+    e.preventDefault()
+    globalSearchOpen.value = true
+  }
+}
+const {
+  events,
+  allEvents,
+  eventAgentId,
+  focusKey,
+  eventQName,
+  eventIocQ,
+  eventGroupId,
+  eventTypeFilter,
+  eventFiltersOn,
+  openEventCount,
+  eventSort,
+  eventSevFilter,
+  selectedEventIds,
+  eventListReturnPage,
+  pendingThreatRestoreId,
+  activeEvent,
+  threatTab,
+  threatTree,
+  threatTreeBusy,
+  tvTreeExpanded,
+  tvShowDotted,
+  tvReadable,
+  tvZoom,
+  threatPanelNode,
+} = useThreatCases()
+const eventListScope = ref('')
+const ENDPOINT_EVENT_MODULES = new Set(['process', 'evm', 'ptm', 'timeline', 'memory', 'script'])
+function eventMatchesListScope(e, scope) {
+  const mod = String(e?.module || '').toLowerCase()
+  if (scope === 'endpoint') return ENDPOINT_EVENT_MODULES.has(mod)
+  if (scope === 'external') return mod === 'network' || mod === 'dns' || /外联|DNS/i.test(String(e?.title || ''))
+  return true
+}
 
 function saveNavState() {
   try {
-    localStorage.setItem(NAV_STORE_KEY, JSON.stringify({
+    localStorage.setItem(NAV_STORE_KEY, encodeNavState({
       section: section.value,
       page: page.value,
       eventListReturnPage: eventListReturnPage.value,
-      threatEventId: page.value === 'threat-view' && activeEvent.value?.id ? activeEvent.value.id : null,
+      activeEventId: page.value === 'threat-view' ? activeEvent.value?.id : null,
       rulesSection: rulesSection.value,
     }))
   } catch { /* ignore */ }
@@ -6121,114 +4959,24 @@ function saveNavState() {
 
 function restoreNavState() {
   try {
-    const raw = JSON.parse(localStorage.getItem(NAV_STORE_KEY) || 'null')
-    if (!raw?.page || !NAV_PAGES.has(raw.page)) return
-    section.value = raw.section || 'overview'
+    const raw = decodeNavState(localStorage.getItem(NAV_STORE_KEY))
+    if (!raw) return
+    // 已删除分区（如 ai）的旧缓存会让 menuMap 查不到分组、二级菜单空白
+    section.value = NAV_SECTIONS.has(raw.section) ? raw.section : 'overview'
     eventListReturnPage.value = raw.eventListReturnPage || 'events'
     if (raw.rulesSection) rulesSection.value = raw.rulesSection
-    if (raw.page === 'threat-view' && raw.threatEventId) {
-      pendingThreatRestoreId.value = Number(raw.threatEventId) || raw.threatEventId
+    if (raw.page === 'threat-view') {
+      // 详情页依赖 activeEvent；刷新后先把 page 落回列表，避免命中空详情分支造成白屏。
+      // 有事件 id 时由 pendingThreatRestoreId 在列表加载完成后异步重新打开详情。
       page.value = raw.eventListReturnPage === 'malware' ? 'malware' : 'events'
+      if (raw.threatEventId) pendingThreatRestoreId.value = Number(raw.threatEventId) || raw.threatEventId
     } else {
       page.value = raw.page
     }
   } catch { /* ignore */ }
 }
-const menuMap = {
-  overview: [
-    {
-      title: '态势',
-      items: [
-        { id: 'overview', label: '总览看板' },
-        { id: 'events', label: '最近威胁' },
-        { id: 'attck', label: 'ATT&CK 看板' },
-      ],
-    },
-    {
-      title: '调查',
-      items: [
-        { id: 'investigate', label: '日志调查' },
-        { id: 'timeline', label: '主机时间线' },
-        { id: 'hunt', label: '调查狩猎' },
-        { id: 'dns', label: 'DNS 狩猎' },
-        { id: 'ioc', label: '威胁情报 IOC' },
-      ],
-    },
-    {
-      title: '终端',
-      items: [
-        { id: 'hosts', label: '终端列表' },
-      ],
-    },
-  ],
-  detect: [
-    {
-      title: '检测响应',
-      items: [{ id: 'events', label: '威胁事件' }],
-    },
-    {
-      title: '威胁概览',
-      items: [{ id: 'overview', label: '终端安全概览' }],
-    },
-    {
-      title: '入侵防护',
-      items: [{ id: 'malware', label: '恶意文件' }],
-    },
-    {
-      title: '调查狩猎',
-      items: [
-        { id: 'behaviors', label: '检出行为' },
-        { id: 'investigate', label: '日志调查' },
-        { id: 'hunt', label: '威胁狩猎' },
-        { id: 'timeline', label: '主机时间线' },
-        { id: 'dns', label: 'DNS 狩猎' },
-        { id: 'ioc', label: '威胁情报 IOC' },
-      ],
-    },
-    {
-      title: '策略配置',
-      items: [{ id: 'whitelist', label: '信任名单' }],
-    },
-  ],
-  rules: [{
-    title: '规则管理',
-    items: [
-      { id: 'rules', label: 'Agent 规则' },
-      { id: 'seq', label: '行为序列' },
-    ],
-  }],
-  ai: [{
-    title: 'AI 分析',
-    items: [
-      { id: 'ai-analyze', label: '一键研判' },
-    ],
-  }],
-  asset: [{
-    title: '调查资产',
-    items: [
-      { id: 'hosts', label: '终端列表' },
-      { id: 'groups', label: '终端分组' },
-    ],
-  }],
-  deploy: [{ title: '部署运营', items: [{ id: 'deploy', label: '安装包下载' }, { id: 'upgrade', label: '灰度升级' }, { id: 'audit', label: '处置审计' }] }],
-  config: [{
-    title: '平台配置',
-    items: [
-      { id: 'settings', label: '接入与地址' },
-      { id: 'policy', label: 'EDR 策略' },
-      { id: 'notify', label: '通知渠道' },
-      { id: 'storage', label: '存储与保留' },
-      { id: 'accounts', label: '账号管理', adminOnly: true },
-    ],
-  }],
-}
-const sectionTitle = computed(() => ({
-  overview: '数据概览', detect: '检测响应', rules: '规则管理', asset: '终端资产', deploy: '部署运营', config: '平台配置',
-}[section.value] || ''))
-const menuGroups = computed(() => (menuMap[section.value] || []).map((g) => ({
-  ...g,
-  items: g.items.filter((m) => !m.adminOnly || isAdmin.value),
-})))
+const sectionTitle = computed(() => sectionTitleFor(section.value))
+const menuGroups = computed(() => visibleMenuGroups(section.value, isAdmin.value))
 
 const agents = ref([])
 const selected = ref(null)
@@ -6236,6 +4984,103 @@ const q = ref('')
 const loading = ref(false)
 const error = ref('')
 const okMsg = ref('')
+const sampleToast = ref(null)
+const {
+  open: sampleInboxOpen,
+  pendingCount: samplePendingCount,
+  readyCount: sampleReadyCount,
+  trackSample,
+  clearReady: clearReadySamples,
+  refreshOnce: refreshSampleInboxOnce,
+  startPoll: startSamplePoll,
+  notifications: notifyItems,
+  badgeCount: notifyBadgeCount,
+  pushResponseNotify,
+  dismissNotify,
+  markRead: markNotifyRead,
+  markAllRead: markAllNotifyRead,
+} = useNotifyCenter()
+
+async function refreshSampleInbox() {
+  const ready = await refreshSampleInboxOnce()
+  for (const it of ready) notifySampleReady(it)
+}
+
+function notifySampleReady(it) {
+  sampleToast.value = {
+    title: '恶意样本提取成功',
+    detail: it.filename || it.path || '可在通知中心下载',
+    actionLabel: '下载',
+    commandId: it.commandId,
+    agentId: it.agentId,
+  }
+  sampleInboxOpen.value = true
+}
+
+function onToggleNotify() {
+  sampleInboxOpen.value = !sampleInboxOpen.value
+}
+
+watch(page, () => {
+  sampleInboxOpen.value = false
+})
+
+async function onSampleInboxDownload(it) {
+  try {
+    await downloadAgentSample(it.agentId, it.commandId)
+    okMsg.value = '样本已开始下载'
+    setTimeout(() => { okMsg.value = '' }, 2000)
+  } catch (e) {
+    error.value = e?.message || String(e)
+  }
+}
+
+function onSampleToastAction() {
+  const t = sampleToast.value
+  if (!t?.agentId || !t?.commandId) return
+  onSampleInboxDownload(t)
+  sampleToast.value = null
+}
+
+function onSampleOpenEvent(it) {
+  if (it?.eventId) openEventById(it.eventId)
+}
+
+// 后台轮询：有待完成样本时持续刷新并弹下载提示
+let sampleWatchTimer = null
+function ensureSampleWatch() {
+  if (sampleWatchTimer) return
+  sampleWatchTimer = setInterval(async () => {
+    if (!samplePendingCount.value) return
+    const ready = await refreshSampleInboxOnce()
+    for (const it of ready) notifySampleReady(it)
+  }, 3500)
+  startSamplePoll()
+}
+ensureSampleWatch()
+
+const {
+  respCommands,
+  respToast,
+  dismissRespToast,
+  resetRespToastKey,
+  showRespToast,
+  loadRespCommands,
+  startRespPoll,
+  stopRespPoll,
+} = useResponseOps({
+  activeEvent,
+  page,
+  error,
+  actionLabel: (a) => actionLabel(a),
+  cmdStatusLabel: (s) => cmdStatusLabel(s),
+  friendlyCmdResult: (a, r) => friendlyCmdResult(a, r),
+  onCommandNotify: (payload) => {
+    // 样本提取已由样本收件箱跟踪，避免重复两条
+    if (payload?.action === 'pull_file') return
+    pushResponseNotify(payload)
+  },
+})
 
 /** AI 分析页 */
 const aiBusy = ref(false)
@@ -6245,6 +5090,30 @@ const aiHosts = ref([])
 const aiSkills = ref([])
 const aiSkillsMeta = ref({ total_indexed: 0, edr_relevant: 0, returned: 0 })
 const aiStatusInfo = ref({})
+const AI_ONLINE_PRESETS = [
+  { id: 'openai', label: 'OpenAI', base_url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  { id: 'deepseek', label: 'DeepSeek', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+  { id: 'moonshot', label: 'Moonshot', base_url: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
+  { id: 'dashscope', label: '通义', base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+]
+const aiModelForm = ref({
+  id: '',
+  name: '',
+  provider_mode: 'local',
+  base_url: '',
+  model: '',
+  api_key: '',
+  timeout: 120,
+  has_key: false,
+  api_key_masked: '',
+  active: false,
+  is_new: false,
+})
+const aiProfiles = ref([])
+const aiModelSaving = ref(false)
+const aiModelTesting = ref(false)
+const aiModelTestMsg = ref('')
+const aiModelTestOk = ref(null)
 let aiHostsTimer = null
 let aiHostsInflight = null
 const aiSelectedId = ref('')
@@ -6255,8 +5124,9 @@ const aiDispBusy = ref(false)
 const aiThinkIdx = ref(0)
 const aiEntityIdx = ref(0)
 const aiThreatIdx = ref(0)
-const aiLogIdx = ref(0)
+const aiLogIdx = ref(-1)
 const aiLogCat = ref('')
+const aiLogRuleHit = ref(null)
 const aiChainNodeId = ref('')
 const aiTab = ref('overview')
 const aiThinkStep = computed(() => {
@@ -6309,11 +5179,84 @@ const aiFilteredForensicsLogs = computed(() => {
   return list.filter((l) => (l?.category || 'other') === cat)
 })
 const aiLogCard = computed(() => {
+  if (aiLogRuleHit.value) return aiLogRuleHit.value
   const list = aiFilteredForensicsLogs.value
-  if (!list.length) return null
-  const i = Math.min(Math.max(0, aiLogIdx.value), list.length - 1)
+  if (!list.length || aiLogIdx.value < 0) return null
+  const i = Math.min(aiLogIdx.value, list.length - 1)
   return list[i]
 })
+const aiLogDetailRows = computed(() => {
+  const l = aiLogCard.value
+  if (!l || typeof l !== 'object') return []
+  const prefer = [
+    ['时间', l.ts || l.time],
+    ['类型', l.etype || l.type],
+    ['分类', l.category],
+    ['摘要', l.summary || l.rule_title || l.title],
+    ['命令行', l.command_line || l.cmdline || l.CommandLine],
+    ['路径', l.path || l.image || l.Image],
+    ['进程', l.process || l.process_name || l.name],
+    ['PID', l.pid],
+    ['用户', l.user || l.User],
+    ['通道', l.channel],
+    ['EventID', l.event_id || l.EventID],
+    ['规则', l.rule_title || l.rule_id],
+    ['证据', l.evidence || l.matched],
+    ['主机', l.hostname],
+  ]
+  const rows = []
+  const seen = new Set()
+  for (const [k, v] of prefer) {
+    if (v == null || v === '') continue
+    seen.add(k)
+    rows.push({ k, v: String(v), mono: /命令行|路径|证据|规则/.test(k) })
+  }
+  for (const [k, v] of Object.entries(l)) {
+    if (seen.has(k) || v == null || v === '' || typeof v === 'object') continue
+    if (['ts', 'etype', 'category', 'summary', 'command_line', 'path'].includes(k)) continue
+    rows.push({ k, v: String(v), mono: false })
+    if (rows.length >= 24) break
+  }
+  return rows
+})
+function openAiLogDetail(i) {
+  aiLogRuleHit.value = null
+  aiLogIdx.value = i
+}
+function closeAiLogDetail() {
+  aiLogIdx.value = -1
+  aiLogRuleHit.value = null
+}
+function openAiLogRuleHit(h) {
+  if (!h) return
+  aiLogIdx.value = -1
+  aiLogRuleHit.value = {
+    ...h,
+    etype: h.etype || 'log_rule_hit',
+    category: h.category || 'rule',
+    summary: h.rule_title || h.title || '日志规则命中',
+    ts: h.time || h.ts || '',
+  }
+}
+function jumpAiLogToInvestigate() {
+  const l = aiLogCard.value
+  if (!l) return
+  const q = String(
+    l.command_line || l.path || l.evidence || l.summary || l.rule_title || '',
+  ).trim().slice(0, 120)
+  invQ.value = q
+  invRange.value = '7d'
+  const host = aiSelectedHost.value?.hostname || l.hostname || ''
+  invFilters.value = {
+    nature: '', etype: '', hostname: host,
+    path: '', hash_q: '', entity: '', tactic: '', os: '',
+    source: '', event_id: '', topic: '',
+  }
+  invNatureTab.value = ''
+  lastInvestigateAt = 0
+  goMenu('investigate')
+  runInvestigate()
+}
 const aiChainNode = computed(() => {
   const nodes = aiResult.value?.result?.attack_graph?.nodes || []
   if (!nodes.length) return null
@@ -6347,136 +5290,10 @@ const aiMarkdownHtml = computed(() => {
   return renderAiMarkdown('暂无正文。请确认 Agent 已上报快照/威胁/日志后重试。')
 })
 
-let errorToastTimer = null
-function clearErrorToast() {
-  error.value = ''
-  if (errorToastTimer) {
-    clearTimeout(errorToastTimer)
-    errorToastTimer = null
-  }
-}
-watch(error, (msg) => {
-  if (errorToastTimer) {
-    clearTimeout(errorToastTimer)
-    errorToastTimer = null
-  }
-  if (!msg) return
-  errorToastTimer = setTimeout(() => {
-    error.value = ''
-    errorToastTimer = null
-  }, 5000)
-})
+const { clearErrorToast } = useErrorToast(error)
 const module = ref('process')
 const modules = ref(Object.keys(LABELS))
 const hostTabGroup = ref('runtime')
-const hostRemoteBusy = ref(false)
-const hostRemoteCommands = ref([])
-let hostRemotePollTimer = null
-const hostRemoteForm = ref({ pid: '', path: '', scanPid: '' })
-const hostRemoteSubTab = ref('ops')
-const hostRemoteFsPath = ref('C:\\')
-const hostRemoteFsEntries = ref([])
-const hostRemoteFsDrives = ref([])
-const hostRemoteFsRoots = ref([])
-const hostRemoteFsHint = ref('')
-const hostRemoteFsTruncated = ref(false)
-const hostRemoteFsPreview = ref('')
-const hostRemoteFsTree = computed(() => {
-  const out = []
-  const walk = (nodes, depth) => {
-    for (const n of nodes || []) {
-      out.push({ node: n, depth })
-      if (n.expanded && n.children?.length) walk(n.children, depth + 1)
-    }
-  }
-  walk(hostRemoteFsRoots.value, 0)
-  return out
-})
-const hostRemoteFsDirCount = computed(() => hostRemoteFsEntries.value.filter((e) => e.dir).length)
-const hostRemoteFsFileCount = computed(() => hostRemoteFsEntries.value.filter((e) => !e.dir).length)
-const hostRemoteReg = ref({ hive: 'HKLM', key: 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run', value: '' })
-const hostRemoteRegResult = ref(null)
-const hostRemoteRegBreadcrumb = computed(() => {
-  const h = hostRemoteReg.value.hive || 'HKLM'
-  const k = String(hostRemoteReg.value.key || '').trim()
-  return k ? `${h}\\${k}` : h
-})
-const hostRemoteRegSubkeys = computed(() => hostRemoteRegResult.value?.subkeys || [])
-const hostRemoteRegValues = computed(() => hostRemoteRegResult.value?.values || [])
-const hostRemoteRegSingleValue = computed(() => {
-  const r = hostRemoteRegResult.value
-  if (!r || r.values) return null
-  if (r.value_name == null && r.data == null && !r.data_hex) return null
-  return { name: r.value_name || '(默认)', type: r.type, data: r.data || r.data_hex }
-})
-const hostRemoteCmdLine = ref('')
-const hostRemoteCmdOut = ref('')
-const hostRemoteCmdLog = ref([])
-const hostLiveQueryTable = ref('processes')
-const hostLiveQueryLimit = ref(200)
-const hostLiveQueryRows = ref([])
-const hostLiveQueryMeta = ref(null)
-const liveQueryAuditItems = ref([])
-
-async function loadLiveQueryAudit() {
-  const aid = selected.value?.agent_id
-  if (!aid) {
-    liveQueryAuditItems.value = []
-    return
-  }
-  try {
-    const r = await listAgentAudit(200)
-    liveQueryAuditItems.value = (r?.items || []).filter((a) =>
-      a.agent_id === aid && String(a.action || '').includes('live_query'),
-    ).slice(0, 40)
-  } catch {
-    liveQueryAuditItems.value = []
-  }
-}
-const hostLiveQueryTableOptions = computed(() => {
-  const fromAgent = selected.value?.health?.sensors?.live_query_tables
-  if (Array.isArray(fromAgent) && fromAgent.length) {
-    return fromAgent.map((t) => ({
-      name: t.name || t,
-      osquery_analog: t.osquery_analog || '',
-    }))
-  }
-  return LIVE_QUERY_TABLES_DEFAULT
-})
-const hostLiveQueryCols = computed(() => {
-  const keys = new Set()
-  for (const row of hostLiveQueryRows.value.slice(0, 50)) {
-    if (row && typeof row === 'object') Object.keys(row).forEach((k) => keys.add(k))
-  }
-  return [...keys].slice(0, 24)
-})
-const hostRemoteShellId = ref('')
-const hostRemoteShellLines = ref([])
-const hostRemoteShellInput = ref('')
-const hostRemoteShellPhase = ref('idle') // idle | connecting | live | error
-const hostRemoteShellViewRef = ref(null)
-const hostRemoteShellInputRef = ref(null)
-let hostRemoteShellPollTimer = null
-let hostRemoteShellPollBusy = false
-
-const hostRemoteShellStatusLabel = computed(() => {
-  const m = {
-    idle: '未连接 — 请先点「连接 Shell」',
-    connecting: '正在连接终端…',
-    live: '会话进行中',
-    error: '连接失败',
-  }
-  return m[hostRemoteShellPhase.value] || m.idle
-})
-const hostRemoteShellHint = ref('')
-const hostRemoteShellHintKind = ref('info')
-const hostRemoteShellConnectDisabled = computed(() => {
-  if (!selected.value?.online) return true
-  if (hostRemoteShellPhase.value === 'connecting') return true
-  if (hostRemoteShellPhase.value === 'live' && hostRemoteShellId.value) return true
-  if (!isAdmin.value) return true
-  return false
-})
 const hostGroupMods = computed(() => {
   const g = HOST_TAB_GROUPS.find((x) => x.id === hostTabGroup.value)
   return g?.mods || HOST_TAB_GROUPS[0].mods
@@ -6484,36 +5301,156 @@ const hostGroupMods = computed(() => {
 const snap = ref(null)
 const snapLoading = ref(false)
 const snapError = ref('')
+const snapModuleStatus = computed(() => selected.value?.health?.inventory_quality?.[module.value] || null)
+const snapStatusMessage = computed(() => {
+  const quality = snapModuleStatus.value
+  const component = selected.value?.health?.sensors?.inventory_components?.find(row => row.name === module.value || row.id === module.value)
+  const ver = String(selected.value?.version || '')
+  const oldAgent = ver && !/^0\.1[3-9]|^0\.[2-9]|^[1-9]/.test(ver)
+  if (component?.state === 'UNSUPPORTED') return '当前平台不支持该模块（如 Linux 无部分 Windows 资产项）'
+  if (component?.state === 'UNAUTHORIZED' || /permission denied|access denied|权限不足|拒绝访问/i.test(quality?.error || '')) {
+    return '采集权限不足，无法判断清单是否为空；请以管理员权限运行 Agent'
+  }
+  if (quality?.status === 'possible_truncation') return '采集可能截断，界面保留最近完整快照；可点「刷新采集」再试'
+  if (quality?.status === 'failed') return '最近一次采集失败：' + (quality.error || '原因未上报') + '。可点「刷新采集」或检查 Agent 日志'
+  if (snap.value && Array.isArray(snap.value.items) && !snap.value.items.length) {
+    if (snapQ.value?.trim()) return '当前搜索无匹配项，可清空搜索重试'
+    return '终端已上报该模块，但结果为 0 条（本机可能确实无此类资产）'
+  }
+  if (!snap.value) {
+    if (!selected.value?.online) return '终端离线，尚无可用快照；上线并心跳后会自动采集'
+    if (oldAgent) return `当前 Agent ${ver || '版本过旧'}，部分资产清单需 0.13.8+；请在部署页升级后等待心跳`
+    if (['software', 'hotfix', 'driver', 'netif', 'groups', 'firewall', 'shares', 'certs', 'usb'].includes(module.value)) {
+      return '尚无可用快照：软件/驱动等重模块约 1～3 分钟后首采；也可点「刷新采集」立即全量同步'
+    }
+    return '尚无可用快照：等待 Agent 下一轮资产采集，或点「刷新采集」强制同步'
+  }
+  return '最近完整快照已上报'
+})
+async function requestInventoryRefresh() {
+  const aid = selected.value?.agent_id
+  const mod = module.value
+  if (!aid) return
+  try {
+    await createAgentCommand(aid, 'refresh_modules', {})
+    okMsg.value = '已下发刷新采集，正在等待终端上报…'
+    // 轮询快照：重模块首轮约 1~3 分钟内到达
+    let tries = 0
+    const poll = async () => {
+      tries += 1
+      if (selected.value?.agent_id !== aid) return
+      try {
+        await loadSnap(mod, { silent: true, keepRow: true, syncGroup: false })
+        if (snap.value?.items?.length) {
+          okMsg.value = `已收到「${modLabel(mod)}」清单 ${snap.value.items.length} 条`
+          setTimeout(() => { okMsg.value = '' }, 4000)
+          return
+        }
+      } catch { /* keep polling */ }
+      if (tries < 24) setTimeout(poll, 5000)
+      else {
+        okMsg.value = '仍未收到快照：请确认 Agent 在线，或稍后再点「重新加载」'
+        setTimeout(() => { okMsg.value = '' }, 6000)
+      }
+    }
+    setTimeout(poll, 4000)
+  } catch (e) {
+    error.value = e?.message || String(e)
+  }
+}
+
+function openHostFromBaseline({ agentId, module: mod } = {}) {
+  const aid = String(agentId || '').trim()
+  if (!aid) return
+  const a = (agents.value || []).find((x) => x.agent_id === aid) || { agent_id: aid, hostname: aid }
+  openHost(a)
+  const m = String(mod || '').trim()
+  if (m) {
+    const hit = HOST_TAB_GROUPS.find((g) => g.mods.includes(m))
+    if (hit) hostTabGroup.value = hit.id
+    loadSnap(m)
+  }
+}
 const snapRow = ref(null)
 const snapQ = ref('')
+const snapPage = ref(1)
+const snapPageSize = ref(50)
+let snapLoadRevision = 0
 const snapView = ref('hide_noise') // all | risk | hide_noise
 const dlBusy = ref(false)
 const dlProgress = ref('')
 const dlError = ref('')
+const deploymentAddress = ref({})
+async function loadDeploymentAddress() {
+  try {
+    deploymentAddress.value = await edrGetSettings()
+  } catch {
+    deploymentAddress.value = { server_url_error: '无法读取平台接入地址，请刷新重试。' }
+  }
+}
+/** 地址变更后必须重拉 release，否则下载按钮仍停在旧状态，要靠切换架构才触发。 */
+async function refreshDeployAddress() {
+  await loadDeploymentAddress()
+  await loadRelease()
+}
+async function loadDeployPage() {
+  await Promise.all([loadDeploymentAddress(), loadCredentials()])
+  await loadRelease()
+}
 const release = ref(null)
+const releaseLoadError = ref('')
+const releaseArch = ref('amd64')
+let releaseRequest = 0
 const releaseBusy = ref(false)
 const RELEASE_LABELS = {
   latest: '最新构建', stale: '源码已更新，EXE 过期', mismatch: 'EXE 与清单不一致',
   unverified: '无构建清单，无法验证', missing: '缺少 EXE',
 }
 const releaseLabel = computed(() => RELEASE_LABELS[release.value?.status] || release.value?.status || '—')
+const windowsDownloadBlocked = computed(() => {
+  if (!isAdmin.value) return '下载安装包需要管理员权限。'
+  if (!deploymentAddress.value.effective_server_url) return deploymentAddress.value.server_url_error || '平台接入地址尚未就绪。'
+  if (releaseLoadError.value) return '无法确认发布状态，下载已暂停。'
+  if (!release.value) return '尚未取得发布状态。'
+  if (!release.value.integrity_verified || !['latest', 'stale'].includes(release.value.status)) return `发布完整性未通过（${releaseLabel.value}），下载已暂停。`
+  return ''
+})
 let releaseTimer = null
 async function loadRelease() {
+  const arch = releaseArch.value
+  const request = ++releaseRequest
+  // 保留上一份 release，避免置空后按钮短暂不可用 / 被并发请求取消后一直空白
+  releaseLoadError.value = ''
   try {
-    release.value = await getAgentRelease()
+    const result = await getAgentRelease(arch)
+    if (request !== releaseRequest || arch !== releaseArch.value) return
+    release.value = result
+    // 发布接口也带回地址状态；若独立 settings 尚未返回，用 release 侧地址补齐
+    if (result?.effective_server_url && !deploymentAddress.value.effective_server_url) {
+      deploymentAddress.value = {
+        ...deploymentAddress.value,
+        effective_server_url: result.effective_server_url,
+        server_url_source: result.server_url_source || deploymentAddress.value.server_url_source,
+        server_url_error: result.server_url_error || '',
+      }
+    }
     if (release.value?.building && !releaseTimer) {
       releaseTimer = setInterval(async () => {
         await loadRelease()
         if (!release.value?.building) { clearInterval(releaseTimer); releaseTimer = null }
       }, 2500)
     }
-  } catch { /* 非管理员或未启动：忽略 */ }
+  } catch (error) {
+    if (request === releaseRequest && arch === releaseArch.value) {
+      releaseLoadError.value = error?.message || '发布状态请求失败'
+    }
+  }
 }
 async function doBuildRelease() {
   releaseBusy.value = true
   dlError.value = ''
   try {
-    await buildAgentRelease()
+    await buildAgentRelease(releaseArch.value)
     okMsg.value = '已开始在服务器构建 Agent'
     setTimeout(() => { okMsg.value = '' }, 2500)
     await loadRelease()
@@ -6530,15 +5467,39 @@ onUnmounted(() => { if (releaseTimer) clearInterval(releaseTimer) })
 // ---- 终端凭据 / 健康 ----
 const credSummary = ref(null)
 const credBusy = ref(false)
+const credLoadError = ref('')
+function normalizeCredSummary(r) {
+  return {
+    total: Number(r?.total || 0),
+    with_secret: Number(r?.with_secret || 0),
+    revoked: Number(r?.revoked || 0),
+    allow_shared_key: r?.allow_shared_key !== false,
+  }
+}
 async function loadCredentials() {
-  try { credSummary.value = await getAgentCredentials() } catch { /* 非管理员：忽略 */ }
+  credLoadError.value = ''
+  credBusy.value = true
+  try {
+    credSummary.value = normalizeCredSummary(await getAgentCredentials())
+  } catch (e) {
+    credSummary.value = null
+    if (isAdmin.value) credLoadError.value = e?.message || '无法加载终端凭据'
+  } finally {
+    credBusy.value = false
+  }
 }
 async function toggleSharedKey() {
   if (!credSummary.value) return
   const next = !credSummary.value.allow_shared_key
   if (!next && !window.confirm('关闭后，已持有专属凭据的终端不受影响；但仍在用共享密钥的老终端将无法上报，确认关闭？')) return
   credBusy.value = true
-  try { credSummary.value = await setSharedKeyPolicy(next) } catch (e) { error.value = e?.message || String(e) } finally { credBusy.value = false }
+  try {
+    credSummary.value = normalizeCredSummary(await setSharedKeyPolicy(next))
+  } catch (e) {
+    error.value = e?.message || String(e)
+  } finally {
+    credBusy.value = false
+  }
 }
 async function toggleRevoke(a) {
   if (!a) return
@@ -6549,136 +5510,11 @@ async function toggleRevoke(a) {
     await Promise.all([softRefresh(), loadCredentials()])
   } catch (e) { error.value = e?.message || String(e) }
 }
-function healthChips(a) {
-  const h = a?.health || {}
-  if (!h || !Object.keys(h).length) return []
-  const o = h.outbox || {}
-  const chips = []
-  if (h.cpu_pct != null) chips.push({ k: 'CPU', v: `${Number(h.cpu_pct).toFixed(1)}%`, warn: h.cpu_pct > 5 })
-  if (h.rss_mb != null) chips.push({ k: '内存', v: `${Number(h.rss_mb).toFixed(0)} MB`, warn: h.rss_mb > 250 })
-  if (o.depth != null) chips.push({ k: '待发队列', v: `${o.depth}`, warn: o.depth > 5000 })
-  if (o.dropped) chips.push({ k: '已丢弃', v: `${o.dropped}`, warn: true })
-  if (o.rejected) chips.push({ k: '被拒', v: `${o.rejected}`, warn: true })
-  if (h.protocol) chips.push({ k: '协议', v: `v${h.protocol}`, warn: false })
-  if (h.auth) chips.push({ k: '鉴权', v: h.auth === 'agent_secret' ? '专属凭据' : '共享密钥', warn: h.auth !== 'agent_secret' })
-  if (a?.clock_skew_sec != null && Math.abs(a.clock_skew_sec) > 60) chips.push({ k: '时钟偏差', v: `${Math.round(a.clock_skew_sec)}s`, warn: true })
-  const pol = h.policy
-  if (pol && typeof pol === 'object') {
-    const st = POLICY_STATUS_LABELS[pol.status] || pol.status
-    chips.push({ k: '策略', v: `rev ${pol.applied_rev || '—'} · ${st}`, warn: pol.status === 'rejected' || pol.status === 'rolled_back', title: pol.error || '' })
-  }
-  const cs = h.sensors?.capture_status || h.capture_status
-  if (cs && typeof cs === 'object') {
-    if (cs.entities_rev != null) chips.push({ k: '实体 rev', v: String(cs.entities_rev), warn: false })
-  }
-  return chips
-}
-
-function captureStatusOf(agent) {
-  const h = agent?.health || {}
-  return h.sensors?.capture_status || h.capture_status || {}
-}
-
-function hostSensorsPanel(agent) {
-  const s = agent?.health?.sensors || {}
-  const ch = s.capture_health || {}
-  const pipe = s.sensor_pipeline || {}
-  const tele = s.telemetry || {}
-  const disks = s.host_metrics?.disks
-  let diskLine = ''
-  if (Array.isArray(disks) && disks.length) {
-    const worst = disks.reduce((a, b) => ((a?.used_pct || 0) > (b?.used_pct || 0) ? a : b))
-    if (worst?.mount) diskLine = `${worst.mount}${worst.used_pct}%`
-  }
-  const outbox = agent?.health?.outbox || {}
-  const byKind = outbox.by_kind || s.outbox?.by_kind || null
-  let byKindLine = ''
-  if (byKind && typeof byKind === 'object') {
-    byKindLine = Object.entries(byKind)
-      .sort((a, b) => (b[1] || 0) - (a[1] || 0))
-      .slice(0, 6)
-      .map(([k, v]) => `${k}:${v}`)
-      .join(' ')
-  }
-  const net = s.host_metrics?.net_io || {}
-  let netLine = ''
-  if (net.nic_in_bytes != null || net.nic_out_bytes != null) {
-    const fmt = (n) => {
-      const x = Number(n) || 0
-      if (x > 1e9) return `${(x / 1e9).toFixed(1)}G`
-      if (x > 1e6) return `${(x / 1e6).toFixed(1)}M`
-      if (x > 1e3) return `${(x / 1e3).toFixed(0)}K`
-      return String(x)
-    }
-    netLine = `NIC ↓${fmt(net.nic_in_bytes)} ↑${fmt(net.nic_out_bytes)}`
-  } else if (net.tcp_curr_estab != null) {
-    netLine = `tcp estab ${net.tcp_curr_estab}`
-  }
-  const cs = captureStatusOf(agent)
-  const statusChips = []
-  if (cs?.etw_session_ok) statusChips.push({ label: 'ETW 正常', ok: true })
-  else if (cs && Object.keys(cs).length) statusChips.push({ label: 'ETW 回退 Winlog', warn: true })
-  if (cs && Object.keys(cs).length) {
-    statusChips.push(cs.audit_4688_enabled
-      ? { label: '4688 已开', ok: true }
-      : { label: '4688 未开', warn: true, title: '进程创建审计未开，命令行补全可能不足' })
-    statusChips.push(cs.sysmon_present
-      ? { label: 'Sysmon', ok: true }
-      : { label: '无 Sysmon', title: '可选增强' })
-  }
-  if (s.elastic_parity?.defend_kernel_tier === false) {
-    statusChips.push({ label: '非 Defend 内核档', title: '对齐 Elastic Agent 编排，非 Defend 内核传感器' })
-  }
-  let channelChips = []
-  const manifest = s.winevent_manifest
-  if (Array.isArray(manifest) && manifest.length) channelChips = manifest.slice(0, 16)
-  else if (typeof s.winevent_channels === 'number' && s.winevent_channels > 0) {
-    channelChips = [`${s.winevent_channels} 通道`]
-  }
-  return {
-    score: ch.score ?? null,
-    level: ch.level || 'good',
-    advise: ch.advise || [],
-    pipeline: [pipe.primary, pipe.secondary].filter(Boolean).join('+') || s.etw || '—',
-    cmdFill: tele.proc_cmd_fill_pct,
-    disks: diskLine,
-    byKind,
-    byKindLine,
-    netIo: net,
-    netLine,
-    parity: s.elastic_parity || null,
-    statusChips,
-    channelChips,
-  }
-}
-
-function captureCaptureHint(agent) {
-  const cs = captureStatusOf(agent)
-  if (!cs || !Object.keys(cs).length) return ''
-  const parts = []
-  const pipe = agent?.health?.sensors?.sensor_pipeline || agent?.health?.fleet?.sensor_pipeline
-  if (pipe?.primary) parts.push(`主:${pipe.primary}`)
-  if (pipe?.secondary) parts.push(`辅:${pipe.secondary}`)
-  const tele = agent?.health?.sensors?.telemetry || agent?.health?.fleet?.telemetry
-  if (tele?.proc_cmd_fill_pct != null) parts.push(`cmd填充 ${tele.proc_cmd_fill_pct}%`)
-  if (cs.etw_session_ok) parts.push('ETW 正常')
-  else parts.push('ETW 未就绪，Winlog 补偿')
-  parts.push(cs.audit_4688_enabled ? '4688 审计已开' : '4688 未开')
-  parts.push(cs.sysmon_present ? 'Sysmon 已装' : '未检测到 Sysmon')
-  const ch = agent?.health?.sensors?.winevent_channels
-  if (ch) parts.push(`Winlog通道 ${ch}`)
-  const manifest = agent?.health?.sensors?.winevent_manifest
-  if (Array.isArray(manifest) && manifest.length) parts.push(manifest.join('+'))
-  const disks = agent?.health?.sensors?.host_metrics?.disks
-  if (Array.isArray(disks) && disks.length) {
-    const worst = disks.reduce((a, b) => ((a?.used_pct || 0) > (b?.used_pct || 0) ? a : b))
-    if (worst?.mount) parts.push(`盘 ${worst.mount} ${worst.used_pct}%`)
-  }
-  const ep = agent?.health?.sensors?.elastic_parity
-  if (ep?.defend_kernel_tier === false) parts.push('非Defend内核档')
-  return parts.join(' · ')
-}
-
+const healthChips = fleetHealthChips
+const captureStatusOf = fleetCaptureStatusOf
+const hostSensorsPanel = fleetHostSensorsPanel
+const captureCaptureHint = fleetCaptureCaptureHint
+const hostQuickStats = fleetHostQuickStats
 function componentHealthChips(agent) {
   const raw = agent?.health?.sensors?.components || agent?.health?.components || []
   if (!Array.isArray(raw)) return []
@@ -6691,28 +5527,11 @@ function componentHealthChips(agent) {
 function componentWarnChips(agent) {
   return componentHealthChips(agent).filter((c) => c.state !== 'OK')
 }
-function hostQuickStats(agent) {
-  return healthChips(agent).filter((c) => ['CPU', '内存', '待发队列', '已丢弃', '被拒', '时钟偏差'].includes(c.k))
-}
 const hostHdrMore = ref(false)
 const hostHealthOpen = ref(false)
-const events = ref([])
-const allEvents = ref([])
-const eventAgentId = ref('')
-const focusKey = ref('')
-const eventQName = ref('')
-const eventIocQ = ref('')
-const eventGroupId = ref('')
-const eventTypeFilter = ref('')
-/** 点「查询」后生效的筛选快照 */
-const eventFiltersOn = ref({ name: '', ioc: '', group: '', type: '', sev: '' })
-const openEventCount = ref(0)
 const liveOk = ref(false)
 const lastSyncAt = ref(0)
 const nowTick = ref(Date.now())
-// 默认按首次发现，避免 hit_count/updated_at 上涨时整表跳动
-const eventSort = ref({ key: 'created_at', dir: 'desc' })
-const eventSevFilter = ref('')
 const behaviorCat = ref('')
 const behaviorSev = ref('')
 const bhNature = ref('')
@@ -6723,14 +5542,8 @@ const bhTactic = ref('')
 const bhAgentId = ref('')
 const bhPage = ref(1)
 const bhPageSize = ref(20)
-const selectedEventIds = ref([])
 const respBusy = ref(false)
 const diagBusy = ref(false)
-const respCommands = ref([])
-const respToast = ref(null)
-let respToastTimer = null
-let respToastCmdKey = ''
-let respPollTimer = null
 const timelineItems = ref([])
 const timelineKinds = ref({})
 const timelineTotal = ref(0)
@@ -6738,10 +5551,22 @@ const tlAgentId = ref('')
 const tlQ = ref('')
 const tlTypeFilter = ref('')
 const tlOpenId = ref(null)
-const huntQ = ref('')
-const huntHits = ref([])
-const huntBusy = ref(false)
-const huntDone = ref(false)
+const {
+  huntQ,
+  huntHits,
+  huntBusy,
+  huntDone,
+  runHunt,
+  openHuntHit,
+} = useHunt({
+  error,
+  agents,
+  labels: LABELS,
+  setModule: (m) => { module.value = m },
+  openEvent: (e) => openEvent(e),
+  openHost: (a, d) => openHost(a, d),
+  openTimelineFor: (id) => openTimelineFor(id),
+})
 const invQ = ref('')
 const invRange = ref('1h')
 const invBusy = ref(false)
@@ -6749,11 +5574,21 @@ const invItems = ref([])
 const invCounts = ref({ all: 0, threat: 0, risk: 0, minor: 0, surface: 0 })
 const invHist = ref([])
 const invFacets = ref({ etype: [], hostname: [] })
-const invFilters = ref({ nature: '', etype: '', hostname: '', path: '', hash_q: '', entity: '', tactic: '', os: '' })
+const invFilters = ref({ nature: '', etype: '', hostname: '', path: '', hash_q: '', entity: '', tactic: '', os: '', source: '', event_id: '', topic: '' })
 const invNatureTab = ref('')
 const invMoreFilters = ref(false)
-/** 默认开启：压掉 info/low 普通 process_create，否则列表易被进程创建占满 */
-const invHideProcNoise = ref(true)
+const INV_TOPIC_CHIPS = [
+  { id: 'file_create', label: '文件创建' },
+  { id: 'startup', label: '启动项' },
+  { id: 'task', label: '计划任务' },
+  { id: 'service', label: '服务' },
+]
+/** 已取消「隐藏普通进程创建」：默认展示全部时间线 */
+const invHideProcNoise = ref(false)
+const invSysmonFileOn = computed(() => {
+  const f = invFilters.value
+  return f.topic === 'file_create' || f.etype === 'file_create' || (f.source === 'sysmon' && (f.event_id === '11' || f.topic === 'file_create'))
+})
 const invDetail = ref(null)
 const invDetailId = ref(null)
 const invDetailTab = ref('info')
@@ -6777,16 +5612,94 @@ const policyForm = ref({
   winevent_channel_mode: 'all',
   winevent_channels_text: '',
   intervals_sec: { process: 5, network: 5, file: 12 },
-  remote_ops_enabled: true,
-  remote_ops_read_only: false,
-  remote_ops_run_cmd: true,
-  remote_ops_shell: true,
 })
 const iocItems = ref([])
 const iocText = ref('')
-const iocType = ref('hash')
+const iocType = ref('auto')
+const iocAddBusy = ref(false)
+const iocForm = ref({ value: '', type: 'auto', name: '', severity: 'high' })
+const iocDetectedType = ref('')
+
+const IOC_TYPE_LABELS = {
+  auto: '自动识别', hash: '文件哈希', ip: 'IP', domain: '域名',
+  path: '路径 / URL', process: '进程名', cmdline: '命令行', file_hash: '文件哈希',
+}
+function iocTypeLabel(t) {
+  return IOC_TYPE_LABELS[t] || t || '—'
+}
+function detectIocTypeLocal(value) {
+  const v = String(value || '').trim().replace(/^["']|["']$/g, '')
+  if (!v) return ''
+  const low = v.toLowerCase()
+  if (/^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$/.test(v)) return 'hash'
+  if (/^(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?$/.test(v)) return 'ip'
+  if (/^https?:\/\//i.test(v) || /^ftp:\/\//i.test(v)) return 'path'
+  const procExt = /\.(exe|dll|sys|bat|cmd|ps1|vbs|js|msi|scr)$/i
+  if ((v.includes('\\') || (v.startsWith('/') && v.includes('/', 1))) && !/\s/.test(v)) {
+    const base = v.replace(/\//g, '\\').split('\\').pop() || ''
+    return procExt.test(base) ? 'process' : 'path'
+  }
+  if (/\s/.test(v) || /powershell|cmd\.exe| -|\/c /i.test(v)) return 'cmdline'
+  if (procExt.test(v)) return 'process'
+  if (/^[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+\.?$/.test(v)) return 'domain'
+  return 'process'
+}
+const iocResolvedType = computed(() => {
+  if (iocForm.value.type && iocForm.value.type !== 'auto') return iocForm.value.type
+  return iocDetectedType.value || detectIocTypeLocal(iocForm.value.value) || 'process'
+})
+const iocPreviewValue = computed(() => {
+  let v = String(iocForm.value.value || '').trim()
+  if (iocResolvedType.value === 'process') {
+    v = v.replace(/\//g, '\\')
+    if (v.includes('\\')) v = v.split('\\').pop() || v
+  }
+  if (iocResolvedType.value === 'ip' && /^\d+\.\d+\.\d+\.\d+:\d+$/.test(v)) v = v.split(':')[0]
+  return v
+})
+const iocDetectHint = computed(() => {
+  if (iocForm.value.type !== 'auto') return '已手动指定'
+  const t = iocResolvedType.value
+  return t ? `识别为 ${iocTypeLabel(t)}` : '输入后自动识别'
+})
+let iocDetectTimer = null
+function onIocValueInput() {
+  const v = iocForm.value.value
+  iocDetectedType.value = detectIocTypeLocal(v)
+  if (iocDetectTimer) clearTimeout(iocDetectTimer)
+  if (!String(v || '').trim()) return
+  iocDetectTimer = setTimeout(async () => {
+    try {
+      const r = await detectIoc(v)
+      if (r?.ioc_type && String(iocForm.value.value || '').trim() === String(v || '').trim()) {
+        iocDetectedType.value = r.ioc_type
+      }
+    } catch { /* 本地启发式已够用 */ }
+  }, 280)
+}
 const iocLib = ref(null)
 const iocLibLocal = ref(0)
+const iocLibPreviewRows = ref([])
+const iocLibPreviewType = ref('')
+const iocLibPreviewOffset = ref(0)
+const iocLibPreviewTotal = ref(0)
+const iocLibPreviewDbTotal = ref(0)
+const iocLibPreviewBusy = ref(false)
+const threatAiBusy = ref(false)
+const threatAiRefining = ref(false)
+const threatAiResult = ref(null)
+const threatAiError = ref('')
+const threatAiSummary = computed(() => {
+  const r = threatAiResult.value?.result || {}
+  const md = r.markdown || r.summary || r.abstract || ''
+  if (md) return String(md).slice(0, 2400)
+  const report = r.report || {}
+  return String(report.abstract || report.summary || '').slice(0, 2400)
+})
+const iocLookupQ = ref('')
+const iocLookupType = ref('')
+const iocLookupHits = ref([])
+const iocLookupBusy = ref(false)
 const attckCols = ref([])
 const attckTop = ref([])
 const attckHeat = ref([])
@@ -6962,38 +5875,22 @@ let stopStream = null
 let liveTickTimer = null
 const agentServerUrl = ref('')
 const saving = ref(false)
-const activeEvent = ref(null)
-const threatTab = ref('graph')
-const threatTree = ref(null)
-const threatTreeBusy = ref(false)
-const tvTreeExpanded = ref({})
-const tvShowDotted = ref(true)
-const tvReadable = ref(true)
-const tvZoom = ref(1)
-const threatPanelNode = ref('hit')
 const ruleStats = ref(null)
 const agentRules = ref([])
-const rulesFilter = ref('all') // all | sensor | custom | elastic
+const rulesFilter = ref('all') // all | sensor | windows | linux | elastic
 const rulesBulkBusy = ref(false)
 const settingsRulesFilter = ref('all')
-const filteredAgentRules = computed(() => {
-  const all = agentRules.value || []
-  if (rulesFilter.value === 'sensor') return all.filter((r) => r.builtin || r.source === 'sensor')
-  if (rulesFilter.value === 'custom') return all.filter((r) => !(r.builtin || r.source === 'sensor'))
-  if (rulesFilter.value === 'elastic') return all.filter((r) => isElasticRule(r))
-  return all
-})
+const abfileRules = computed(() => (agentRules.value || []).filter(isAbfileRule))
+const detectRulesCount = computed(() => (agentRules.value || []).filter((r) => !isAbfileRule(r)).length)
+const filteredAgentRules = computed(() => filterAgentRules(agentRules.value, rulesFilter.value))
+const groupedAgentRules = computed(() => groupAgentRules(filteredAgentRules.value))
+const linuxRuleCount = computed(() => linuxRuleCountsOf(agentRules.value).total)
 const ruleStatsItems = computed(() => {
   const fromStats = ruleStats.value?.items
   if (Array.isArray(fromStats) && fromStats.length) return fromStats
   return agentRules.value || []
 })
-const filteredSettingsRules = computed(() => {
-  const all = ruleStatsItems.value || []
-  if (settingsRulesFilter.value === 'sensor') return all.filter((r) => r.builtin || r.source === 'sensor')
-  if (settingsRulesFilter.value === 'custom') return all.filter((r) => !(r.builtin || r.source === 'sensor'))
-  return all
-})
+const filteredSettingsRules = computed(() => filterSettingsRules(ruleStatsItems.value, settingsRulesFilter.value))
 const editingRule = ref(null)
 const ruleCreating = ref(false)
 const ruleSaving = ref(false)
@@ -7022,6 +5919,10 @@ const memoryYaraBusy = ref(false)
 const memoryYaraErr = ref('')
 const memoryYaraControlsBusy = ref(false)
 const MEMORY_YARA_GROUP_KEYS = ['protections_yara', 'builtin_yara', 'valhalla_yara', 'string_rules']
+const logRulesPack = ref(null)
+const logRulesBusy = ref(false)
+const logRulesErr = ref('')
+const logRulesControlsBusy = ref(false)
 const overviewStats = ref({})
 const fleetDriftByAgent = ref({})
 const UPGRADE_STATE_LABELS = {
@@ -7058,8 +5959,8 @@ const AGENT_INTEGRATION_GROUPS = [
   {
     id: 'collect',
     title: '端上 · 采集与监控',
-    hint: 'ETW 为主通道；WMI 进程订阅默认关闭，可按需打开。',
-    keys: ['etw', 'winevent', 'wmi_process', 'fim', 'registry'],
+    hint: 'Windows 使用 ETW/Winlog；Linux 使用 Journald 定向安全日志。WMI 默认关闭。',
+    keys: ['etw', 'winevent', 'wmi_process', 'fim', 'registry', 'linux_journal'],
   },
   {
     id: 'compliance',
@@ -7087,16 +5988,6 @@ function emptyRuleForm() {
     note: '',
     etype: '',
   }
-}
-
-function isElasticRule(r) {
-  if (!r) return false
-  if (r.source === 'elastic') return true
-  const id = String(r.id || '')
-  if (id.startsWith('elastic-')) return true
-  if (r.elastic_rule_id) return true
-  const note = String(r.note || '')
-  return note.startsWith('Elastic:') || note.startsWith('Elastic EVM')
 }
 
 const isEditingSensor = computed(() => !!(
@@ -7151,25 +6042,7 @@ const fieldsSet = computed(() => new Set(
   String(ruleForm.value.fieldsText || '').split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean),
 ))
 
-const onlineCount = computed(() => agents.value.filter((a) => a.online).length)
-/** 概览顶栏终端数以实时 agents 为准（overviewStats 仅定时刷新，避免新上线主机要手动 F5） */
-const ovAgentTotal = computed(() => agents.value.length)
-
-function sparklinePoints(buckets, w = 120, h = 32) {
-  const arr = Array.isArray(buckets) ? buckets : []
-  if (!arr.length) return ''
-  const max = Math.max(...arr, 1)
-  return arr
-    .map((v, i) => {
-      const x = (i / Math.max(arr.length - 1, 1)) * w
-      const y = h - (Number(v) / max) * (h - 6) - 3
-      return `${x.toFixed(1)},${y.toFixed(1)}`
-    })
-    .join(' ')
-}
-const overviewSparkTl = computed(() => sparklinePoints(overviewStats.value?.timeline_24h?.buckets))
-const overviewSparkDns = computed(() => sparklinePoints(overviewStats.value?.dns_24h?.buckets))
-const overviewTopMalware = computed(() => overviewStats.value?.threats?.top_malware || [])
+const { onlineCount, ovAgentTotal, overviewSparkTl, overviewSparkDns, overviewTopMalware, recentThreats, ovStatus, ovSevDist, ovTrend, ovTopHosts } = useOverviewDisplay({ agents, allEvents, overviewStats })
 
 async function loadOverview() {
   try {
@@ -7189,33 +6062,6 @@ async function loadOverview() {
   }
   loadAgentSyncManifest({ silent: true }).catch(() => {})
 }
-
-const ovOnlineCaptureHint = computed(() => {
-  const online = agents.value.filter((a) => a.online)
-  if (!online.length) return ''
-  let etwBad = 0
-  let no4688 = 0
-  for (const a of online) {
-    const cs = captureStatusOf(a)
-    if (cs.etw_session_ok === false) etwBad++
-    if (cs.audit_4688_enabled === false) no4688++
-  }
-  const parts = []
-  if (etwBad) parts.push(`${etwBad} 台 ETW 未就绪`)
-  if (no4688) parts.push(`${no4688} 台未开 4688 审计`)
-  if (!parts.length) return '在线终端采集通道正常（ETW / 事件日志）'
-  return parts.join(' · ') + '，命令行可能不全'
-})
-
-const ovDriftHint = computed(() => {
-  const n = overviewStats.value?.agents?.component_drift ?? 0
-  const p = overviewStats.value?.agents?.policy_drift ?? 0
-  if (!n && !p) return ''
-  const parts = []
-  if (n) parts.push(`${n} 台在线终端组件 expected/actual 漂移`)
-  if (p) parts.push(`${p} 台 PolicyApplied 未收敛`)
-  return parts.join(' · ') + '（见灰度升级页或终端详情）'
-})
 
 function agentDriftRow(agentId) {
   return fleetDriftByAgent.value?.[agentId] || null
@@ -7297,49 +6143,6 @@ const filteredAgents = computed(() => {
   const s = q.value.trim().toLowerCase()
   if (!s) return agents.value
   return agents.value.filter((a) => `${a.hostname || ''} ${a.ip || ''} ${a.agent_id || ''}`.toLowerCase().includes(s))
-})
-const recentThreats = computed(() => allEvents.value.slice(0, 8))
-const ovStatus = computed(() => {
-  const out = { open: 0, closed: 0, ignored: 0 }
-  for (const e of allEvents.value) out[e.status in out ? e.status : 'open'] += 1
-  return out
-})
-const ovSevDist = computed(() => {
-  const defs = [['critical', '严重'], ['high', '高危'], ['medium', '中危'], ['low', '低危'], ['info', '信息']]
-  const cnt = Object.fromEntries(defs.map(([k]) => [k, 0]))
-  for (const e of allEvents.value) if (e.severity in cnt) cnt[e.severity] += 1
-  const max = Math.max(1, ...Object.values(cnt))
-  return defs.map(([key, label]) => ({ key, label, count: cnt[key], pct: Math.round((cnt[key] / max) * 100) }))
-})
-const ovTrend = computed(() => {
-  const days = []
-  const now = new Date()
-  for (let i = 6; i >= 0; i -= 1) {
-    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i)
-    const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-    days.push({ day, label: `${d.getMonth() + 1}/${d.getDate()}`, count: 0, high: 0 })
-  }
-  const idx = Object.fromEntries(days.map((d, i) => [d.day, i]))
-  let total = 0
-  for (const e of allEvents.value) {
-    const i = idx[String(e.created_at || '').slice(0, 10)]
-    if (i == null) continue
-    days[i].count += 1
-    total += 1
-    if (e.severity === 'high' || e.severity === 'critical') days[i].high += 1
-  }
-  const max = Math.max(1, ...days.map((d) => d.count))
-  return { total, days: days.map((d) => ({ ...d, pct: Math.round((d.count / max) * 100), hpct: Math.round((d.high / max) * 100) })) }
-})
-const ovTopHosts = computed(() => {
-  const m = new Map()
-  for (const e of allEvents.value) {
-    const r = m.get(e.agent_id) || { agent_id: e.agent_id, hostname: e.hostname || short(e.agent_id), count: 0, high: 0 }
-    r.count += 1
-    if (e.severity === 'high' || e.severity === 'critical') r.high += 1
-    m.set(e.agent_id, r)
-  }
-  return [...m.values()].sort((a, b) => b.high - a.high || b.count - a.count).slice(0, 5)
 })
 const ovTactics = computed(() => {
   const cnt = {}
@@ -7502,25 +6305,15 @@ function behaviorKind(e) {
 }
 const recentRiskTimeline = computed(() => {
   const sevOk = new Set(['critical', 'high', 'medium'])
+  const known = new Set((agents.value || []).map((a) => a.agent_id).filter(Boolean))
   return (timelineItems.value || [])
-    .filter((t) => sevOk.has(String(t.severity || '').toLowerCase()))
+    .filter((t) => known.has(t.agent_id) && sevOk.has(String(t.severity || '').toLowerCase()))
     .slice(0, 8)
 })
 function selectHostGroup(gid) {
   const g = HOST_TAB_GROUPS.find((x) => x.id === gid)
   if (!g) return
   hostTabGroup.value = gid
-  if (gid === 'remote') {
-    loadHostRemoteCommands()
-    if (hostRemoteSubTab.value === 'files' && selected.value?.online) hostRemoteFsLoadVolumes()
-    if (hostRemoteSubTab.value === 'livequery') loadLiveQueryAudit()
-    if (hostRemoteShellPhase.value === 'connecting') {
-      hostRemoteShellPhase.value = 'idle'
-      hostRemoteShellHint.value = '上次连接未完成，请重新点击「连接 Shell」'
-      hostRemoteShellHintKind.value = 'warn'
-    }
-    return
-  }
   if (gid === 'inventory') snapView.value = 'all'
   const cur = module.value
   if (g.mods.length && !g.mods.includes(cur)) {
@@ -7528,16 +6321,11 @@ function selectHostGroup(gid) {
   }
 }
 function syncHostTabGroup(mod) {
-  if (hostTabGroup.value === 'remote') return
   const hit = HOST_TAB_GROUPS.find((g) => g.mods.includes(mod))
   if (hit) hostTabGroup.value = hit.id
 }
 
 function refreshHostDetail() {
-  if (hostTabGroup.value === 'remote') {
-    loadHostRemoteCommands()
-    return
-  }
   loadSnap(module.value)
 }
 const hostsWithAlert = computed(() => {
@@ -7634,11 +6422,6 @@ function openHostRiskItem(it) {
 function agentIp(agentId) {
   return agents.value.find((a) => a.agent_id === agentId)?.ip || '—'
 }
-function shortPath(p) {
-  const s = String(p || '')
-  if (s.length <= 48) return s || '—'
-  return `…${s.slice(-46)}`
-}
 const ruleCountLabel = computed(() => {
   const n = ruleStats.value?.enabled ?? agentRules.value.filter((r) => r.enabled).length
   return n != null ? String(n) : '—'
@@ -7720,26 +6503,57 @@ const malwareFileStats = computed(() => {
     total: list.length,
     hosts: new Set(list.map((e) => e.agent_id)).size,
     high: list.filter((e) => e.severity === 'critical' || e.severity === 'high').length,
+    hostIds: [...new Set(list.map((e) => e.agent_id).filter(Boolean))],
   }
 })
+const malwareStatFocus = ref('')
+function onMalwareStatClick(kind) {
+  if (malwareStatFocus.value === kind) {
+    malwareStatFocus.value = ''
+    if (kind === 'high') eventSevFilter.value = ''
+    if (kind === 'hosts' || kind === 'all') eventAgentId.value = ''
+    return
+  }
+  malwareStatFocus.value = kind
+  if (kind === 'all') {
+    eventSevFilter.value = ''
+    eventAgentId.value = ''
+  } else if (kind === 'high') {
+    eventSevFilter.value = ''
+    eventAgentId.value = ''
+  } else if (kind === 'hosts') {
+    eventSevFilter.value = ''
+    const ids = malwareFileStats.value.hostIds || []
+    eventAgentId.value = ids.length === 1 ? ids[0] : ''
+  }
+  evtPage.value = 1
+}
 const eventFiltersActive = computed(() => {
   const on = eventFiltersOn.value || {}
   return Boolean(
     eventAgentId.value
     || focusKey.value
     || on.name || on.ioc || on.group || on.type || on.sev
-    || (page.value === 'malware' && eventSevFilter.value),
+    || (page.value === 'malware' && eventSevFilter.value)
+    || eventListScope.value,
   )
 })
+const eventServerTotal = ref(null)
+const eventWorkingSetIncomplete = computed(() => eventServerTotal.value == null ? allEvents.value.length >= 500 : eventServerTotal.value > allEvents.value.length)
 const filteredEvents = computed(() => {
   let list = [...events.value].filter((e) => e.status !== 'ignored')
   if (page.value === 'malware') list = list.filter(isMalwareFileEvent)
+  if (eventListScope.value) list = list.filter((e) => eventMatchesListScope(e, eventListScope.value))
   if (eventAgentId.value) list = list.filter((e) => e.agent_id === eventAgentId.value)
   const on = eventFiltersOn.value || {}
   const typeKey = on.type || focusKey.value
   if (typeKey && page.value !== 'malware') list = list.filter((e) => catOf(e) === typeKey)
-  const sev = on.sev || (page.value === 'malware' ? eventSevFilter.value : '')
-  if (sev) list = list.filter((e) => e.severity === sev)
+  if (page.value === 'malware' && malwareStatFocus.value === 'high') {
+    list = list.filter((e) => e.severity === 'critical' || e.severity === 'high')
+  } else {
+    const sev = on.sev || (page.value === 'malware' ? eventSevFilter.value : '')
+    if (sev) list = list.filter((e) => e.severity === sev)
+  }
   if (on.group) {
     const g = (groupItems.value || []).find((x) => String(x.id) === String(on.group))
     const ids = new Set((g?.agent_ids || []).map(String))
@@ -7792,10 +6606,17 @@ watch([
   () => focusKey.value,
   () => eventSevFilter.value,
   () => eventFiltersOn.value,
+  () => eventListScope.value,
   () => eventSort.value.key,
   () => eventSort.value.dir,
 ], () => {
   evtPage.value = 1
+})
+watch(() => eventSevFilter.value, (sev) => {
+  if (sev && malwareStatFocus.value === 'high') malwareStatFocus.value = ''
+})
+watch(page, (id) => {
+  if (id !== 'malware' && malwareStatFocus.value) malwareStatFocus.value = ''
 })
 watch(filteredEvents, () => {
   if (evtPage.value > evtPageCount.value) evtPage.value = evtPageCount.value
@@ -8400,19 +7221,24 @@ function mergeThreatEvidenceEnrich(partial) {
 async function enrichThreatFromProcessDb(agentId, flat) {
   const aid = String(agentId || '').trim()
   if (!aid || !flat) return
+  const eventId = activeEvent.value?.id
+  const epoch = threatOpenEpoch
+  const current = () => epoch === threatOpenEpoch && page.value === 'threat-view' && activeEvent.value?.id === eventId
   const pid = flat.pid != null && flat.pid !== '' ? String(flat.pid) : ''
   const ppid = flat.ppid != null && flat.ppid !== '' ? String(flat.ppid) : ''
   try {
     if (pid) {
       const r = await listProcessEntities(aid, { q: pid })
+      if (!current()) return
       const items = r?.items || []
-      const hit = items.find((row) => String(row.pid) === pid) || items[0]
+      const hit = items.find((row) => String(row.pid) === pid)
       if (hit) mergeThreatEvidenceEnrich(pickProcessSnapFields(hit))
     }
     if (ppid) {
       const r = await listProcessEntities(aid, { q: ppid })
+      if (!current()) return
       const items = r?.items || []
-      const par = items.find((row) => String(row.pid) === ppid) || items[0]
+      const par = items.find((row) => String(row.pid) === ppid)
       if (par?.name) mergeThreatEvidenceEnrich({ parent_name: par.name })
     }
   } catch { /* 实体表未同步时忽略 */ }
@@ -8955,6 +7781,36 @@ const listPreviewRelated = computed(() => {
   return listPreviewRelatedEvents(cur, allEvents.value || [])
 })
 
+function isBuildingBlockUpgrade(flat, root) {
+  const f = flat || {}
+  const r = root || {}
+  return !!(f.building_block_upgrade || r.building_block_upgrade
+    || f.etype === 'building_block_upgrade' || r.etype === 'building_block_upgrade'
+    || (Array.isArray(f.related_hits) && f.related_hits.length)
+    || (Array.isArray(r.related_hits) && r.related_hits.length))
+}
+function buildingBlockHitsOf(flat, root) {
+  const f = flat || {}
+  const r = root || {}
+  const hits = Array.isArray(f.related_hits) && f.related_hits.length
+    ? f.related_hits
+    : (Array.isArray(r.related_hits) ? r.related_hits : [])
+  return hits.filter((h) => h && typeof h === 'object')
+}
+function buildingBlockHitSub(h) {
+  if (!h) return ''
+  const bits = [
+    h.matched || h.summary,
+    h.process_name ? `${h.process_name}${h.pid != null ? ` PID ${h.pid}` : ''}` : '',
+    h.path ? shortPath(h.path) : '',
+    h.command_line ? String(h.command_line).slice(0, 120) : '',
+    h.reg_key || '',
+    h.remote || h.domain || '',
+    h.rule_id || '',
+  ].filter(Boolean)
+  return bits.join(' · ')
+}
+
 const listAlertBehaviors = computed(() => {
   const cur = listFocusEvent.value
   if (!cur) return []
@@ -8967,7 +7823,28 @@ const listAlertBehaviors = computed(() => {
     time: fmtTime(cur.updated_at || cur.created_at),
     isCurrent: true,
   }]
+  const seen = new Set([cur.id])
+  // 多阶段：优先展开积木子告警（比弱关联更贴近本条）
+  if (isBuildingBlockUpgrade(ev, listEventEvidence.value)) {
+    for (const h of buildingBlockHitsOf(ev, listEventEvidence.value)) {
+      const eid = h.event_id
+      if (eid != null && seen.has(eid)) continue
+      if (eid != null) seen.add(eid)
+      rows.push({
+        eventId: eid,
+        severity: h.severity || 'medium',
+        title: h.title || h.rule_id || (eid != null ? `#${eid}` : '积木子告警'),
+        sub: buildingBlockHitSub(h),
+        time: h.created_at ? fmtTime(h.created_at) : (eid != null ? `#${eid}` : ''),
+        isCurrent: false,
+        fromBuildingBlock: true,
+        detail: h,
+      })
+    }
+  }
   for (const e of listPreviewRelated.value) {
+    if (seen.has(e.id)) continue
+    seen.add(e.id)
     const raw = parseEventEvidence(e)
     const flat = evidenceFlatOf(raw)
     const p = evidencePathOf(flat, raw)
@@ -9451,7 +8328,15 @@ const MODULE_COLS = {
   user: ['name', 'source', 'enabled', 'last_logon', 'session', 'state'],
   sysinfo: ['caption', 'hostname', 'ip', 'domain', 'version', 'build'],
   driver: ['name', 'display_name', 'risk_tags', 'status', 'start_type', 'kind', 'signed', 'signer', 'path'],
-  browser: ['browser', 'domain', 'title', 'url', 'visited_at', 'visit_count', 'profile'],
+  software: ['name', 'version', 'publisher', 'hive', 'user', 'arch', 'install_path'],
+  hotfix: ['kb', 'description', 'installed_on', 'installed_by', 'source'],
+  listen: ['proto', 'local', 'state', 'process_name', 'pid'],
+  netif: ['name', 'ip', 'mac', 'gateway', 'dns', 'status', 'description'],
+  groups: ['name', 'member_count', 'members', 'description', 'sid'],
+  firewall: ['display_name', 'direction', 'action', 'profile', 'enabled', 'name'],
+  shares: ['name', 'path', 'description', 'share_type', 'current_users', 'encrypt'],
+  certs: ['name', 'issuer', 'store', 'not_after', 'thumbprint', 'has_private'],
+  usb: ['name', 'class', 'status', 'manufacturer', 'instance_id', 'service'],
 }
 
 const columns = computed(() => {
@@ -9483,7 +8368,7 @@ function rowIsRisk(row) {
   return false
 }
 const filteredSnapRows = computed(() => {
-  let items = (snap.value?.items || []).slice(0, 800)
+  let items = snap.value?.items || []
   if (snapView.value === 'risk') items = items.filter(rowIsRisk)
   else if (snapView.value === 'hide_noise') items = items.filter((r) => !rowIsNoise(r))
   const s = snapQ.value.trim().toLowerCase()
@@ -9496,6 +8381,9 @@ const filteredSnapRows = computed(() => {
     }
   })
 })
+const snapPagination = computed(() => paginateSnapshotRows(filteredSnapRows.value, snapPage.value, snapPageSize.value))
+watch([snapQ, snapView], () => { snapPage.value = 1 })
+watch(snapPagination, (page) => { if (snapPage.value !== page.page) snapPage.value = page.page })
 const snapRiskCount = computed(() => (snap.value?.items || []).filter(rowIsRisk).length)
 const selectedDll = ref(null)
 const processDlls = computed(() => {
@@ -9596,45 +8484,8 @@ function openSelectedHostThreats() {
   eventAgentId.value = aid
 }
 
-function rowTitle(row) {
-  if (!row) return '条目'
-  return row.name || row.task_name || row.display_name || row.path || row.local || '条目详情'
-}
 
-function formatDetail(v) {
-  if (v == null || v === '') return '—'
-  if (typeof v === 'boolean') return v ? '是' : '否'
-  return String(v)
-}
 
-function detailGroups(row) {
-  if (!row) return []
-  const groups = [
-    { title: '基本信息', keys: ['name', 'task_name', 'display_name', 'status', 'state', 'enabled', 'pid', 'ppid', 'parent_name', 'process_name', 'user', 'account', 'session_id', 'session', 'source', 'ext', 'proto', 'risk_score', 'risk_tags'] },
-    { title: '路径 / 命令', keys: ['path', 'command', 'command_line', 'execute', 'arguments', 'working_directory', 'directory', 'location', 'local', 'remote'] },
-    { title: '签名 / 哈希', keys: ['signed', 'signer', 'company', 'file_version', 'sha256'] },
-    { title: '模块 / 资源', keys: ['module_count', 'module_third_count', 'modules_summary', 'uptime', 'uptime_sec', 'create_time', 'created', 'modified', 'last_run', 'next_run', 'last_logon', 'last_result', 'memory_mb', 'size', 'size_kb', 'handles'] },
-    { title: '其他', keys: [] },
-  ]
-  const used = new Set(['modules', 'noise'])
-  const out = []
-  for (const g of groups.slice(0, 4)) {
-    const fields = {}
-    for (const k of g.keys) {
-      if (k in row) {
-        fields[k] = row[k]
-        used.add(k)
-      }
-    }
-    if (Object.keys(fields).length) out.push({ title: g.title, fields })
-  }
-  const rest = {}
-  for (const [k, v] of Object.entries(row)) {
-    if (!used.has(k)) rest[k] = v
-  }
-  if (Object.keys(rest).length) out.push({ title: '其他字段', fields: rest })
-  return out
-}
 
 function rowRelatedAlerts(row) {
   if (!row || !selected.value) return []
@@ -9670,17 +8521,6 @@ async function removeEvent(e) {
   }
 }
 
-function short(id) { return String(id || '').slice(0, 8) }
-const EVENT_MODULE_LABELS = {
-  memory: '内存扫描', kernel: '内核驱动', etw: 'ETW', timeline: '时间线',
-  sequence: '行为序列', response: '处置', ioc: '威胁情报', registry: '注册表',
-  image: 'DLL / 驱动加载', inject: '注入 / 进程访问', dns: 'DNS', account: '账号与登录',
-  audit: '审计日志', script: '脚本执行',
-}
-function modLabel(m) { return LABELS[m] || EVENT_MODULE_LABELS[m] || m || '' }
-function colLabel(c) { return COL_LABELS[c] || c }
-function statusLabel(s) { return ({ open: '未处置', closed: '已处置', ignored: '无需处置' })[s] || s }
-function sevLabel(s) { return ({ critical: '严重', high: '高危', medium: '中危', low: '低危', info: '信息' })[s] || s || '—' }
 function judgeOf(e) {
   if (/规则命中/.test(e.title || '')) return '规则命中'
   if (/Defender|排除项/.test(e.title || '')) return '防御削弱'
@@ -9689,37 +8529,7 @@ function judgeOf(e) {
   if (/失败|为空/.test(e.title || '')) return '采集异常'
   return '待研判'
 }
-function cell(row, c) {
-  const v = row?.[c]
-  if (v == null || v === '') return '—'
-  const s = String(v).replace(/\uFFFD/g, '')
-  return s.length > 120 ? `${s.slice(0, 118)}…` : s
-}
-function fmtTime(t) {
-  if (!t) return '—'
-  return String(t).replace('T', ' ').slice(0, 19)
-}
 
-/** 一级导航默认页：跳过会跳到其它 rail 分区的二级项（如检测里的「终端安全概览」→ 概览分区） */
-function defaultPageForSection(sectionId) {
-  const skipCross = {
-    detect: new Set(['overview', 'whitelist', 'malware']),
-    rules: new Set(['whitelist']),
-    ai: new Set(),
-    asset: new Set(),
-    deploy: new Set(),
-    config: new Set(),
-    overview: new Set(),
-  }
-  const skip = skipCross[sectionId] || new Set()
-  for (const g of menuMap[sectionId] || []) {
-    for (const m of g.items || []) {
-      if (m.adminOnly) continue
-      if (!skip.has(m.id)) return m.id
-    }
-  }
-  return null
-}
 
 function setSection(id) {
   section.value = id
@@ -9727,9 +8537,12 @@ function setSection(id) {
   if (id !== 'detect') {
     activeEvent.value = null
   }
-  menuHover.value = true
+  // 概览为单页直达：不在该分区浮出二级菜单，避免挡住看板数据
+  menuHover.value = id !== 'overview'
   const pick = defaultPageForSection(id)
   if (pick) goMenu(pick)
+  // 去掉左侧栏按钮焦点描边，避免点完像整栏变色
+  try { document.activeElement?.blur?.() } catch { /* ignore */ }
 }
 
 function goMenu(id) {
@@ -9764,13 +8577,15 @@ function goMenu(id) {
     loadEvents(true, true)
     return
   }
-  if (['events', 'behaviors', 'attck', 'investigate', 'timeline', 'hunt', 'dns', 'ioc'].includes(id)) section.value = 'detect'
+  if (['events', 'behaviors', 'attck', 'investigate', 'timeline', 'hunt', 'dns', 'lineage-risk', 'network-awareness', 'abnormal-files', 'approvals'].includes(id)) section.value = 'detect'
+  if (id === 'ioc') section.value = 'intel'
   if (['rules', 'seq'].includes(id)) section.value = 'rules'
   if (id === 'ai-analyze') section.value = 'ai'
   if (['hosts', 'groups'].includes(id)) section.value = 'asset'
+  if (id === 'baseline') { goMenu('hosts'); return }
   if (id === 'assets') { section.value = 'asset'; id = 'hosts' }
   if (['deploy', 'upgrade', 'audit'].includes(id)) section.value = 'deploy'
-  if (['settings', 'policy', 'notify', 'storage', 'accounts'].includes(id)) section.value = 'config'
+  if (['settings', 'policy', 'notify', 'storage', 'accounts', 'archive'].includes(id)) section.value = 'config'
   if (id === 'accounts') loadEdrUsers()
 
   if (id === 'events' || id === 'behaviors') {
@@ -9789,7 +8604,13 @@ function goMenu(id) {
     return
   }
   page.value = id
-  if (id === 'rules') { loadRules(); loadMemoryYara(); loadAgentSyncManifest(); loadWhitelistOnly() }
+  if (id === 'rules') {
+    loadRules()
+    loadMemoryYara()
+    loadAgentSyncManifest()
+    loadWhitelistOnly()
+    if (rulesSection.value === 'logrules') loadLogRules(false)
+  }
   if (id === 'settings') { loadSettings(); loadRules() }
   if (id === 'timeline') loadTimeline()
   if (id === 'investigate') {
@@ -9812,7 +8633,7 @@ function goMenu(id) {
   if (id === 'groups') loadGroups()
   if (id === 'audit') loadAudit()
   if (id === 'ai-analyze') loadAiAnalyzePage()
-  if (id === 'deploy') { loadRelease(); loadCredentials() }
+  if (id === 'deploy') { loadDeployPage() }
   if (id === 'assets' || id === 'hosts') refresh()
 }
 
@@ -9829,15 +8650,21 @@ async function loadRules() {
 }
 
 async function bulkRulesEnabled(on) {
-  const ids = (filteredAgentRules.value || []).map((r) => r.id).filter(Boolean)
-  if (!ids.length) return
+  const { snapshotIds, evmIds } = ruleBulkTargets(filteredAgentRules.value)
+  if (!snapshotIds.length && !evmIds.length) return
   rulesBulkBusy.value = true
   try {
-    await bulkAgentRulesEnabled({ enabled: !!on, all_filtered: true, rule_ids: ids })
-    await loadRules()
+    if (snapshotIds.length) {
+      await bulkAgentRulesEnabled({ enabled: !!on, all_filtered: true, rule_ids: snapshotIds })
+    }
+    if (evmIds.length) {
+      await bulkElasticEvmEnabled({ enabled: !!on, rule_ids: evmIds })
+      await loadAgentSyncManifest()
+    }
   } catch (e) {
     error.value = e?.message || String(e)
   } finally {
+    await loadRules()
     rulesBulkBusy.value = false
   }
 }
@@ -9867,20 +8694,52 @@ async function bulkElasticEvm(on) {
   }
 }
 
-function shortHash(h) {
-  const s = String(h || '')
-  if (s.length < 24) return s || '—'
-  return `${s.slice(0, 16)}…${s.slice(-8)}`
-}
 
 function openRulesMemorySection() {
   rulesSection.value = 'memory'
   if (!memoryYaraPack.value && !memoryYaraBusy.value) loadMemoryYara()
 }
 
+function openRulesLogSection() {
+  rulesSection.value = 'logrules'
+  if (!logRulesBusy.value && !logRulesPack.value?.ok) loadLogRules(false)
+}
+
 function openRulesWhitelistSection() {
   rulesSection.value = 'whitelist'
   loadWhitelistOnly()
+}
+
+async function loadLogRules(forceReload = false) {
+  logRulesBusy.value = true
+  logRulesErr.value = ''
+  try {
+    logRulesPack.value = await getLogRulesPack(!!forceReload)
+    if (!logRulesPack.value?.ok) {
+      logRulesErr.value = logRulesPack.value?.error || '日志规则包不可用'
+    }
+  } catch (e) {
+    logRulesErr.value = e?.message || String(e)
+    logRulesPack.value = null
+  } finally {
+    logRulesBusy.value = false
+  }
+}
+
+async function setLogRulesGroup(key, on) {
+  if (!isAdmin.value) return
+  logRulesControlsBusy.value = true
+  logRulesErr.value = ''
+  try {
+    const groups = { ...(logRulesPack.value?.controls?.groups || {}), [key]: !!on }
+    const out = await saveLogRulesControls({ groups })
+    if (out?.pack?.ok) logRulesPack.value = out.pack
+    else await loadLogRules(true)
+  } catch (e) {
+    logRulesErr.value = e?.message || String(e)
+  } finally {
+    logRulesControlsBusy.value = false
+  }
 }
 
 async function loadWhitelistOnly() {
@@ -10053,6 +8912,23 @@ function startCreateRule() {
   ruleForm.value = emptyRuleForm()
 }
 
+function startCreateAbfileRule() {
+  rulesSection.value = 'abfile'
+  ruleCreating.value = true
+  editingRule.value = null
+  ruleFormError.value = ''
+  ruleForm.value = {
+    ...emptyRuleForm(),
+    modules: ['file'],
+    fieldsText: 'path,name',
+    patternsText: '*',
+    fileExts: ['exe', 'dll', 'ps1', 'bat', 'cmd', 'vbs', 'js'],
+    fileExtsText: 'exe,dll,ps1,bat,cmd,vbs,js',
+    severity: 'high',
+    note: '异常文件规则',
+  }
+}
+
 async function startEditRule(r) {
   ruleCreating.value = false
   editingRule.value = r
@@ -10158,11 +9034,12 @@ function toggleField(f) {
 function buildRulePayload() {
   syncFileExtsFromText()
   const f = ruleForm.value
-  return {
+  const abfile = rulesSection.value === 'abfile' || isAbfileRule(editingRule.value)
+  const payload = {
     title: f.title.trim(),
     severity: f.severity,
-    modules: f.modules,
-    fields: f.fieldsText,
+    modules: abfile ? ['file'] : f.modules,
+    fields: abfile ? (f.fieldsText || 'path,name') : f.fieldsText,
     patterns: f.patternsText,
     file_exts: f.fileExts,
     signed_filter: f.signedFilter || '',
@@ -10171,6 +9048,11 @@ function buildRulePayload() {
     enabled: f.enabled,
     note: f.note,
   }
+  if (abfile) {
+    payload.abfile = true
+    payload.category = 'abfile'
+  }
+  return payload
 }
 
 async function saveRuleForm() {
@@ -10275,8 +9157,18 @@ async function removeRule(r) {
   }
 }
 
-function goEventsWith({ focus = '', agent = '' } = {}) {
+function goEventsWith({ focus = '', agent = '', scope = '' } = {}) {
   goPage('events')
+  eventAgentId.value = agent
+  const fromCard = scope === 'endpoint' || scope === 'external' || focus === 'process' || focus === 'network'
+  if (fromCard && (scope || focus === 'process' || focus === 'network')) {
+    eventListScope.value = scope === 'external' || focus === 'network' ? 'external' : 'endpoint'
+    focusKey.value = ''
+    eventTypeFilter.value = ''
+    eventFiltersOn.value = { name: '', ioc: '', group: '', type: '', sev: '' }
+    return
+  }
+  eventListScope.value = ''
   focusKey.value = focus
   eventTypeFilter.value = focus
   eventAgentId.value = agent
@@ -10316,6 +9208,7 @@ function eventSearchText(e) {
 }
 function applyEventFilters() {
   eventTypeFilter.value = eventTypeFilter.value || ''
+  if (eventTypeFilter.value) eventListScope.value = ''
   focusKey.value = eventTypeFilter.value
   eventFiltersOn.value = {
     name: eventQName.value.trim().toLowerCase(),
@@ -10333,6 +9226,8 @@ function resetEventFilters() {
   eventSevFilter.value = ''
   eventAgentId.value = ''
   focusKey.value = ''
+  eventListScope.value = ''
+  malwareStatFocus.value = ''
   eventFiltersOn.value = { name: '', ioc: '', group: '', type: '', sev: '' }
 }
 function clearEventFilters() {
@@ -10361,6 +9256,7 @@ function openEventLogHits(e) {
   invFilters.value = {
     nature: '', etype: '', hostname: e.hostname || '',
     path: '', hash_q: '', entity: '', tactic: '', os: '',
+    source: '', event_id: '', topic: '',
   }
   invNatureTab.value = ''
   lastInvestigateAt = 0
@@ -10389,24 +9285,16 @@ async function softRefresh({ snap = false, rules = false, overview = false, even
       const still = agents.value.find((a) => a.agent_id === selected.value.agent_id)
       selected.value = still || null
       if (still && (snap || page.value === 'hosts' || page.value === 'assets')) {
-        if (hostTabGroup.value === 'remote') {
-          loadHostRemoteCommands()
-        } else {
-          await loadSnap(module.value, { silent: true, keepRow: true })
-        }
+        await loadSnap(module.value, { silent: true, keepRow: true })
       }
     }
-    // 告警列表：默认不每几秒全量重拉（会因 updated_at 重排，看起来像「事件名称一直在变」）
-    // 仅：显式 events / 总览页 / 距上次超过 90s / 列表仍空
-    const onAlertPage = page.value === 'events' || page.value === 'malware' || page.value === 'behaviors'
-    const eventsDue = Date.now() - lastSoftEventsAt > 90000
-    if (events || overview || page.value === 'overview' || !allEvents.value.length || (onAlertPage && eventsDue)) {
+    const onEventPages = page.value === 'events' || page.value === 'malware' || page.value === 'behaviors'
+    const stale = Date.now() - lastSoftEventsAt > 90000
+    if (events || overview || page.value === 'overview' || !allEvents.value.length || (onEventPages && stale)) {
       await loadEvents(false)
       lastSoftEventsAt = Date.now()
     }
-    if (overview || page.value === 'overview') {
-      scheduleOverviewReload()
-    }
+    if (overview || page.value === 'overview') scheduleOverviewReload()
     if (rules) {
       try {
         const rs = await agentRuleStats()
@@ -10444,15 +9332,15 @@ async function refresh() {
       const still = agents.value.find((a) => a.agent_id === selected.value.agent_id)
       selected.value = still || null
       if (still) {
-        if (hostTabGroup.value === 'remote') loadHostRemoteCommands()
-        else await loadSnap(module.value, { silent: false, keepRow: true })
+        await loadSnap(module.value, { silent: false, keepRow: true })
       }
     }
-    await Promise.all([eventsP, loadOverview(), loadSettings()])
-    maybeAutoEnrichEvents()
-    listTimeline({ limit: 80 }).then((tl) => {
-      timelineItems.value = tl?.items || []
-    }).catch(() => {})
+    await Promise.all([eventsP, loadOverview(), loadGroups().catch(() => {})])
+    if (!timelineItems.value.length) {
+      listTimeline({ limit: 80 }).then((tl) => {
+        timelineItems.value = tl?.items || []
+      }).catch(() => {})
+    }
     lastSyncAt.value = Date.now()
     liveOk.value = true
   } catch (e) {
@@ -10558,6 +9446,8 @@ function actionLabel(a) {
     restore_file: '回滚隔离',
     rollback_upgrade: '回滚升级',
     uninstall_agent: '远程卸载',
+    collect_diagnostics: '诊断包',
+    pull_file: '采集样本',
     reg_read: '读注册表',
     fs_list: '列目录',
     fs_volumes: '枚举盘符',
@@ -10578,6 +9468,24 @@ function parseJsonSafe(raw) {
   try { return typeof raw === 'string' ? JSON.parse(raw) : raw } catch { return {} }
 }
 
+function fmtBytes(n) {
+  const v = Number(n)
+  if (!Number.isFinite(v) || v < 0) return '—'
+  if (v < 1024) return `${Math.round(v)} B`
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`
+  return `${(v / (1024 * 1024)).toFixed(1)} MB`
+}
+
+async function downloadPulledSample(c) {
+  try {
+    await downloadAgentSample(c.agent_id, c.id)
+    okMsg.value = '样本已开始下载'
+    setTimeout(() => { okMsg.value = '' }, 2000)
+  } catch (e) {
+    error.value = e?.message || String(e)
+  }
+}
+
 async function restoreQuarantined(c) {
   const res = parseJsonSafe(c.result_json)
   const original = res.original || parseJsonSafe(c.params_json).path
@@ -10591,11 +9499,9 @@ async function restoreQuarantined(c) {
     okMsg.value = '回滚指令已下发'
     await loadRespCommands()
     startRespPoll()
-    if (hostTabGroup.value === 'remote') {
-      await loadHostRemoteCommands()
-      startHostRemotePoll()
-    }
-  } catch (e) { error.value = e?.message || String(e) }
+  } catch (e) {
+    error.value = e?.message || String(e)
+  }
 }
 function cmdStatusLabel(s) {
   return ({ pending: '等待下发', sent: '已送达执行中', done: '成功', failed: '失败' })[s] || s
@@ -10620,6 +9526,21 @@ function friendlyCmdResult(action, raw) {
   if (action === 'quarantine_file') {
     if (o.dest || o.original) return `已隔离至 ${o.dest || o.original}`
   }
+  if (action === 'pull_file') {
+    const nested = (o.result && typeof o.result === 'object') ? o.result : {}
+    const size = o.size ?? nested.size
+    const maxB = o.max_bytes ?? nested.max_bytes
+    if (o.stored || nested.stored) {
+      return `样本已入库 ${o.filename || nested.filename || ''}（${fmtBytes(size)}），点右侧「下载样本」`
+    }
+    if (o.refused || nested.refused || o.error || nested.error) {
+      const err = String(o.error || nested.error || '')
+      if (/过大|max_bytes/i.test(err) || maxB) {
+        return `文件过大（${fmtBytes(size)} > ${fmtBytes(maxB)}），请升级 Agent 至 0.13.9+（上限 64MB）或在终端本地取证`
+      }
+      return err || '样本采集被拒绝'
+    }
+  }
   if (action === 'isolate_network') return o.ok === false ? '网络隔离失败' : '终端已网络隔离'
   if (action === 'unisolate_network') return o.ok === false ? '解除隔离失败' : '已解除网络隔离'
   if (action === 'scan_memory') {
@@ -10638,655 +9559,6 @@ function friendlyCmdResult(action, raw) {
   return '详见「处置结果」页签'
 }
 
-function dismissRespToast() {
-  respToast.value = null
-  if (respToastTimer) {
-    clearTimeout(respToastTimer)
-    respToastTimer = null
-  }
-}
-
-function showRespToast(cls, title, detail, { sticky = false, ms = 4200 } = {}) {
-  respToast.value = { cls, title, detail }
-  if (respToastTimer) clearTimeout(respToastTimer)
-  if (sticky) return
-  respToastTimer = setTimeout(() => {
-    respToast.value = null
-    respToastTimer = null
-  }, ms)
-}
-
-function stopHostRemotePoll() {
-  if (hostRemotePollTimer) {
-    clearInterval(hostRemotePollTimer)
-    hostRemotePollTimer = null
-  }
-}
-
-function stopHostRemoteShellPoll() {
-  if (hostRemoteShellPollTimer) {
-    clearInterval(hostRemoteShellPollTimer)
-    hostRemoteShellPollTimer = null
-  }
-}
-
-function hostRemoteResultOf(raw) {
-  const r = parseJsonSafe(raw)
-  if (r?.error && r.result && typeof r.result === 'object' && !Array.isArray(r.result)) {
-    return { ...r.result, _error: r.error }
-  }
-  return r
-}
-
-function hostRemoteCmdError(c) {
-  const r = hostRemoteResultOf(c?.result_json)
-  return r.error || r._error || friendlyCmdResult(c?.action, c?.result_json) || '执行失败'
-}
-
-async function hostRemoteWaitCommand(cmdId, timeoutMs = 120000) {
-  const want = String(cmdId || '').trim()
-  if (!want) return { ok: false, error: '指令未创建（需管理员账号，且策略允许 Shell）' }
-  const start = Date.now()
-  let polls = 0
-  while (Date.now() - start < timeoutMs) {
-    await new Promise((r) => setTimeout(r, polls < 3 ? 400 : 900))
-    polls += 1
-    await loadHostRemoteCommands()
-    const c = hostRemoteCommands.value.find((x) => String(x.id) === want)
-    if (!c) continue
-    if (c.status === 'done') return { ok: true, result: hostRemoteResultOf(c.result_json), cmd: c }
-    if (c.status === 'failed' || c.status === 'expired') {
-      return { ok: false, error: hostRemoteCmdError(c), cmd: c }
-    }
-  }
-  return { ok: false, error: '等待终端执行超时（Agent 是否在线、是否已升级支持 Shell？）' }
-}
-
-function hostLiveQueryCell(row, col) {
-  const v = row?.[col]
-  if (v == null || v === '') return '—'
-  if (typeof v === 'object') return JSON.stringify(v).slice(0, 120)
-  return String(v).slice(0, 200)
-}
-
-async function hostLiveQueryRun() {
-  hostLiveQueryRows.value = []
-  hostLiveQueryMeta.value = null
-  const lim = Math.min(500, Math.max(10, Number(hostLiveQueryLimit.value) || 200))
-  hostLiveQueryLimit.value = lim
-  const done = await hostRemoteExec('live_query', { table: hostLiveQueryTable.value, limit: lim }, { timeoutMs: 180000 })
-  loadLiveQueryAudit()
-  if (!done?.ok) return
-  const res = done.result || {}
-  hostLiveQueryRows.value = Array.isArray(res.rows) ? res.rows : []
-  hostLiveQueryMeta.value = {
-    table: res.table || hostLiveQueryTable.value,
-    row_count: res.row_count ?? hostLiveQueryRows.value.length,
-    schema: res.schema || 'forensic_v1',
-  }
-  okMsg.value = `Live Query ${hostLiveQueryMeta.value.table}：${hostLiveQueryMeta.value.row_count} 行`
-  setTimeout(() => { okMsg.value = '' }, 2500)
-}
-
-function hostLiveQueryExport() {
-  const blob = new Blob([JSON.stringify({ meta: hostLiveQueryMeta.value, rows: hostLiveQueryRows.value }, null, 2)], { type: 'application/json' })
-  const a = document.createElement('a')
-  a.href = URL.createObjectURL(blob)
-  a.download = `live-query-${hostLiveQueryTable.value}-${Date.now()}.json`
-  a.click()
-  URL.revokeObjectURL(a.href)
-}
-
-async function hostRemoteExec(action, params, { timeoutMs = 120000, busy = true, refreshCmdLog = true } = {}) {
-  const a = selected.value
-  if (!a?.agent_id) return null
-  if (!a.online) {
-    error.value = '终端离线，无法下发远程运维指令'
-    return null
-  }
-  if (busy) hostRemoteBusy.value = true
-  try {
-    const r = await createAgentCommand(a.agent_id, action, params)
-    if (!r?.ok) {
-      const msg = r?.error || '创建指令失败（需管理员且策略允许）'
-      if (busy) error.value = msg
-      return { ok: false, error: msg }
-    }
-    if (refreshCmdLog) startHostRemotePoll()
-    const done = await hostRemoteWaitCommand(r?.id, timeoutMs)
-    if (!done.ok && busy) error.value = done.error || '执行失败'
-    return done
-  } catch (e) {
-    const msg = e?.message || String(e)
-    if (busy) error.value = msg
-    return { ok: false, error: msg }
-  } finally {
-    if (busy) hostRemoteBusy.value = false
-  }
-}
-
-function hostRemoteShellAppend(kind, text) {
-  const t = String(text ?? '').trimEnd()
-  if (!t) return
-  hostRemoteShellLines.value.push({ kind, text: t })
-  nextTick(() => {
-    const el = hostRemoteShellViewRef.value
-    if (el) el.scrollTop = el.scrollHeight
-  })
-}
-
-function hostRemoteFmtSize(n) {
-  const x = Number(n)
-  if (!Number.isFinite(x) || x < 0) return '—'
-  if (x < 1024) return `${x} B`
-  if (x < 1024 * 1024) return `${(x / 1024).toFixed(1)} KB`
-  if (x < 1024 * 1024 * 1024) return `${(x / 1024 / 1024).toFixed(1)} MB`
-  return `${(x / 1024 / 1024 / 1024).toFixed(2)} GB`
-}
-
-function hostRemoteFsNorm(p) {
-  return String(p || '').replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase()
-}
-
-function hostRemoteFsSamePath(a, b) {
-  const x = hostRemoteFsNorm(a)
-  const y = hostRemoteFsNorm(b)
-  if (!x || !y) return false
-  return x === y
-}
-
-function hostRemoteFsJoin(base, name) {
-  const b = String(base || '').replace(/\\+$/, '')
-  return `${b}\\${name}`
-}
-
-function hostRemoteFsFind(nodes, path) {
-  const want = hostRemoteFsNorm(path)
-  for (const n of nodes || []) {
-    if (hostRemoteFsNorm(n.path) === want) return n
-    const hit = hostRemoteFsFind(n.children, path)
-    if (hit) return hit
-  }
-  return null
-}
-
-function hostRemoteFsNodeFromEntry(parentPath, e) {
-  const path = hostRemoteFsJoin(parentPath, e.name)
-  return {
-    path,
-    name: e.name,
-    label: e.name,
-    dir: true,
-    child_count: e.child_count ?? null,
-    expanded: false,
-    loaded: false,
-    children: [],
-  }
-}
-
-function hostRemoteFsAttach(path, entries) {
-  const node = hostRemoteFsFind(hostRemoteFsRoots.value, path)
-  if (!node) return
-  node.loaded = true
-  node.expanded = true
-  if (!hostRemoteFsTruncated.value || node.child_count == null) node.child_count = entries.length
-  const prev = new Map((node.children || []).map((c) => [hostRemoteFsNorm(c.path), c]))
-  node.children = entries.filter((e) => e.dir).map((e) => {
-    const childPath = hostRemoteFsJoin(path, e.name)
-    const old = prev.get(hostRemoteFsNorm(childPath))
-    if (old) {
-      old.child_count = e.child_count ?? old.child_count
-      return old
-    }
-    return hostRemoteFsNodeFromEntry(path, e)
-  })
-}
-
-function hostRemoteFsRootsFromEntries(entries) {
-  return (entries || []).map((d) => {
-    const path = String(d.path || d.name || '')
-    const letter = d.drive || path.replace(/:\\?$/, '')
-    return {
-      path: path.endsWith('\\') ? path : `${path}\\`,
-      name: letter,
-      label: String(letter).endsWith(':') ? letter : `${letter}:`,
-      dir: true,
-      child_count: d.child_count ?? null,
-      expanded: false,
-      loaded: false,
-      children: [],
-    }
-  }).filter((n) => n.path && n.path.length >= 3)
-}
-
-function hostRemoteFsNormalizePath(p) {
-  let s = String(p || '').trim().replace(/\//g, '\\')
-  if (/^[a-zA-Z]:$/.test(s)) s += '\\'
-  return s
-}
-
-async function hostRemoteFsDrivesFromCmd() {
-  let done = await hostRemoteExec('run_cmd', {
-    command: 'wmic logicaldisk get name',
-    timeout_sec: 25,
-  }, { timeoutMs: 35000, busy: false })
-  let text = String(done?.result?.output || '')
-  if (!text.trim()) {
-    done = await hostRemoteExec('run_cmd', {
-      command: 'powershell -noprofile -command "Get-PSDrive -PSProvider FileSystem | ForEach-Object { $_.Root }"',
-      timeout_sec: 25,
-    }, { timeoutMs: 35000, busy: false })
-    text = String(done?.result?.output || '')
-  }
-  const seen = new Set()
-  const entries = []
-  for (const m of text.matchAll(/[A-Za-z]:\\/g)) {
-    const path = m[0].toUpperCase()
-    if (seen.has(path)) continue
-    seen.add(path)
-    entries.push({ path, drive: path.slice(0, 1), name: path, dir: true })
-  }
-  return entries
-}
-
-async function hostRemoteFsDiscoverByList() {
-  const entries = []
-  for (const letter of 'CDEFGHIJKLMNOPQRSTUVWXYZAB') {
-    const path = `${letter}:\\`
-    const done = await hostRemoteExec('fs_list', { path, max_entries: 1 }, { timeoutMs: 12000, busy: false })
-    if (done?.ok) entries.push({ path, drive: letter, name: path, dir: true })
-  }
-  return entries
-}
-
-async function hostRemoteFsLoadVolumes() {
-  if (!selected.value?.online) return
-  hostRemoteFsHint.value = ''
-  const done = await hostRemoteExec('fs_volumes', {}, { timeoutMs: 25000, busy: false })
-  let entries = done?.ok ? (done.result?.entries || []) : []
-  if (!entries.length) {
-    entries = await hostRemoteFsDrivesFromCmd()
-    if (entries.length) {
-      hostRemoteFsHint.value = '当前 Agent 较旧，已用 wmic/PowerShell 列出磁盘。'
-    }
-  }
-  if (!entries.length) {
-    entries = await hostRemoteFsDiscoverByList()
-    if (entries.length) hostRemoteFsHint.value = '已通过逐盘 fs_list 探测盘符（无需 run_cmd）。'
-  }
-  hostRemoteFsDrives.value = entries
-  hostRemoteFsRoots.value = hostRemoteFsRootsFromEntries(entries)
-  if (!hostRemoteFsRoots.value.length) {
-    hostRemoteFsHint.value = '没有读到盘符。确认终端在线且已开启远程运维，或手动输入 C:\\ 后点刷新。'
-    return
-  }
-  const first = hostRemoteFsRoots.value[0]
-  hostRemoteFsPath.value = first.path
-  await hostRemoteFsBrowse()
-}
-
-async function hostRemoteFsToggle(node) {
-  if (!node?.path) return
-  hostRemoteFsPath.value = node.path
-  if (node.loaded && node.expanded) {
-    node.expanded = false
-    return
-  }
-  node.expanded = true
-  await hostRemoteFsBrowse()
-}
-
-function hostRemoteFsUp() {
-  let p = String(hostRemoteFsPath.value || '').replace(/\\+$/, '')
-  if (!p) return
-  const i = p.lastIndexOf('\\')
-  if (i <= 2) hostRemoteFsPath.value = `${p.slice(0, 2)}\\`
-  else hostRemoteFsPath.value = p.slice(0, i)
-  hostRemoteFsBrowse()
-}
-
-async function hostRemoteFsBrowse() {
-  hostRemoteFsPreview.value = ''
-  const path = hostRemoteFsNormalizePath(hostRemoteFsPath.value)
-  hostRemoteFsPath.value = path
-  const atDriveRoot = /^[A-Za-z]:$/.test(path.replace(/\\+$/, ''))
-  const done = await hostRemoteExec('fs_list', {
-    path,
-    max_entries: 200,
-    count_dirs: atDriveRoot,
-  }, { timeoutMs: 120000 })
-  if (!done?.ok) {
-    hostRemoteFsHint.value = done?.error || '列目录失败（检查路径、策略是否允许远程运维）'
-    hostRemoteFsEntries.value = []
-    return
-  }
-  hostRemoteFsHint.value = ''
-  const entries = [...(done.result?.entries || [])]
-  entries.sort((a, b) => {
-    if (!!a.dir !== !!b.dir) return a.dir ? -1 : 1
-    return String(a.name || '').localeCompare(String(b.name || ''), 'zh')
-  })
-  hostRemoteFsEntries.value = entries
-  hostRemoteFsTruncated.value = !!done.result?.truncated
-  hostRemoteFsAttach(hostRemoteFsPath.value, entries)
-}
-
-function hostRemoteFsEnter(e) {
-  if (!e?.name) return
-  const base = hostRemoteFsPath.value.replace(/\\+$/, '')
-  const next = e.dir ? `${base}\\${e.name}` : `${base}\\${e.name}`
-  hostRemoteFsPath.value = next
-  if (e.dir) hostRemoteFsBrowse()
-  else {
-    hostRemoteForm.value.path = next
-    hostRemoteFsRead()
-  }
-}
-
-async function hostRemoteFsRead() {
-  const path = String(hostRemoteFsPath.value || '').trim()
-  if (!path) return
-  const stat = await hostRemoteExec('fs_stat', { path }, { timeoutMs: 60000, busy: false })
-  if (stat?.ok && stat.result?.dir) {
-    error.value = '当前路径是目录，请进入目录后双击文件，或选中文件再点「读文件」'
-    hostRemoteFsPreview.value = ''
-    return
-  }
-  const done = await hostRemoteExec('fs_read', { path, max_bytes: 65536 })
-  if (done?.ok) {
-    const r = done.result || {}
-    hostRemoteFsPreview.value = r.text || r.hex_preview || JSON.stringify(r, null, 2)
-  } else if (done?.error) {
-    error.value = done.error
-    hostRemoteFsPreview.value = ''
-  }
-}
-
-function hostRemoteRegApplyShortcut(s) {
-  hostRemoteReg.value.hive = s.hive
-  hostRemoteReg.value.key = s.key
-  hostRemoteReg.value.value = ''
-  if (selected.value?.online) hostRemoteRegLoad()
-}
-
-function hostRemoteRegOpenSubkey(sk) {
-  const base = String(hostRemoteReg.value.key || '').replace(/\\+$/, '')
-  hostRemoteReg.value.key = base ? `${base}\\${sk}` : sk
-  hostRemoteReg.value.value = ''
-  hostRemoteRegLoad()
-}
-
-function hostRemoteRegUp() {
-  const k = String(hostRemoteReg.value.key || '').replace(/\\+$/, '')
-  const i = k.lastIndexOf('\\')
-  if (i < 0) return
-  hostRemoteReg.value.key = k.slice(0, i)
-  hostRemoteReg.value.value = ''
-}
-
-async function hostRemoteRegLoad() {
-  hostRemoteRegResult.value = null
-  const p = { hive: hostRemoteReg.value.hive, key: hostRemoteReg.value.key }
-  if (hostRemoteReg.value.value?.trim()) p.value = hostRemoteReg.value.value.trim()
-  const done = await hostRemoteExec('reg_read', p)
-  if (done?.ok) hostRemoteRegResult.value = done.result
-}
-
-async function hostRemoteRunCmd() {
-  const cmd = hostRemoteCmdLine.value.trim()
-  if (!cmd) return
-  hostRemoteCmdLog.value.unshift({ at: fmtTime(new Date().toISOString()), cmd })
-  hostRemoteCmdLog.value = hostRemoteCmdLog.value.slice(0, 40)
-  const done = await hostRemoteExec('run_cmd', { command: cmd, timeout_sec: 90 })
-  if (done?.ok) {
-    hostRemoteCmdOut.value = done.result?.output || JSON.stringify(done.result, null, 2)
-  }
-}
-
-async function hostRemoteShellStart() {
-  hostRemoteShellHint.value = ''
-  error.value = ''
-  if (!isAdmin.value) {
-    hostRemoteShellHintKind.value = 'err'
-    hostRemoteShellHint.value = '需要管理员账号才能下发 Shell 指令'
-    hostRemoteShellAppend('err', hostRemoteShellHint.value)
-    return
-  }
-  if (!selected.value?.online) {
-    hostRemoteShellHintKind.value = 'err'
-    hostRemoteShellHint.value = '终端离线，无法连接'
-    hostRemoteShellAppend('err', hostRemoteShellHint.value)
-    return
-  }
-  hostRemoteShellLines.value = []
-  hostRemoteShellId.value = ''
-  hostRemoteShellPhase.value = 'connecting'
-  hostRemoteShellAppend('sys', '正在连接终端 cmd 会话…')
-  try {
-    const done = await hostRemoteExec('shell_open', {}, { timeoutMs: 90000 })
-    const sid = done?.result?.session_id || done?.result?.sessionId || ''
-    if (done?.ok && sid) {
-      hostRemoteShellId.value = String(sid)
-      hostRemoteShellPhase.value = 'live'
-      hostRemoteShellHintKind.value = 'ok'
-      hostRemoteShellHint.value = 'Shell 已连接，可直接输入命令'
-      hostRemoteShellAppend('sys', '已连接。输入命令后按 Enter；输出将自动刷新。')
-      stopHostRemoteShellPoll()
-      await hostRemoteShellPollOnce()
-      hostRemoteShellPollTimer = setInterval(() => { hostRemoteShellPollOnce() }, 1500)
-      nextTick(() => { hostRemoteShellInputRef.value?.focus() })
-      return
-    }
-    hostRemoteShellPhase.value = 'error'
-    const msg = done?.error || '连接失败：请确认 Agent 已重新编译部署、EDR 策略已开启「交互式 Shell」'
-    hostRemoteShellHintKind.value = 'err'
-    hostRemoteShellHint.value = msg
-    hostRemoteShellAppend('err', msg)
-  } catch (e) {
-    hostRemoteShellPhase.value = 'error'
-    const msg = e?.message || String(e)
-    hostRemoteShellHintKind.value = 'err'
-    hostRemoteShellHint.value = msg
-    hostRemoteShellAppend('err', msg)
-  }
-}
-
-async function hostRemoteShellPollOnce() {
-  if (hostRemoteShellPollBusy || !hostRemoteShellId.value || !selected.value?.online) return
-  hostRemoteShellPollBusy = true
-  try {
-    const done = await hostRemoteExec(
-      'shell_poll',
-      { session_id: hostRemoteShellId.value },
-      { timeoutMs: 45000, busy: false, refreshCmdLog: false },
-    )
-    if (!done?.ok) {
-      if (String(done?.error || '').includes('session not found')) {
-        hostRemoteShellAppend('err', '会话已在终端结束，请重新连接')
-        await hostRemoteShellStop(true)
-      }
-      return
-    }
-    const chunk = String(done.result?.output || '')
-    if (chunk.trim()) hostRemoteShellAppend('out', chunk.trimEnd())
-  } finally {
-    hostRemoteShellPollBusy = false
-  }
-}
-
-function hostRemoteShellClear() {
-  hostRemoteShellLines.value = []
-}
-
-async function hostRemoteShellQuick(cmd) {
-  if (!hostRemoteShellId.value) return
-  hostRemoteShellInput.value = cmd
-  await hostRemoteShellSend()
-}
-
-async function hostRemoteShellSend() {
-  const line = hostRemoteShellInput.value.trim()
-  if (!line || !hostRemoteShellId.value) return
-  hostRemoteShellAppend('in', line)
-  hostRemoteShellInput.value = ''
-  const done = await hostRemoteExec(
-    'shell_write',
-    { session_id: hostRemoteShellId.value, input: line },
-    { timeoutMs: 90000, busy: false, refreshCmdLog: true },
-  )
-  if (!done?.ok) {
-    hostRemoteShellAppend('err', done?.error || '发送失败')
-    return
-  }
-  await hostRemoteShellPollOnce()
-  setTimeout(() => { hostRemoteShellPollOnce() }, 800)
-}
-
-async function hostRemoteShellStop(silent = false) {
-  stopHostRemoteShellPoll()
-  const sid = hostRemoteShellId.value
-  hostRemoteShellId.value = ''
-  if (sid) {
-    await hostRemoteExec('shell_close', { session_id: sid }, { timeoutMs: 30000, busy: false, refreshCmdLog: true })
-  }
-  hostRemoteShellPhase.value = 'idle'
-  if (!silent) hostRemoteShellAppend('sys', '会话已断开')
-}
-
-function startHostRemotePoll() {
-  stopHostRemotePoll()
-  hostRemotePollTimer = setInterval(async () => {
-    if (page.value !== 'hosts' || hostTabGroup.value !== 'remote' || !selected.value?.agent_id) {
-      stopHostRemotePoll()
-      return
-    }
-    await loadHostRemoteCommands()
-    const pending = hostRemoteCommands.value.some((c) => c.status === 'pending' || c.status === 'sent')
-    if (!pending) stopHostRemotePoll()
-  }, 2500)
-}
-
-async function loadHostRemoteCommands() {
-  const aid = selected.value?.agent_id
-  if (!aid) return
-  try {
-    const r = await listAgentCommands(aid)
-    hostRemoteCommands.value = (r?.items || []).slice(0, 40)
-  } catch (e) {
-    error.value = e?.message || String(e)
-  }
-}
-
-function hostRemotePrefillFromRow(row) {
-  if (!row) return
-  if (row.pid != null && row.pid !== '') hostRemoteForm.value.pid = String(row.pid)
-  if (row.pid != null && row.pid !== '') hostRemoteForm.value.scanPid = String(row.pid)
-  const p = row.path || row.image || ''
-  if (p) hostRemoteForm.value.path = String(p)
-}
-
-function hostRemoteFromRow(row) {
-  hostRemotePrefillFromRow(row)
-  selectHostGroup('remote')
-}
-
-function openInvestigateForHost() {
-  const h = selected.value?.hostname || ''
-  if (!h) return
-  goMenu('investigate')
-  invFilters.value = { ...invFilters.value, hostname: h }
-  invQ.value = ''
-  runInvestigate()
-}
-
-async function hostRemoteAction(action) {
-  const a = selected.value
-  if (!a?.agent_id) return
-  if (!a.online) {
-    error.value = '终端离线，无法下发远程指令'
-    return
-  }
-  const params = {}
-  if (action === 'kill_process') {
-    const pid = Number(String(hostRemoteForm.value.pid || '').trim())
-    if (!pid) {
-      error.value = '请填写要结束的 PID'
-      return
-    }
-    if (!window.confirm(`确认结束 ${a.hostname || a.agent_id} 上的进程 PID ${pid}？`)) return
-    params.pid = pid
-  } else if (action === 'quarantine_file') {
-    const path = String(hostRemoteForm.value.path || '').trim()
-    if (!path) {
-      error.value = '请填写要隔离的文件路径'
-      return
-    }
-    if (!window.confirm(`确认隔离文件？\n${path}`)) return
-    params.path = path
-  } else if (action === 'isolate_network') {
-    if (!window.confirm('确认对该终端执行网络隔离？')) return
-  } else if (action === 'unisolate_network') {
-    if (!window.confirm('确认解除网络隔离？')) return
-  } else if (action === 'scan_memory') {
-    const sp = String(hostRemoteForm.value.scanPid || '').trim()
-    const pid = sp ? Number(sp) : 0
-    if (pid) params.pid = pid
-    else params.max_processes = 40
-    if (!window.confirm(pid ? `扫描 PID ${pid} 内存？` : '扫描该主机前 40 个进程内存？')) return
-  } else if (action === 'refresh_modules') {
-    if (!window.confirm('触发全模块快照刷新？下一心跳起立即采集。')) return
-  }
-  hostRemoteBusy.value = true
-  try {
-    await createAgentCommand(a.agent_id, action, params)
-    okMsg.value = `${actionLabel(action)} · 指令已下发`
-    await loadHostRemoteCommands()
-    startHostRemotePoll()
-  } catch (err) {
-    error.value = err?.message || String(err)
-  } finally {
-    hostRemoteBusy.value = false
-  }
-}
-
-async function loadRespCommands() {
-  const aid = activeEvent.value?.agent_id
-  if (!aid) return
-  try {
-    const r = await listAgentCommands(aid)
-    respCommands.value = r?.items || []
-    const latest = respCommands.value[0]
-    if (!latest) return
-    const key = `${latest.id}:${latest.status}`
-    if (key === respToastCmdKey) return
-    if (latest.status === 'done') {
-      respToastCmdKey = key
-      showRespToast('ok', `${actionLabel(latest.action)} · 成功`, friendlyCmdResult(latest.action, latest.result_json))
-    } else if (latest.status === 'failed') {
-      respToastCmdKey = key
-      showRespToast('err', `${actionLabel(latest.action)} · 失败`, friendlyCmdResult(latest.action, latest.result_json), { ms: 6000 })
-    } else if (latest.status === 'pending' || latest.status === 'sent') {
-      respToastCmdKey = key
-      showRespToast('wait', `${actionLabel(latest.action)} · ${cmdStatusLabel(latest.status)}`, '等待终端心跳执行…', { sticky: true })
-    }
-  } catch (e) {
-    error.value = e?.message || String(e)
-  }
-}
-
-function startRespPoll() {
-  if (respPollTimer) clearInterval(respPollTimer)
-  respPollTimer = setInterval(async () => {
-    if (page.value !== 'threat-view' || !activeEvent.value?.agent_id) return
-    await loadRespCommands()
-    const pending = respCommands.value.some((c) => c.status === 'pending' || c.status === 'sent')
-    if (!pending && respPollTimer) {
-      clearInterval(respPollTimer)
-      respPollTimer = null
-    }
-  }, 2500)
-}
-
 function goAuditPage() {
   section.value = 'deploy'
   page.value = 'audit'
@@ -11296,6 +9568,10 @@ function goAuditPage() {
 async function doResponse(action) {
   const e = activeEvent.value
   if (!e?.agent_id) return
+  if (!canRespond.value) {
+    error.value = '只读账号不能下发处置'
+    return
+  }
   const ev = eventEvidence.value.evidence || {}
   const params = {}
   if (action === 'kill_process') {
@@ -11309,6 +9585,16 @@ async function doResponse(action) {
     // 身份保护：终端会校验 PID 仍对应取证时的同一进程，避免 PID 复用误杀
     const guid = String(ev.process_guid || '').trim()
     if (guid) params.process_guid = guid
+  } else if (action === 'pull_file') {
+    const path = ev.path || evidencePath.value
+    if (!path) {
+      error.value = '证据中无文件路径，无法采集样本'
+      return
+    }
+    if (!window.confirm(`确认从终端提取该文件到平台？\n${path}\n\n上限 64MB；完成后右上角「样本箱」可下载，离开本页也会通知。不修改原文件。`)) return
+    params.path = path
+    const sha = String(ev.sha256 || '').trim()
+    if (/^[0-9a-fA-F]{64}$/.test(sha)) params.sha256 = sha.toLowerCase()
   } else if (action === 'quarantine_file') {
     const path = ev.path || evidencePath.value
     if (!path) {
@@ -11335,8 +9621,18 @@ async function doResponse(action) {
   respBusy.value = true
   try {
     const r = await createAgentCommand(e.agent_id, action, params)
+    if (action === 'pull_file' && r?.id) {
+      trackSample({
+        agentId: e.agent_id,
+        commandId: r.id,
+        eventId: e.id,
+        path: params.path || '',
+        hostname: e.hostname || e.agent_hostname || '',
+      })
+      ensureSampleWatch()
+    }
     threatTab.value = 'response'
-    respToastCmdKey = ''
+    resetRespToastKey()
     showRespToast('wait', `${actionLabel(action)} · 已下发`, `指令 ${r?.id || ''} 等待终端执行…`, { sticky: true })
     await loadRespCommands()
     startRespPoll()
@@ -11386,14 +9682,20 @@ function huntFromEmptyCmd() {
   openHuntModule('process', q)
 }
 
+const timelineRequestGate = latestRequest()
 async function loadTimeline() {
+  const current = timelineRequestGate.begin()
+  const filters = { agentId: tlAgentId.value, q: tlQ.value, kind: tlTypeFilter.value }
+  const stillCurrent = () => current() && filters.agentId === tlAgentId.value && filters.q === tlQ.value && filters.kind === tlTypeFilter.value
   try {
-    const r = await listTimeline({ agentId: tlAgentId.value, q: tlQ.value, kind: tlTypeFilter.value, limit: 300 })
+    const r = await listTimeline({ ...filters, limit: 300 })
+    if (!stillCurrent()) return
     timelineItems.value = r?.items || []
     timelineKinds.value = r?.kinds || {}
     timelineTotal.value = r?.total ?? timelineItems.value.length
     tlOpenId.value = null
   } catch (e) {
+    if (!stillCurrent()) return
     error.value = e?.message || String(e)
   }
 }
@@ -11453,6 +9755,12 @@ function applyInvSaved(s) {
     hostname: s.hostname || '',
     path: s.path || '',
     hash_q: s.hash_q || '',
+    entity: s.entity || '',
+    tactic: s.tactic || '',
+    os: s.os || '',
+    source: s.source || '',
+    event_id: s.event_id || '',
+    topic: s.topic || '',
   }
   invNatureTab.value = s.natureTab || s.nature || ''
   if (s.hideProcNoise !== undefined) invHideProcNoise.value = !!s.hideProcNoise
@@ -11465,13 +9773,63 @@ function setInvNature(n) {
   invFilters.value = { ...invFilters.value, nature: n || '' }
   runInvestigate()
 }
+function setInvTopic(id) {
+  const cur = invFilters.value.topic
+  const next = cur === id ? '' : id
+  invFilters.value = {
+    ...invFilters.value,
+    topic: next,
+    etype: '',
+    // 关注里点「文件创建」与「更多筛选 → Sysmon」对齐，但不过度收窄 EventID
+    source: next === 'file_create' ? '' : (next ? invFilters.value.source : ''),
+    event_id: next === 'file_create' ? '' : (next ? invFilters.value.event_id : ''),
+  }
+  runInvestigate()
+}
+/** Sysmon + 文件创建合并：按文件主题拉宽匹配，避免 source∧E11 过严导致空列表 */
+function toggleInvSysmonFile() {
+  const on = invSysmonFileOn.value
+  if (on) {
+    invFilters.value = {
+      ...invFilters.value,
+      topic: '',
+      etype: '',
+      source: '',
+      event_id: '',
+    }
+  } else {
+    invFilters.value = {
+      ...invFilters.value,
+      topic: 'file_create',
+      etype: '',
+      source: '',
+      event_id: '',
+      nature: '',
+    }
+    invNatureTab.value = ''
+    // 近 1 小时往往几乎没有落地事件，自动放宽到今天便于看到数据
+    if (invRange.value === '1h') invRange.value = 'today'
+  }
+  runInvestigate()
+}
+function invRowIsSysmon(it) {
+  if (!it) return false
+  const d = it.detail || {}
+  const src = String(d.source || it.source || '').toLowerCase()
+  if (src.includes('sysmon')) return true
+  const et = String(it.etype || '')
+  return /sysmon|file_create|file_stream|file_delete|pipe_created|process_tampering/i.test(et + ' ' + (it.summary || ''))
+}
+function invTopicLabel(tp) {
+  return ({ file_create: '文件创建', startup: '启动', task: '计划任务', service: '服务' })[tp] || tp
+}
 function resetInvestigate() {
   invQ.value = ''
-  invFilters.value = { nature: '', etype: '', hostname: '', path: '', hash_q: '', entity: '', tactic: '', os: '' }
+  invFilters.value = { nature: '', etype: '', hostname: '', path: '', hash_q: '', entity: '', tactic: '', os: '', source: '', event_id: '', topic: '' }
   invNatureTab.value = ''
   invRange.value = 'today'
   invMoreFilters.value = false
-  invHideProcNoise.value = true
+  invHideProcNoise.value = false
   closeInvDetail()
   runInvestigate()
 }
@@ -11482,6 +9840,7 @@ async function runInvestigate() {
   invBusy.value = true
   try {
     const nature = invNatureTab.value || invFilters.value.nature || ''
+    const fileFocus = invFilters.value.topic === 'file_create'
     const r = await investigateLogs({
       q: invQ.value.trim(),
       range: invRange.value,
@@ -11490,8 +9849,11 @@ async function runInvestigate() {
       hostname: invFilters.value.hostname,
       path: invFilters.value.path,
       hash_q: invFilters.value.hash_q,
-      hide_proc_noise: invHideProcNoise.value ? 1 : 0,
-      limit: 200,
+      source: invFilters.value.source,
+      event_id: invFilters.value.event_id,
+      topic: invFilters.value.topic,
+      hide_proc_noise: 0,
+      limit: fileFocus ? 400 : 300,
     })
     if (seq !== invReqSeq) return
     let items = r?.items || []
@@ -11649,19 +10011,54 @@ const dnsStats = computed(() => {
   }
 })
 
-function dnsIocLabel(d) {
-  const h = (d?.ioc_hits || [])[0]
-  const fam = String(h?.malware || '').split(',')[0].trim()
-  if (fam) return fam.length > 12 ? `${fam.slice(0, 12)}…` : fam
+function dnsHitChip(h) {
+  if (!h) return '情报'
+  const fam = String(h.family || '').trim() || String(h.malware || '').split(/[,;]/)[0].trim()
+  if (fam && !/^https?:/i.test(fam) && fam.toLowerCase() !== 'unknown') {
+    return fam.length > 18 ? `${fam.slice(0, 18)}…` : fam
+  }
+  if (h.label) {
+    const lab = String(h.label)
+    return lab.length > 22 ? `${lab.slice(0, 22)}…` : lab
+  }
+  const m = String(h.matched || '').trim()
+  if (m) return m.length > 18 ? `${m.slice(0, 10)}…${m.slice(-6)}` : m
   return '情报'
+}
+function dnsHitTags(d) {
+  const out = []
+  const seen = new Set()
+  for (const h of d?.ioc_hits || []) {
+    for (const t of (h.tags || [])) {
+      const s = String(t || '').trim()
+      if (!s || seen.has(s.toLowerCase())) continue
+      if (/^https?:/i.test(s)) continue
+      seen.add(s.toLowerCase())
+      out.push(s.length > 16 ? `${s.slice(0, 16)}…` : s)
+    }
+    if (h.source && !['ioc_db', 'ioc', 'sqlite', 'mysql', 'es'].includes(String(h.source).toLowerCase())) {
+      const src = String(h.source)
+      const short = src.length > 20 ? `${src.slice(0, 20)}…` : src
+      if (!seen.has(short.toLowerCase())) {
+        seen.add(short.toLowerCase())
+        out.push(short)
+      }
+    }
+  }
+  return out
+}
+function dnsIocLabel(d) {
+  return dnsHitChip((d?.ioc_hits || [])[0])
 }
 function dnsIocTitle(d) {
   const rows = d?.ioc_hits || []
   if (!rows.length) return '命中 ioc_data.db（精确）'
   return rows.map((h) => {
-    const fam = h.malware ? ` · ${h.malware}` : ''
+    const via = h.via_label || h.via || ''
+    const fam = h.family || h.malware || ''
     const src = h.source ? ` @${h.source}` : ''
-    return `${h.type || 'ioc'}=${h.matched || ''}${fam}${src}`
+    const ans = h.answer_ip ? ` ←${h.answer_ip}` : ''
+    return `[${via}] ${h.type || 'ioc'}=${h.matched || ''}${fam ? ` · ${fam}` : ''}${ans}${src}`
   }).join('\n')
 }
 
@@ -11762,6 +10159,7 @@ function openDnsLogHits(d) {
   invFilters.value = {
     nature: '', etype: '', hostname: d.hostname || '',
     path: '', hash_q: '', entity: '', tactic: '', os: '',
+    source: '', event_id: '', topic: '',
   }
   invNatureTab.value = ''
   lastInvestigateAt = 0
@@ -11868,6 +10266,7 @@ function etypeKind(etype) {
 }
 function etypeLabel(etype) {
   const map = {
+    linux_journal: 'Linux 系统日志',
     process_create: '进程创建',
     process_create_live: '进程创建(WMI)',
     process_create_etw: '进程创建(ETW)',
@@ -12091,37 +10490,75 @@ const tlTypeOptions = computed(() => {
   ]
 })
 
-async function runHunt() {
-  const q = huntQ.value.trim()
-  if (q.length < 2) {
-    error.value = '请输入至少 2 个字符'
-    return
-  }
-  huntBusy.value = true
-  huntDone.value = false
-  try {
-    const r = await huntAgents(q, 120)
-    huntHits.value = r?.items || []
-    huntDone.value = true
-  } catch (e) {
-    error.value = e?.message || String(e)
-  } finally {
-    huntBusy.value = false
-  }
+/* ---- Timeline process-tree view (derived only, no data mutation) ---- */
+const tlView = ref('timeline') // 'timeline' | 'tree'
+function tlNodeInfo(t) {
+  const d = parseTlDetail(t) || {}
+  const pid = d.pid ?? d.target_pid ?? ''
+  const ppid = d.ppid ?? ''
+  const name = d.name || d.process_name || d.image || d.parent_name || ''
+  const cmd = d.command_line || d.cmdline || ''
+  return { pid: pid == null ? '' : String(pid), ppid: ppid == null ? '' : String(ppid), name, cmd }
 }
-
-function openHuntHit(h) {
-  if (h?.source === 'event' && h.id) {
-    openEvent({ id: h.id, agent_id: h.agent_id, title: h.title, module: h.module, severity: h.severity })
-    return
+const tlProcessTree = computed(() => {
+  // Aggregate the already-loaded timeline into per-process nodes, then link
+  // parent/child by pid↔ppid. Purely presentational; timelineItems is untouched.
+  const byPid = new Map()
+  const loose = []
+  for (const t of (filteredTimeline.value || [])) {
+    const info = tlNodeInfo(t)
+    const key = info.pid || `ev-${t.id}`
+    let node = byPid.get(key)
+    if (!node) {
+      node = {
+        key, pid: info.pid, ppid: info.ppid,
+        name: info.name || (info.pid ? `进程 ${info.pid}` : (t.summary || '事件')),
+        cmd: info.cmd, events: [], severities: new Set(), kinds: new Set(),
+      }
+      byPid.set(key, node)
+    }
+    node.events.push(t)
+    if (t.severity) node.severities.add(etypeKind(t.etype) === 'alert' || t.severity !== 'info' ? t.severity : 'info')
+    if (t.etype) node.kinds.add(etypeKind(t.etype))
   }
-  const a = agents.value.find((x) => x.agent_id === h.agent_id)
-  if (a && h.module && LABELS[h.module]) {
-    module.value = h.module
-    openHost(a, 'hosts')
-  } else if (h?.agent_id) {
-    openTimelineFor(h.agent_id)
+  const nodes = [...byPid.values()]
+  // Attach children via ppid when the parent pid exists in the set.
+  for (const n of nodes) {
+    n.children = []
+    n.parent = null
   }
+  for (const n of nodes) {
+    if (n.ppid && n.ppid !== n.pid && byPid.has(n.ppid)) {
+      n.parent = byPid.get(n.ppid)
+      n.parent.children.push(n)
+    }
+  }
+  const roots = nodes.filter((n) => !n.parent)
+  for (const n of nodes) {
+    n.topSeverity = ['critical', 'high', 'medium', 'low', 'info'].find((s) => n.severities.has(s)) || 'info'
+    n.eventCount = n.events.length
+  }
+  roots.sort((a, b) => (b.events[0]?.ts || '') > (a.events[0]?.ts || '') ? 1 : -1)
+  // Flatten depth-first so arbitrarily deep parent chains render with one v-for.
+  const flat = []
+  const walk = (n, depth) => {
+    flat.push({ node: n, depth })
+    for (const c of [...n.children].sort((a, b) => (b.events[0]?.ts || '') > (a.events[0]?.ts || '') ? 1 : -1)) walk(c, depth + 1)
+  }
+  for (const r of roots) walk(r, 0)
+  return { roots, flat, total: nodes.length }
+})
+const tlTreeOpen = ref(new Set())
+function tlToggleTreeNode(key) {
+  const s = new Set(tlTreeOpen.value)
+  s.has(key) ? s.delete(key) : s.add(key)
+  tlTreeOpen.value = s
+}
+function tlFocusTreeEvents(node) {
+  // Jump back to the timeline tab and filter to this process id.
+  tlView.value = 'timeline'
+  tlQ.value = node.pid || node.name
+  loadTimeline()
 }
 
 async function loadPolicyPage() {
@@ -12148,10 +10585,6 @@ async function loadPolicyPage() {
           network: p.policy.intervals_sec?.network ?? 5,
           file: p.policy.intervals_sec?.file ?? 12,
         },
-        remote_ops_enabled: p.policy.remote_ops_enabled !== false,
-        remote_ops_read_only: !!p.policy.remote_ops?.read_only,
-        remote_ops_run_cmd: p.policy.remote_ops?.run_cmd_enabled !== false,
-        remote_ops_shell: p.policy.remote_ops?.shell_enabled !== false,
       }
       policyRev.value = p.rev || 0
     }
@@ -12162,6 +10595,39 @@ async function loadPolicyPage() {
   }
 }
 
+async function loadIocLibPreview(reset = false) {
+  if (reset) iocLibPreviewOffset.value = 0
+  // 硬限制：只读库前 100 条窗口
+  iocLibPreviewOffset.value = Math.max(0, Math.min(iocLibPreviewOffset.value, 60))
+  iocLibPreviewBusy.value = true
+  try {
+    const r = await iocLibPreview({
+      limit: 40,
+      offset: iocLibPreviewOffset.value,
+      ioc_type: iocLibPreviewType.value,
+    })
+    iocLibPreviewRows.value = r?.items || []
+    iocLibPreviewTotal.value = Number(r?.total_for_filter || 0)
+    iocLibPreviewDbTotal.value = Number(r?.total_in_db || r?.total_for_filter || 0)
+  } catch (e) {
+    iocLibPreviewRows.value = []
+    error.value = e?.message || String(e)
+  } finally {
+    iocLibPreviewBusy.value = false
+  }
+}
+
+function fillIocFormatFromLib() {
+  const rows = (iocLibPreviewRows.value || []).slice(0, 8)
+  if (!rows.length) return
+  iocText.value = rows.map((r) => {
+    const parts = [r.type || 'file_hash', r.value || '']
+    if (r.source) parts.push(String(r.source).replace(/,/g, ' '))
+    if (r.malware) parts.push(String(r.malware).replace(/,/g, ' '))
+    return parts.join(',')
+  }).join('\n')
+}
+
 async function loadIoc() {
   try {
     const [r, st] = await Promise.all([listIoc(), iocLibStatus().catch(() => null)])
@@ -12170,7 +10636,25 @@ async function loadIoc() {
       iocLib.value = st.lib || {}
       iocLibLocal.value = st.local_enabled || 0
     }
+    await loadIocLibPreview(true)
   } catch (e) { error.value = e?.message || String(e) }
+}
+
+async function doIocLookup() {
+  const q = iocLookupQ.value.trim()
+  if (!q) return
+  iocLookupBusy.value = true
+  try {
+    const r = await lookupIocLib(q, iocLookupType.value)
+    iocLookupHits.value = r?.hits || []
+    if (!iocLookupHits.value.length) okMsg.value = '情报库未命中'
+    else okMsg.value = `命中 ${iocLookupHits.value.length} 条`
+    setTimeout(() => { okMsg.value = '' }, 2000)
+  } catch (e) {
+    error.value = e?.message || String(e)
+  } finally {
+    iocLookupBusy.value = false
+  }
 }
 
 function renderAiMarkdown(src) {
@@ -12313,9 +10797,6 @@ async function loadAiAnalyzePage(opts = {}) {
           returned: skills.returned || skills.items.length,
         }
       }
-      if (isAdmin.value && st && !st.configured) {
-        await setupLocalAiModel(true)
-      }
     } catch (e) {
       // 侧栏失败不阻断主机列表
       if (!(aiHosts.value || []).length) error.value = e?.message || String(e)
@@ -12325,30 +10806,214 @@ async function loadAiAnalyzePage(opts = {}) {
   await Promise.all([hostsTask, sideTask])
 }
 
-async function setupLocalAiModel(silent = false) {
-  const quiet = silent === true
-  try {
-    aiBusy.value = true
-    const r = await aiSetupLocal({
-      base_url: 'http://192.168.31.220:8085/v1',
-      api_key: 'strata-c0938a1a4b224201931e41d162698fe9',
-      model: 'qwen3.8-flash-next-iq3_s',
-      timeout: 120,
-    })
-    aiStatusInfo.value = {
-      ...(aiStatusInfo.value || {}),
-      configured: true,
-      base_url: r?.platform?.base_url || 'http://192.168.31.220:8085/v1',
-      model: r?.platform?.model || 'qwen3.8-flash-next-iq3_s',
-      source: 'platform',
-      timeout: 120,
-      skills_root: aiStatusInfo.value?.skills_root,
+function applyAiModelPreset(mode) {
+  const m = mode === 'online' ? 'online' : 'local'
+  aiModelForm.value.provider_mode = m
+  if (m === 'local') {
+    if (!aiModelForm.value.base_url || /openai\.com|deepseek\.com|moonshot|dashscope/i.test(aiModelForm.value.base_url)) {
+      aiModelForm.value.base_url = 'http://127.0.0.1:8085/v1'
     }
-    if (!quiet) okMsg.value = '本地模型已同步到平台与当前账号'
+    if (!aiModelForm.value.model || /gpt-|deepseek-chat|moonshot|qwen-plus/i.test(aiModelForm.value.model)) {
+      aiModelForm.value.model = 'local-model'
+    }
+    if (!aiModelForm.value.name || /DeepSeek|OpenAI|Moonshot|通义|生产/.test(aiModelForm.value.name)) {
+      aiModelForm.value.name = '本地模型'
+    }
+  }
+}
+
+function applyAiOnlineVendor(p) {
+  if (!p) return
+  aiModelForm.value.provider_mode = 'online'
+  aiModelForm.value.base_url = p.base_url || ''
+  aiModelForm.value.model = p.model || ''
+  if (!aiModelForm.value.name || aiModelForm.value.is_new) {
+    aiModelForm.value.name = p.label || p.model || '在线模型'
+  }
+}
+
+function fillAiModelFormFromProfile(p, st = null) {
+  if (!p || typeof p !== 'object') {
+    if (st) fillAiModelFormFromStatus(st)
+    return
+  }
+  const mode = p.provider_mode === 'local' || p.provider_mode === 'online'
+    ? p.provider_mode
+    : (/192\.168\.|10\.|172\.|127\.0\.0\.1|localhost/i.test(String(p.base_url || '')) ? 'local' : 'online')
+  aiModelForm.value = {
+    id: p.id || '',
+    name: p.name || p.model || '',
+    provider_mode: mode,
+    base_url: p.base_url || '',
+    model: p.model || '',
+    api_key: '',
+    timeout: Number(p.timeout) || 120,
+    has_key: !!(p.has_api_key || p.configured || p.api_key_masked),
+    api_key_masked: p.api_key_masked || '',
+    active: !!p.active,
+    is_new: false,
+  }
+  aiModelTestMsg.value = ''
+  aiModelTestOk.value = null
+}
+
+function fillAiModelFormFromStatus(st) {
+  if (!st || typeof st !== 'object') return
+  const profiles = Array.isArray(st.profiles) ? st.profiles : []
+  aiProfiles.value = profiles
+  const active = profiles.find((x) => x.active) || profiles[0]
+  if (active) {
+    fillAiModelFormFromProfile(active, st)
+    return
+  }
+  const mode = st.provider_mode === 'local' || st.provider_mode === 'online'
+    ? st.provider_mode
+    : (/192\.168\.|10\.|172\.|127\.0\.0\.1|localhost/i.test(String(st.base_url || '')) ? 'local' : 'online')
+  aiModelForm.value = {
+    id: st.active_id || '',
+    name: st.name || st.model || '',
+    provider_mode: mode,
+    base_url: st.base_url || '',
+    model: st.model || '',
+    api_key: '',
+    timeout: Number(st.timeout) || 120,
+    has_key: !!(st.has_api_key || st.configured || st.api_key_masked),
+    api_key_masked: st.api_key_masked || '',
+    active: true,
+    is_new: false,
+  }
+}
+
+function selectAiProfile(p) {
+  fillAiModelFormFromProfile(p)
+}
+
+function startNewAiProfile() {
+  const mode = aiModelForm.value.provider_mode === 'online' ? 'online' : 'local'
+  aiModelForm.value = {
+    id: '',
+    name: mode === 'local' ? '本地模型' : '在线模型',
+    provider_mode: mode,
+    base_url: mode === 'local' ? 'http://127.0.0.1:8085/v1' : 'https://api.deepseek.com/v1',
+    model: mode === 'local' ? 'local-model' : 'deepseek-chat',
+    api_key: '',
+    timeout: 120,
+    has_key: false,
+    api_key_masked: '',
+    active: false,
+    is_new: true,
+  }
+  aiModelTestMsg.value = ''
+  aiModelTestOk.value = null
+}
+
+async function loadAiModelConfig() {
+  try {
+    const st = await aiStatus()
+    if (st) {
+      aiStatusInfo.value = { ...(aiStatusInfo.value || {}), ...st }
+      fillAiModelFormFromStatus(st)
+    }
+  } catch (e) {
+    error.value = e?.message || String(e)
+  }
+}
+
+function applyPlatformAiStatus(plat, fallback = {}) {
+  const merged = { ...(aiStatusInfo.value || {}), ...(plat || {}), source: 'platform' }
+  if (!merged.base_url) merged.base_url = fallback.base_url
+  if (!merged.model) merged.model = fallback.model
+  aiStatusInfo.value = merged
+  fillAiModelFormFromStatus(merged)
+}
+
+async function saveAiModelConfig() {
+  if (!isAdmin.value) return
+  aiModelSaving.value = true
+  error.value = ''
+  aiModelTestMsg.value = ''
+  try {
+    const f = aiModelForm.value
+    const payload = {
+      as_new: !!f.is_new || !f.id,
+      activate: true,
+      name: String(f.name || f.model || '').trim(),
+      provider_mode: f.provider_mode === 'online' ? 'online' : 'local',
+      base_url: String(f.base_url || '').trim(),
+      model: String(f.model || '').trim(),
+      timeout: Number(f.timeout) || 120,
+    }
+    if (f.id && !f.is_new) payload.id = f.id
+    const key = String(f.api_key || '').trim()
+    if (key) payload.api_key = key
+    const r = await aiSaveConfig(payload)
+    applyPlatformAiStatus(r?.platform, payload)
+    flashOk(f.is_new ? '已新增并启用模型' : '模型配置已保存')
   } catch (e) {
     error.value = e?.message || String(e)
   } finally {
-    aiBusy.value = false
+    aiModelSaving.value = false
+  }
+}
+
+async function activateAiModelProfile(id) {
+  if (!isAdmin.value || !id) return
+  aiModelSaving.value = true
+  error.value = ''
+  try {
+    const r = await aiActivateProfile(id)
+    applyPlatformAiStatus(r?.platform)
+    flashOk('已切换为当前使用模型')
+  } catch (e) {
+    error.value = e?.message || String(e)
+  } finally {
+    aiModelSaving.value = false
+  }
+}
+
+async function deleteAiModelProfile(id) {
+  if (!isAdmin.value || !id) return
+  if (!window.confirm('删除这套模型配置？')) return
+  aiModelSaving.value = true
+  error.value = ''
+  try {
+    const r = await aiDeleteProfile(id)
+    applyPlatformAiStatus(r?.platform)
+    flashOk('已删除')
+  } catch (e) {
+    error.value = e?.message || String(e)
+  } finally {
+    aiModelSaving.value = false
+  }
+}
+
+async function testAiModelConfig() {
+  if (!isAdmin.value) return
+  aiModelTesting.value = true
+  aiModelTestMsg.value = ''
+  aiModelTestOk.value = null
+  error.value = ''
+  try {
+    const f = aiModelForm.value
+    const payload = {
+      id: f.id || '',
+      profile_id: (!f.is_new && f.id) ? f.id : '',
+      base_url: String(f.base_url || '').trim(),
+      model: String(f.model || '').trim(),
+      timeout: Math.min(Number(f.timeout) || 30, 60),
+    }
+    const key = String(f.api_key || '').trim()
+    if (key) payload.api_key = key
+    const r = await aiTestConfig(payload)
+    aiModelTestOk.value = true
+    aiModelTestMsg.value = `连通正常 · ${r.latency_ms || '?'}ms · 回复「${(r.reply || '').slice(0, 40)}」`
+    flashOk('模型测试通过')
+  } catch (e) {
+    aiModelTestOk.value = false
+    aiModelTestMsg.value = e?.message || String(e)
+    error.value = e?.message || String(e)
+  } finally {
+    aiModelTesting.value = false
   }
 }
 
@@ -12356,18 +11021,19 @@ async function runAiAnalyze(host) {
   if (!host?.agent_id || aiBusy.value || aiRefining.value) return
   const aid = host.agent_id
   aiSelectedId.value = aid
-    aiResult.value = null
-    aiErrorText.value = ''
-    aiRefining.value = false
-    aiThinkIdx.value = 0
-    aiEntityIdx.value = 0
-    aiThreatIdx.value = 0
-    aiLogIdx.value = 0
-    aiLogCat.value = ''
-    aiChainNodeId.value = ''
-    aiTab.value = 'overview'
-    aiBusy.value = true
-    try {
+  aiResult.value = null
+  aiErrorText.value = ''
+  aiRefining.value = false
+  aiThinkIdx.value = 0
+  aiEntityIdx.value = 0
+  aiThreatIdx.value = 0
+  aiLogIdx.value = -1
+  aiLogCat.value = ''
+  aiLogRuleHit.value = null
+  aiChainNodeId.value = ''
+  aiTab.value = 'overview'
+  aiBusy.value = true
+  try {
     // 1) Agent Team 启发式（通常 <1s）
     const quick = await aiAnalyzeHost(aid, { useLlm: false })
     if (aiSelectedId.value !== aid) return
@@ -12375,8 +11041,9 @@ async function runAiAnalyze(host) {
     aiThinkIdx.value = 0
     aiEntityIdx.value = 0
     aiThreatIdx.value = 0
-    aiLogIdx.value = 0
+    aiLogIdx.value = -1
     aiLogCat.value = ''
+    aiLogRuleHit.value = null
     const nodes = quick?.result?.attack_graph?.nodes || []
     aiChainNodeId.value = (nodes.find((n) => n.type === 'stage') || nodes[0] || {}).id || ''
     // 优先看攻击链路；否则研判事件 / 日志
@@ -12593,11 +11260,14 @@ async function doRollbackUpgrade() {
 async function loadAttackStory() {
   const ev = activeEvent.value
   if (!ev) return
+  const epoch = threatOpenEpoch
+  const current = () => epoch === threatOpenEpoch && page.value === 'threat-view' && activeEvent.value?.id === ev.id
   try {
     const r = await attackStory({ agentId: ev.agent_id, eventId: ev.id, limit: 60 })
+    if (!current()) return
     storyNodes.value = r?.nodes || []
     storyTech.value = r?.techniques || []
-  } catch (e) { error.value = e?.message || String(e) }
+  } catch (e) { if (current()) error.value = e?.message || String(e) }
 }
 
 function threatTreeHasKids(id) {
@@ -12617,11 +11287,7 @@ const threatGraphVisibleNodes = computed(() => {
   if (!hitId) return nodes
   const byId = Object.fromEntries(nodes.map((n) => [n.id, n]))
   const keep = new Set()
-  let cur = byId[hitId]
-  while (cur) {
-    keep.add(cur.id)
-    cur = cur.parent_id ? byId[cur.parent_id] : null
-  }
+  for (const node of graphParentChain(byId, hitId)) keep.add(node.id)
   const stack = [hitId]
   const exp = tvTreeExpanded.value || {}
   while (stack.length) {
@@ -12647,8 +11313,7 @@ const threatGraphLayers = computed(() => {
   function depthOf(n) {
     if (!n?.id) return 0
     if (depthMemo.has(n.id)) return depthMemo.get(n.id)
-    let d = 0
-    if (n.parent_id && byId[n.parent_id]) d = depthOf(byId[n.parent_id]) + 1
+    const d = Math.max(0, graphParentChain(byId, n.id).length - 1)
     depthMemo.set(n.id, d)
     return d
   }
@@ -12772,9 +11437,12 @@ function onThreatGraphNode(n) {
 async function loadThreatProcessTree() {
   const ev = activeEvent.value
   if (!ev?.agent_id) return
+  const epoch = threatOpenEpoch
+  const current = () => epoch === threatOpenEpoch && page.value === 'threat-view' && activeEvent.value?.id === ev.id
   threatTreeBusy.value = true
   try {
     const r = await threatProcessTree({ agentId: ev.agent_id, eventId: ev.id, maxNodes: 72 })
+    if (!current()) return
     threatTree.value = r
     const nodes = r?.nodes || []
     const hitNode = nodes.find((n) => n.is_hit) || nodes.find((n) => n.id === r?.hit_id)
@@ -12794,17 +11462,13 @@ async function loadThreatProcessTree() {
     const byId = Object.fromEntries(nodes.map((n) => [n.id, n]))
     const exp = {}
     for (const n of nodes) exp[n.id] = true
-    let cur = byId[r?.hit_id]
-    while (cur) {
-      exp[cur.id] = true
-      cur = byId[cur.parent_id]
-    }
+    for (const node of graphParentChain(byId, r?.hit_id)) exp[node.id] = true
     tvTreeExpanded.value = exp
     tvZoom.value = 1
   } catch {
-    threatTree.value = null
+    if (current()) threatTree.value = null
   } finally {
-    threatTreeBusy.value = false
+    if (current()) threatTreeBusy.value = false
   }
 }
 
@@ -12886,31 +11550,97 @@ async function doDelUpgrade(id) {
   } catch (e) { error.value = e?.message || String(e) }
 }
 
-function fmtNum(n) {
-  const x = Number(n) || 0
-  return x.toLocaleString('zh-CN')
-}
 
-function fmtSize(n) {
-  const x = Number(n) || 0
-  if (x < 1024) return `${x} B`
-  if (x < 1024 * 1024) return `${(x / 1024).toFixed(1)} KB`
-  return `${(x / 1024 / 1024).toFixed(1)} MB`
+
+async function doAddIoc() {
+  if (!isAdmin.value) {
+    error.value = '需要管理员才能添加 IOC'
+    return
+  }
+  const value = String(iocForm.value.value || '').trim()
+  if (!value) return
+  iocAddBusy.value = true
+  try {
+    const r = await addIoc(
+      iocForm.value.type || 'auto',
+      value,
+      iocForm.value.severity || 'high',
+      '',
+      iocForm.value.name || '',
+    )
+    okMsg.value = `已添加 ${iocTypeLabel(r?.ioc_type || iocResolvedType.value)}：${r?.value || value}`
+    iocForm.value = { value: '', type: 'auto', name: '', severity: iocForm.value.severity || 'high' }
+    iocDetectedType.value = ''
+    await loadIoc()
+  } catch (e) {
+    error.value = e?.message || String(e)
+  } finally {
+    iocAddBusy.value = false
+  }
 }
 
 async function doImportIoc() {
+  if (!isAdmin.value) {
+    error.value = '需要管理员才能导入 IOC'
+    return
+  }
   if (!iocText.value.trim()) return
   try {
-    const r = await importIoc(iocText.value, iocType.value)
-    okMsg.value = `已导入 ${r?.imported || 0} 条`
+    const r = await importIoc(iocText.value, iocType.value || 'auto')
+    const skipped = r?.skipped ? `，跳过 ${r.skipped}` : ''
+    const types = (r?.types || []).length ? `（${r.types.map(iocTypeLabel).join('、')}）` : ''
+    okMsg.value = `已导入 ${r?.imported || 0} 条${types}${skipped}`
     iocText.value = ''
     await loadIoc()
   } catch (e) { error.value = e?.message || String(e) }
 }
 
 async function delIoc(id) {
+  if (!isAdmin.value) {
+    error.value = '需要管理员才能删除 IOC'
+    return
+  }
   if (!window.confirm('删除 IOC？')) return
   try { await deleteIoc(id); await loadIoc() } catch (e) { error.value = e?.message || String(e) }
+}
+
+function openThreatAi() {
+  threatTab.value = 'ai'
+  if (!threatAiResult.value && !threatAiBusy.value) runThreatAi(false)
+}
+
+async function runThreatAi(force = false) {
+  const aid = activeEvent.value?.agent_id
+  const eid = activeEvent.value?.id
+  if (!aid) {
+    threatAiError.value = '当前告警缺少终端 ID'
+    return
+  }
+  if (threatAiBusy.value || threatAiRefining.value) return
+  if (!force && threatAiResult.value?.agent_id === aid && threatAiResult.value?.focus_event_id === eid) return
+  threatAiBusy.value = true
+  threatAiRefining.value = false
+  threatAiError.value = ''
+  threatAiResult.value = null
+  try {
+    const quick = await aiAnalyzeHost(aid, { useLlm: false, eventId: eid })
+    threatAiResult.value = { ...quick, agent_id: aid, focus_event_id: eid }
+    threatAiBusy.value = false
+    threatAiRefining.value = true
+    try {
+      const full = await aiAnalyzeHost(aid, { useLlm: true, eventId: eid })
+      if (full?.ok) threatAiResult.value = { ...full, agent_id: aid, focus_event_id: eid }
+      else if (full?.error) threatAiError.value = `模型精炼：${full.error}`
+    } catch (e) {
+      threatAiError.value = `模型精炼失败：${e?.message || e}（已保留启发式结果）`
+    } finally {
+      threatAiRefining.value = false
+    }
+  } catch (e) {
+    threatAiError.value = e?.message || String(e)
+    threatAiBusy.value = false
+    threatAiRefining.value = false
+  }
 }
 
 async function loadSeqRules() {
@@ -13080,10 +11810,6 @@ async function savePolicy() {
       fim_paths_text: fimText,
       log_tail_paths_text: logTailText,
       winevent_channels_text: wevtText,
-      remote_ops_read_only,
-      remote_ops_run_cmd,
-      remote_ops_shell,
-      remote_ops_enabled,
       ...rest
     } = policyForm.value
     const fimPaths = String(fimText || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 50)
@@ -13094,12 +11820,12 @@ async function savePolicy() {
       fim_paths: fimPaths,
       log_tail_paths: logTailPaths,
       winevent_channels: wineventChannels,
-      remote_ops_enabled,
+      remote_ops_enabled: false,
       remote_ops: {
-        enabled: remote_ops_enabled,
-        read_only: remote_ops_read_only,
-        run_cmd_enabled: remote_ops_run_cmd,
-        shell_enabled: remote_ops_shell,
+        enabled: false,
+        read_only: true,
+        run_cmd_enabled: false,
+        shell_enabled: false,
         shell_max_minutes: 15,
       },
     }, 'global')
@@ -13286,10 +12012,14 @@ function hydrateEventsCache() {
   }
 }
 
+const eventsRequestGate = latestRequest()
 async function loadEvents(showErr = true, syncFromTimeline = false) {
+  const current = eventsRequestGate.begin()
   try {
     // 始终先拉轻量列表（sync=0）；绝不因晋升卡住首屏
     const quick = await listEvents({ status: '', limit: 500, sync: false })
+    if (!current()) return
+    eventServerTotal.value = Number.isInteger(quick?.total) ? quick.total : null
     if (Array.isArray(quick?.items)) applyEventsList(quick.items)
 
     const wantSync = syncFromTimeline || !allEvents.value.length
@@ -13298,63 +12028,78 @@ async function loadEvents(showErr = true, syncFromTimeline = false) {
       eventsSyncInflight = listEvents({ status: '', limit: 500, sync: true })
         .then((synced) => {
           lastEventsSyncAt = Date.now()
-          if (Array.isArray(synced?.items)) applyEventsList(synced.items)
+          if (current() && Array.isArray(synced?.items)) {
+            eventServerTotal.value = Number.isInteger(synced?.total) ? synced.total : null
+            applyEventsList(synced.items)
+          }
           return synced
         })
         .catch((e) => {
-          if (showErr && !allEvents.value.length) error.value = e?.message || String(e)
+          if (current() && showErr && !allEvents.value.length) error.value = e?.message || String(e)
         })
         .finally(() => { eventsSyncInflight = null })
     }
-    if ((wantSync || syncFromTimeline) && !timelineItems.value.length) {
-      listTimeline({ limit: 80 }).then((tl) => {
-        timelineItems.value = tl?.items || []
-      }).catch(() => {})
+    if ((wantSync || syncFromTimeline) && !timelineItems.value.length && !tlAgentId.value && !tlQ.value && !tlTypeFilter.value) {
+      await loadTimeline()
     }
   } catch (e) {
-    if (showErr && !allEvents.value.length) error.value = e?.message || String(e)
+    if (current() && showErr && !allEvents.value.length) error.value = e?.message || String(e)
   }
 }
 
+let threatOpenEpoch = 0
 async function openEvent(e) {
   if (!e?.id) return
+  const epoch = ++threatOpenEpoch
   section.value = 'detect'
   threatTab.value = 'graph'
   threatPanelNode.value = 'hit'
   dismissRespToast()
-  respToastCmdKey = ''
+  resetRespToastKey()
   storyNodes.value = []
   storyTech.value = []
   relatedPayload.value = null
   threatEvidenceEnrich.value = {}
   threatProcessSnap.value = []
+  threatTree.value = null
+  threatTreeBusy.value = false
+  threatAiBusy.value = false
+  threatAiRefining.value = false
+  threatAiResult.value = null
+  threatAiError.value = ''
+  if (page.value === 'malware') eventListReturnPage.value = 'malware'
+  else if (page.value === 'events') eventListReturnPage.value = 'events'
+  activeEvent.value = e
+  listFocusId.value = e.id
+  listFocusEvent.value = e
+  page.value = 'threat-view'
+  const current = () => epoch === threatOpenEpoch && page.value === 'threat-view' && activeEvent.value?.id === e.id
   try {
     const r = await getEvent(e.id)
+    if (!current()) return
     activeEvent.value = r?.item || e
     if (detailLooksThinForEnrich(activeEvent.value)) {
       try {
         const er = await enrichEventDetail(e.id)
+        if (!current()) return
         if (er?.item) activeEvent.value = er.item
       } catch { /* 单条 enrich 失败仍用 getEvent 结果 */ }
     }
   } catch {
-    activeEvent.value = e
+    if (!current()) return
   }
-  listFocusId.value = e.id
+  if (!current()) return
   listFocusEvent.value = activeEvent.value
-  if (page.value === 'malware') eventListReturnPage.value = 'malware'
-  else if (page.value === 'events') eventListReturnPage.value = 'events'
-  page.value = 'threat-view'
   // 预载同主机时间线，便于威胁图补全父进程名
   const aid = activeEvent.value?.agent_id
   if (aid) {
     tlAgentId.value = aid
     listTimeline({ agentId: aid, limit: 200 }).then((r) => {
-      timelineItems.value = r?.items || []
+      if (current()) timelineItems.value = r?.items || []
     }).catch(() => {})
     getSnapshot(aid, 'process').then((r) => {
-      if (activeEvent.value?.agent_id !== aid) return
-      const items = r?.items || r?.snap?.items || []
+      if (!current()) return
+      const items = r?.item?.items || r?.items || r?.snap?.items || []
       threatProcessSnap.value = items
       const flat = evidenceFlatOf(parseEventEvidence(activeEvent.value))
       const pid = flat.pid != null && flat.pid !== '' ? String(flat.pid) : ''
@@ -13367,6 +12112,7 @@ async function openEvent(e) {
       })
       enrichThreatFromProcessDb(aid, flat)
     }).catch(() => {
+      if (!current()) return
       const flat = evidenceFlatOf(parseEventEvidence(activeEvent.value))
       enrichThreatFromProcessDb(aid, flat)
     })
@@ -13375,12 +12121,17 @@ async function openEvent(e) {
   loadAttackStory()
   loadThreatProcessTree()
   getRelatedEvents(e.id, 20).then((r) => {
-    if (activeEvent.value?.id === e.id) relatedPayload.value = r
-  }).catch(() => { relatedPayload.value = null })
+    if (current()) relatedPayload.value = r
+  }).catch(() => { if (current()) relatedPayload.value = null })
 }
 
 function closeThreat() {
+  threatOpenEpoch++
   activeEvent.value = null
+  threatAiBusy.value = false
+  threatAiRefining.value = false
+  threatAiResult.value = null
+  threatAiError.value = ''
   page.value = eventListReturnPage.value === 'malware' ? 'malware' : 'events'
   loadEvents()
 }
@@ -13410,34 +12161,48 @@ async function loadSnap(m, { silent = false, keepRow = false, syncGroup = true }
   module.value = m
   if (syncGroup && hostTabGroup.value !== 'remote') syncHostTabGroup(m)
   if (switched) {
+    snap.value = null
+    snapPage.value = 1
     snapRow.value = null
     snapQ.value = ''
   }
   if (!selected.value?.agent_id) return
+  const agentID = selected.value.agent_id
+  const revision = ++snapLoadRevision
+  const current = () => revision === snapLoadRevision && selected.value?.agent_id === agentID && module.value === m
   if (!silent) snapLoading.value = true
   snapError.value = ''
   const prevKey = keepRow || !switched ? rowKey(snapRow.value) : ''
   try {
-    const r = await getSnapshot(selected.value.agent_id, m)
+    const r = await getSnapshot(agentID, m)
+    if (!current()) return
     snap.value = r?.item || r || null
     const items = snap.value?.items || []
     if (m === 'sysinfo') {
       snapRow.value = null
     } else if (items.length) {
       const found = prevKey ? items.find((x) => rowKey(x) === prevKey) : null
-      snapRow.value = found || (switched || !snapRow.value ? items[0] : snapRow.value)
+      snapRow.value = found || items[0]
     } else {
       snapRow.value = null
     }
   } catch (e) {
+    if (!current()) return
     snap.value = null
     if (!silent) snapError.value = e?.message || '无快照'
   } finally {
-    if (!silent) snapLoading.value = false
+    if (current()) snapLoading.value = false
   }
 }
 
 function openHost(a, dest = 'hosts') {
+  if (selected.value?.agent_id !== a.agent_id) {
+    snapLoadRevision++
+    snap.value = null
+    snapRow.value = null
+    snapPage.value = 1
+    snapQ.value = ''
+  }
   selected.value = a
   section.value = 'asset'
   page.value = 'hosts'
@@ -13448,19 +12213,33 @@ function openHost(a, dest = 'hosts') {
 }
 
 function backFromHost() {
-  stopHostRemotePoll()
-  stopHostRemoteShellPoll()
-  hostRemoteShellId.value = ''
-  hostRemoteShellPhase.value = 'idle'
-  hostRemoteShellLines.value = []
+  snapLoadRevision++
+  snapLoading.value = false
   hostHdrMore.value = false
   hostHealthOpen.value = false
   selected.value = null
   snap.value = null
   snapRow.value = null
   hostRiskItems.value = []
-  hostRemoteCommands.value = []
   page.value = 'hosts'
+}
+
+function purgeClientAgentResidue(agentId) {
+  const aid = String(agentId || '')
+  if (!aid) return
+  allEvents.value = (allEvents.value || []).filter((e) => e.agent_id !== aid)
+  events.value = allEvents.value
+  openEventCount.value = allEvents.value.length
+  timelineItems.value = (timelineItems.value || []).filter((t) => t.agent_id !== aid)
+  if (listFocusEvent.value?.agent_id === aid) {
+    listFocusId.value = null
+    listFocusEvent.value = null
+  }
+  if (activeEvent.value?.agent_id === aid) {
+    activeEvent.value = null
+    if (page.value === 'threat-view') page.value = 'events'
+  }
+  try { sessionStorage.removeItem(EVENTS_CACHE_KEY) } catch { /* ignore */ }
 }
 
 async function removeHost(a) {
@@ -13469,13 +12248,20 @@ async function removeHost(a) {
     ? `仅删除平台记录「${a.hostname || a.agent_id}」（快照/威胁/时间线）？\nAgent 若仍在跑会重新注册。若要卸掉客户端请先点「远程卸载」。`
     : `删除主机「${a.hostname || a.agent_id}」及其快照、威胁、时间线？`
   if (!window.confirm(tip)) return
+  const aid = a.agent_id
   try {
-    await deleteAgent(a.agent_id)
-    if (selected.value?.agent_id === a.agent_id) selected.value = null
+    await deleteAgent(aid)
+    if (selected.value?.agent_id === aid) selected.value = null
+    // 先清前端残留，避免概览在 API 刷新完成前仍展示已删终端告警
+    purgeClientAgentResidue(aid)
     okMsg.value = '平台记录已删除（含威胁与时间线）'
     setTimeout(() => { okMsg.value = '' }, 2500)
     await refresh()
-    await loadEvents()
+    await Promise.all([
+      loadEvents(false, false),
+      loadTimeline(),
+      loadOverview(),
+    ])
   } catch (e) {
     error.value = e?.message || String(e)
   }
@@ -13487,11 +12273,11 @@ async function uninstallHost(a) {
     error.value = '终端离线，无法远程卸载'
     return
   }
-  const tip = `向「${a.hostname || a.agent_id}」下发远程卸载？\n将停止并删除 Agent 服务（约数秒后生效），随后可再「删除记录」清理平台数据。`
+  const tip = `向「${a.hostname || a.agent_id}」下发远程卸载？\n将：停止并删除 ForensicAgent 服务、删除 keepalive 计划任务、清理安装目录与状态目录（需 Agent ≥0.13.10）。\n平台侧记录需另点「删除记录」。`
   if (!window.confirm(tip)) return
   try {
     await createAgentCommand(a.agent_id, 'uninstall_agent', { remove_files: true })
-    okMsg.value = '卸载指令已下发，等待终端心跳执行'
+    okMsg.value = '完整卸载已下发（服务+任务+目录），等待终端执行'
     setTimeout(() => { okMsg.value = '' }, 3000)
   } catch (e) {
     error.value = e?.message || String(e)
@@ -13499,22 +12285,45 @@ async function uninstallHost(a) {
 }
 
 async function doDownload() {
+  const blocked = windowsDownloadBlocked.value
+  if (blocked) {
+    dlError.value = blocked
+    return
+  }
+  if (!release.value?.integrity_verified || !['latest', 'stale'].includes(release.value?.status)) {
+    dlError.value = '发布状态不可下载，请切换架构或点「刷新地址」后重试。'
+    return
+  }
+  const allowStale = release.value.status === 'stale'
+  if (allowStale && !window.confirm('该安装包不包含当前全部源码修复，确认下载旧构建？')) return
+  await runPackageDownload((arch, progress) => downloadInstallPackage(arch, progress, { allowStale }), releaseArch.value, `Windows ${releaseArch.value}`)
+}
+
+async function doDownloadLinux(arch) {
+  if (!isAdmin.value) return
+  const labels = { amd64: 'x64', arm64: 'ARM64', loong64: 'LoongArch64', riscv64: 'RISC-V64' }
+  if (!labels[arch]) return
+  await runPackageDownload(downloadLinuxInstallPackage, arch, `Linux ${labels[arch]}`)
+}
+
+async function runPackageDownload(download, arch, label) {
+  if (dlBusy.value) return
   dlBusy.value = true
-  dlProgress.value = '准备安装包…'
+  dlProgress.value = `正在准备 ${label} 安装包…`
   dlError.value = ''
   try {
-    await downloadInstallPackage(({ phase, received, total }) => {
+    await download(arch, ({ phase, received, total }) => {
       if (phase !== 'download') return
       if (total > 0) {
         const pct = Math.min(100, Math.round((received / total) * 100))
         const mb = (received / 1048576).toFixed(1)
         const tmb = (total / 1048576).toFixed(1)
-        dlProgress.value = `下载中 ${pct}%（${mb}/${tmb} MB）`
+        dlProgress.value = `${label} 下载中 ${pct}%（${mb}/${tmb} MB）`
       } else {
-        dlProgress.value = `下载中 ${(received / 1048576).toFixed(1)} MB…`
+        dlProgress.value = `${label} 下载中 ${(received / 1048576).toFixed(1)} MB…`
       }
     })
-    okMsg.value = '安装包已开始下载'
+    okMsg.value = `${label} 安装包已开始下载`
     setTimeout(() => { okMsg.value = '' }, 2000)
   } catch (e) {
     dlError.value = e?.message || String(e)
@@ -13528,6 +12337,9 @@ async function loadSettings() {
   try {
     const j = await edrGetSettings()
     agentServerUrl.value = j.agent_server_url || ''
+  } catch { /* ignore */ }
+  try {
+    await loadAiModelConfig()
   } catch { /* ignore */ }
   try {
     if (!agentRules.value.length) await loadRules()
@@ -13566,7 +12378,7 @@ function flashOk(msg) {
 // ---------- 账号 ----------
 
 const edrUsers = ref([])
-const roleLabels = ref({ admin: '管理员', analyst: '分析员', readonly: '只读' })
+const roleLabels = ref({ ...ROLE_LABELS })
 const dlg = ref('')
 const dlgForm = ref({})
 const dlgBusy = ref(false)
@@ -13575,12 +12387,6 @@ const dlgTitle = computed(() => ({
   pw: '修改我的密码', create: '新建账号', reset: '重置密码',
 }[dlg.value] || ''))
 
-function fmtEpoch(sec) {
-  if (!sec) return '—'
-  const d = new Date(Number(sec) * 1000)
-  const p = (n) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
-}
 
 async function loadEdrUsers() {
   if (!isAdmin.value) return
@@ -13673,21 +12479,9 @@ let snapTimer = null
 
 watch([section, page, eventListReturnPage, rulesSection, () => activeEvent.value?.id], saveNavState)
 
-watch(hostRemoteSubTab, (tab) => {
-  if (tab === 'files' && selected.value?.online) hostRemoteFsLoadVolumes()
-  if (tab === 'shell') nextTick(() => { hostRemoteShellInputRef.value?.focus() })
-})
-
-watch(() => selected.value?.agent_id, () => {
-  hostRemoteFsDrives.value = []
-  hostRemoteFsRoots.value = []
-  hostRemoteFsEntries.value = []
-  hostRemoteFsPreview.value = ''
-  hostRemoteFsHint.value = ''
-  hostLiveQueryRows.value = []
-  hostLiveQueryMeta.value = null
-  if (hostTabGroup.value === 'remote' && hostRemoteSubTab.value === 'files' && selected.value?.online) {
-    hostRemoteFsLoadVolumes()
+watch([page, rulesSection], ([p, rs]) => {
+  if (p === 'rules' && rs === 'logrules' && !logRulesBusy.value && !logRulesPack.value?.ok) {
+    loadLogRules(false)
   }
 })
 
@@ -13695,6 +12489,9 @@ onMounted(async () => {
   restoreNavState()
   hydrateEventsCache() // 刷新瞬间先用缓存顶住威胁列表，避免空白
   await refresh()
+  if (page.value === 'rules' && rulesSection.value === 'logrules') {
+    loadLogRules(false)
+  }
   if (pendingThreatRestoreId.value) {
     const tid = pendingThreatRestoreId.value
     pendingThreatRestoreId.value = null
@@ -13709,6 +12506,9 @@ onMounted(async () => {
     const kind = msg?.kind || ''
     const rulesKind = kind === 'policy' || kind === 'rules' || kind === 'whitelist' || kind === 'ioc' || kind === 'command'
     const fleetKind = kind === 'register' || kind === 'agent' || kind === 'heartbeat' || kind === 'agent_deleted'
+    if (kind === 'agent_deleted' && msg?.agent_id) {
+      purgeClientAgentResidue(msg.agent_id)
+    }
     if (page.value === 'rules' && shouldRefreshAgentSyncManifest(kind)) {
       loadAgentSyncManifest({ silent: true })
     }
@@ -13716,8 +12516,13 @@ onMounted(async () => {
       snap: kind === 'snapshot' || kind === 'event' || kind === 'timeline',
       rules: rulesKind,
       overview: fleetKind || page.value === 'overview',
-      events: kind === 'event', // 有新告警才立刻刷新列表
+      // 删除终端后必须立刻刷告警列表，否则概览会残留
+      events: kind === 'event' || kind === 'agent_deleted',
     })
+    if (kind === 'agent_deleted') {
+      loadTimeline().catch(() => {})
+      loadOverview().catch(() => {})
+    }
   })
   const softRefreshTick = () => {
     softRefresh({
@@ -13732,14 +12537,16 @@ onMounted(async () => {
     nowTick.value = Date.now()
   }, 1000)
   document.addEventListener('click', closeUserMenu)
+  document.addEventListener('keydown', onGlobalSearchHotkey)
 })
 onUnmounted(() => {
   document.removeEventListener('click', closeUserMenu)
+  document.removeEventListener('keydown', onGlobalSearchHotkey)
   if (timer) clearInterval(timer)
   if (overviewReloadTimer) clearTimeout(overviewReloadTimer)
   if (snapTimer) clearInterval(snapTimer)
   if (liveTickTimer) clearInterval(liveTickTimer)
-  if (respPollTimer) clearInterval(respPollTimer)
+  stopRespPoll()
   try { stopStream?.() } catch { /* ignore */ }
 })
 </script>
@@ -13747,119 +12554,20 @@ onUnmounted(() => {
 <style scoped>
 .app {
   display: grid;
-  grid-template-columns: 76px 1fr;
+  grid-template-columns: 76px minmax(0, 1fr);
+  width: 100%;
+  max-width: none;
   height: 100%;
   min-height: 100vh;
   position: relative;
+  margin: 0;
 }
-.rail {
-  background: linear-gradient(180deg, #0a101c 0%, #121a2a 55%, #0f1624 100%);
-  color: #8b9cb3;
-  display: flex;
-  flex-direction: column;
-  padding: 12px 8px 14px;
-  border-right: 1px solid rgba(255,255,255,.04);
-}
-.logo {
-  display: flex; flex-direction: column; align-items: center; gap: 8px;
-  padding: 8px 4px 18px; color: #fff;
-  border-bottom: 1px solid rgba(255,255,255,.06);
-  margin-bottom: 10px;
-}
-.logo-mark {
-  width: 36px; height: 36px; border-radius: 10px;
-  background: linear-gradient(145deg, #c81626 0%, #a8121f 100%);
-  box-shadow: 0 6px 16px rgba(200, 22, 38, .35);
-  display: grid; place-items: center; font-weight: 750; font-size: 15px;
-  letter-spacing: -.02em;
-}
-.logo-name {
-  font-size: 12px; font-weight: 700; letter-spacing: .04em;
-  color: #e8eef8; line-height: 1;
-}
-.rail-nav { display: flex; flex-direction: column; gap: 4px; flex: 1; }
-.rail-item {
-  position: relative; border: 0; background: transparent; color: inherit;
-  border-radius: 12px; padding: 10px 4px 9px; text-align: center;
-  display: flex; flex-direction: column; gap: 5px; align-items: center;
-  transition: background .15s, color .15s;
-}
-.rail-item::before {
-  content: ''; position: absolute; left: -8px; top: 50%; transform: translateY(-50%);
-  width: 3px; height: 0; border-radius: 0 3px 3px 0; background: #e11d2e;
-  transition: height .15s;
-}
-.rail-item:hover { background: rgba(255,255,255,.05); color: #dbe7f7; }
-.rail-item.on {
-  background: rgba(200, 22, 38, .22); color: #fff;
-  box-shadow: inset 0 0 0 1px rgba(200, 22, 38, .28);
-}
-.rail-item.on::before { height: 22px; }
-.rail-item .ico {
-  display: grid; place-items: center; width: 24px; height: 24px; opacity: .88;
-}
-.rail-item.on .ico { opacity: 1; color: #fecaca; }
-.rail-item em {
-  font-style: normal; font-size: 11px; font-weight: 600;
-  letter-spacing: .02em; line-height: 1.1; white-space: nowrap;
-}
-.dot-n {
-  position: absolute; top: 4px; right: 4px; min-width: 16px; height: 16px;
-  padding: 0 4px; border-radius: 999px; background: #f97316; color: #fff;
-  font-size: 10px; font-style: normal; font-weight: 700;
-  display: grid; place-items: center; box-shadow: 0 0 0 2px #0f1624;
-}
-.rail-bottom {
-  position: relative; margin-top: auto; padding-top: 12px;
-  border-top: 1px solid rgba(255,255,255,.06); text-align: center;
-}
-.rail-user {
-  width: 100%; border: 0; background: transparent; color: #a9b8cd; border-radius: 12px;
-  padding: 8px 4px; display: flex; flex-direction: column; align-items: center; gap: 6px;
-}
-.rail-user:hover { background: rgba(255,255,255,.05); color: #e8eef8; }
-.rail-user em {
-  font-style: normal; font-size: 11px; font-weight: 600; max-width: 100%;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.ru-avatar {
-  width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; flex: none;
-  background: linear-gradient(145deg, #334155, #1e293b); color: #e2e8f0;
-  font-size: 13px; font-weight: 700; box-shadow: inset 0 0 0 1px rgba(255,255,255,.12);
-}
-.ru-avatar.lg { width: 38px; height: 38px; font-size: 15px; background: linear-gradient(145deg, #3b82f6, #1d4ed8); color: #fff; }
-.ru-avatar.sm { width: 28px; height: 28px; font-size: 12px; background: var(--accent-soft); color: var(--accent); box-shadow: none; }
-.user-pop {
-  position: absolute; left: calc(100% + 10px); bottom: 4px; z-index: 50; width: 230px;
-  background: #fff; color: var(--ink); text-align: left; border-radius: 12px; padding: 8px;
-  border: 1px solid var(--line); box-shadow: 0 12px 36px rgba(15, 23, 36, .18);
-}
-.up-head { display: flex; align-items: center; gap: 10px; padding: 8px 8px 10px; border-bottom: 1px solid var(--line-2); }
-.up-head strong { display: block; font-size: 14px; }
-.up-head small { color: var(--muted); font-size: 12px; }
-.up-meta { margin: 8px 8px 4px; font-size: 11px; color: var(--muted); }
-.up-item {
-  display: block; width: 100%; text-align: left; border: 0; background: transparent;
-  padding: 9px 10px; border-radius: 8px; font-size: 13px; color: var(--ink-2);
-}
-.up-item:hover { background: var(--line-2); color: var(--ink); }
-.up-item.danger { color: var(--danger); }
-.up-item.danger:hover { background: #fff1f2; }
 
-.acct-table td { vertical-align: middle; }
-.acct-name { display: flex; align-items: center; gap: 10px; }
-.acct-name strong { display: block; font-size: 13px; }
-.acct-name small { color: var(--muted); font-size: 12px; }
-.acct-me {
-  margin-left: 6px; padding: 0 6px; border-radius: 4px; font-style: normal; font-size: 11px;
-  background: var(--accent-soft); color: var(--accent);
-}
-.acct-ip { display: block; font-size: 11px; color: var(--muted); }
 .field.sm { width: auto; min-width: 96px; padding: 5px 8px; margin-top: 0; font-size: 13px; }
 .pill.warn { background: #fff4e5; color: #b54708; margin-left: 6px; }
 
 .dlg-mask {
-  position: fixed; inset: 0; z-index: 100; background: rgba(15, 23, 36, .45);
+  position: fixed; inset: 0; z-index: 2000; background: rgba(15, 23, 36, .45);
   display: grid; place-items: center; padding: 20px;
 }
 .dlg {
@@ -13883,7 +12591,17 @@ onUnmounted(() => {
 .allow-sec-row .allow-sec { margin: 0; flex: 1; }
 .ed-prev-hint { margin: 0 0 8px; color: #64748b; }
 .ed-beh-row.current { border-left: 3px solid var(--primary, #2563eb); padding-left: 8px; }
+.ed-beh-row.clickable { cursor: pointer; }
+.ed-beh-row.clickable:hover { background: #f0f6ff; }
 .ed-cur-tag { font-style: normal; font-size: 11px; color: #2563eb; margin-left: 6px; font-weight: 600; }
+.ed-cur-tag.bb { color: #b54708; background: #fffaeb; padding: 0 6px; border-radius: 999px; }
+.ed-bb-extra { margin-top: 4px; }
+.ed-bb-extra code {
+  display: block; font-size: 11.5px; color: #334155; background: #f8fafc;
+  border: 1px solid #e8eef6; border-radius: 6px; padding: 6px 8px;
+  white-space: pre-wrap; word-break: break-all; max-height: 72px; overflow: auto;
+}
+.tvs-bb-block .ed-beh { max-height: 360px; overflow: auto; }
 .ed-file-src { display: block; font-size: 11px; color: #64748b; margin-top: 2px; font-style: normal; }
 .allow-opts { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; max-height: 240px; overflow: auto; }
 .dlg label.allow-opt {
@@ -13904,52 +12622,26 @@ onUnmounted(() => {
 .wl-val { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 tr.wl-off td { opacity: .5; }
 
-.menu {
-  position: fixed; left: 76px; top: 0; bottom: 0; width: 212px; z-index: 45;
-  background: #fff; border-right: 1px solid var(--line);
-  padding: 16px 12px 20px; overflow: auto;
-  box-shadow: 8px 0 28px rgba(15, 23, 42, .08);
-  transform: translateX(-12px); opacity: 0; pointer-events: none;
-  transition: opacity .16s ease, transform .16s ease;
-}
-.menu.open {
-  opacity: 1; pointer-events: auto; transform: translateX(0);
-}
-.menu-top {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  margin-bottom: 10px; padding: 0 4px;
-}
-.menu h2 { margin: 0; font-size: 15px; font-weight: 700; }
-.menu-pin {
-  border: 1px solid var(--line); background: #fff; border-radius: 999px;
-  padding: 3px 9px; font-size: 11px; font-weight: 650; color: var(--muted); cursor: pointer;
-}
-.menu-pin.on { border-color: #93c5fd; background: #eff6ff; color: #1d4ed8; }
-.menu-group {
-  margin: 14px 12px 6px; font-size: 11px; font-weight: 700; color: #98a2b3;
-  letter-spacing: .04em;
-}
-.menu-item {
-  width: 100%; text-align: left; border: 0; background: transparent;
-  border-radius: 8px; padding: 9px 12px; color: var(--ink-2); font-size: 13px; font-weight: 500;
-}
-.menu-item:hover { background: var(--line-2); }
-.menu-item.on { background: var(--accent-soft); color: var(--accent); font-weight: 650; }
-.menu-hint {
-  margin-top: 18px; padding: 10px 12px; border-radius: 8px;
-  background: #f7f9fc; color: var(--muted); font-size: 11px; line-height: 1.55;
-}
-.menu-hint.soft { background: #f8fafc; border: 1px dashed #e4e7ec; }
 
 .workspace {
   min-width: 0; height: 100vh;
   overflow: hidden; /* 禁止整页右侧下拉，各 page 内部自己滚 */
   display: flex; flex-direction: column;
   background: var(--bg); transition: padding-left .16s ease;
+  position: relative;
+  /* 顶栏已固定到 body，给页面留出高度 */
+  padding-top: 56px;
+  box-sizing: border-box;
+  grid-column: 2;
+  grid-row: 1;
 }
 .workspace.menu-pinned { padding-left: 212px; }
 .page {
-  padding: 20px 24px 12px; box-sizing: border-box;
+  /* 与顶栏左右对齐，模块统一贴边 */
+  padding: 6px 6px 6px; box-sizing: border-box;
+  width: 100%;
+  max-width: none;
+  margin: 0;
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;
   overflow: hidden; /* 结构化页面：只让表格/列表区滚动 */
@@ -13958,21 +12650,12 @@ tr.wl-off td { opacity: .5; }
 .page:not(.overview):not(.events-page):not(.behaviors-page):not(.timeline-page):not(.rules-page):not(.settings-page):not(.inv-page):not(.host-detail):not(.threat-detail):not(.attck-page):not(.hosts-page):not(.seq-page):not(.dns-page):not(.ai-page) {
   overflow: auto;
 }
-/* 概览：撑满可视区，底部面板吃掉剩余高度 */
+/* 概览：撑满可视区 */
 .page.overview {
   overflow: auto;
-  padding-bottom: 12px;
+  padding: 6px 6px 6px;
+  gap: 0;
 }
-.page-hd {
-  display: flex; justify-content: space-between; align-items: flex-start;
-  gap: 16px; margin-bottom: 16px;
-  background: #fff;
-  border: 1px solid rgba(15, 23, 42, .06);
-  border-radius: 14px;
-  padding: 16px 20px;
-  box-shadow: 0 8px 24px rgba(15, 23, 42, .045);
-}
-.page-hd h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
 .desc { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
 .hd-right { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .sync-pill {
@@ -14005,83 +12688,6 @@ tr.wl-off td { opacity: .5; }
 .btn.danger-outline { color: #c2410c; border-color: #fdba74; background: #fff7ed; }
 .btn-text { border: 0; background: none; color: var(--accent); font-weight: 600; font-size: 13px; }
 
-.ov-fleet-strip {
-  display: flex; align-items: stretch; gap: 10px; margin-bottom: 12px;
-  background: linear-gradient(135deg, #1a2332 0%, #243044 55%, #1e293b 100%);
-  border-radius: 14px; padding: 14px 16px; color: #e8edf5;
-  box-shadow: 0 12px 32px rgba(15, 23, 42, .18);
-}
-.ov-fleet-strip.collapsed .ov-fleet-main { display: none; }
-.ov-fleet-main { display: flex; flex: 1; gap: 18px; align-items: stretch; min-width: 0; }
-.ov-fleet-block { flex: 1; min-width: 0; }
-.ov-fleet-block:last-child { flex: 1.15; }
-.ov-fleet-hd { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #94a3b8; margin-bottom: 8px; }
-.ov-fleet-ico { font-size: 16px; opacity: .85; }
-.ov-info { font-style: normal; font-size: 11px; width: 16px; height: 16px; border-radius: 50%; border: 1px solid #64748b; display: inline-grid; place-items: center; cursor: help; }
-.ov-fleet-metric { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
-.ov-fleet-metric > strong { font-size: 28px; font-weight: 700; letter-spacing: -.02em; }
-.ov-pill { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 999px; }
-.ov-pill.agent { background: #2563eb; color: #fff; }
-.ov-pill.va { background: #ea580c; color: #fff; }
-.ov-fleet-div { width: 1px; background: rgba(148, 163, 184, .25); align-self: stretch; }
-.ov-fleet-sub { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; align-items: end; }
-.ov-fleet-sub.three {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px 28px;
-  align-items: flex-end;
-  justify-content: flex-start;
-}
-.ov-fleet-sub.three .ov-fleet-cell { flex: 0 1 auto; min-width: 7.5rem; max-width: 14rem; }
-.ov-fleet-cell em { display: block; font-style: normal; font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
-.ov-fleet-cell b { font-size: 20px; font-weight: 700; }
-.ov-fleet-cell.click { cursor: pointer; border-radius: 8px; padding: 4px 6px; margin: -4px -6px; }
-.ov-fleet-cell.click:hover { background: rgba(255,255,255,.06); }
-.ov-spark-row { display: flex; align-items: center; gap: 10px; }
-.ov-spark { width: 120px; height: 32px; flex-shrink: 0; opacity: .95; }
-.ov-fleet-toggle {
-  align-self: center; border: 1px solid rgba(148,163,184,.35); background: transparent; color: #cbd5e1;
-  border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer;
-}
-.ov-threat-rail {
-  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px;
-}
-.ov-rail-card {
-  display: flex; gap: 12px; align-items: center; padding: 14px 16px; border-radius: 12px;
-  background: #fff; border: 1px solid rgba(15, 23, 42, .08);
-  box-shadow: 0 6px 18px rgba(15, 23, 42, .05);
-}
-.ov-rail-card.click { cursor: pointer; transition: border-color .15s, box-shadow .15s; }
-.ov-rail-card.click:hover { border-color: #93c5fd; box-shadow: 0 8px 22px rgba(37, 99, 235, .12); }
-.ov-rail-ico { width: 40px; height: 40px; border-radius: 10px; display: grid; place-items: center; font-size: 18px; background: #f1f5f9; flex-shrink: 0; }
-.ov-rail-ico.warn { background: #fee2e2; color: #b91c1c; }
-.ov-rail-body span { display: block; font-size: 12px; color: var(--muted); }
-.ov-rail-body strong { font-size: 22px; font-weight: 800; line-height: 1.2; }
-.ov-rail-body small { font-size: 11px; color: var(--muted); }
-.ov-rail-body small b.ok { color: #059669; }
-.ov-bottom-grid {
-  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px;
-  margin-top: 12px; flex: 0 0 auto;
-}
-.ov-panel { min-height: 168px; display: flex; flex-direction: column; }
-.ov-panel .ov-bars, .ov-panel .ov-trend, .ov-panel .ov-rank, .ov-panel .ov-mal-list { flex: 1; }
-.ov-cats-compact { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.ov-mal-list.compact { padding: 6px 14px 12px; }
-.ov-ops-mini {
-  margin: 0 12px 10px; padding: 10px 12px; border-radius: 10px;
-  background: #f8fafc; border: 1px solid var(--line);
-}
-.ov-ops-hd { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 13px; }
-.ov-ops-dl { display: grid; grid-template-columns: 1fr; gap: 6px; margin: 0; font-size: 12px; }
-.ov-ops-dl div { display: flex; justify-content: space-between; gap: 8px; }
-.ov-ops-dl dt { color: var(--muted); margin: 0; }
-.ov-ops-dl dd { margin: 0; font-weight: 600; text-align: right; }
-.ov-cap-hint { margin: 8px 0 0; line-height: 1.45; }
-.ov-mal-list { list-style: none; margin: 0; padding: 8px 16px 14px; }
-.ov-mal-list li { display: grid; grid-template-columns: 24px 1fr auto; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
-.ov-mal-list li:last-child { border-bottom: 0; }
-.ov-mal-list i { font-style: normal; color: var(--muted); font-weight: 700; }
-.ov-mal-list em { font-style: normal; font-weight: 700; }
 .comp-health .hchip.off { opacity: .55; }
 .capture-hint-line { margin: 6px 0 0; }
 
@@ -14092,12 +12698,6 @@ tr.wl-off td { opacity: .5; }
 .ov-kpis-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .ov-quick { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
 .overview { display: flex; flex-direction: column; gap: 0; min-height: 0; flex: 1; }
-.ov-body {
-  display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(280px, .85fr);
-  gap: 14px; align-items: stretch; flex: 1 1 auto; min-height: 0;
-}
-.ov-threats { min-width: 0; display: flex; flex-direction: column; min-height: 0; }
-.ov-threats .ov-threat-scroll { flex: 1; min-height: 0; max-height: none; }
 .ov-start { margin-top: 14px; flex: 0 0 auto; }
 .ov-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 14px 16px 16px; }
 .ov-step {
@@ -14119,44 +12719,6 @@ tr.wl-off td { opacity: .5; }
 }
 .ov-grid3 > .panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; height: 100%; }
 .ov-span2 { grid-column: span 2; }
-.ov-cats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 12px 14px 14px; }
-.ov-cat {
-  display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: #fafbfd;
-  border-radius: 8px; padding: 7px 9px; cursor: pointer; text-align: left; min-width: 0;
-}
-.ov-cat:hover { border-color: #b7c9f0; background: var(--accent-soft); }
-.ov-cat .focus-ico { width: 24px; height: 24px; font-size: 11px; }
-.ov-cat b { flex: 1; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ov-cat em { font-style: normal; font-weight: 700; font-size: 13px; }
-.ov-bars { display: flex; flex-direction: column; gap: 12px; padding: 16px; flex: 1; justify-content: center; }
-.ov-bar-row { display: grid; grid-template-columns: 48px 1fr 40px; align-items: center; gap: 10px; }
-.ov-bar-row b { text-align: right; font-size: 13px; }
-.ov-bar { height: 8px; border-radius: 4px; background: #eef1f6; overflow: hidden; }
-.ov-bar i { display: block; height: 100%; border-radius: 4px; background: #98a2b3; transition: width .3s; }
-.ov-bar i[data-s="critical"] { background: #b42318; }
-.ov-bar i[data-s="high"] { background: #e11d2e; }
-.ov-bar i[data-s="medium"] { background: #f79009; }
-.ov-bar i[data-s="low"] { background: #2e90fa; }
-.ov-trend { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; padding: 14px 16px 12px; flex: 1; min-height: 170px; }
-.ov-trend-col { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0; }
-.ov-trend-col em { font-style: normal; font-size: 11px; color: var(--muted); height: 14px; }
-.ov-trend-bar { position: relative; flex: 1; width: 100%; max-width: 30px; background: #f2f4f8; border-radius: 6px; overflow: hidden; }
-.ov-trend-bar i { position: absolute; left: 0; right: 0; bottom: 0; background: #9db4e6; border-radius: 6px 6px 0 0; }
-.ov-trend-bar i.hi { background: #e11d2e; opacity: .85; }
-.ov-trend-col small { font-size: 11px; color: var(--muted); }
-.ov-rank { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px 12px; }
-.ov-rank-row {
-  display: grid; grid-template-columns: 22px 1fr auto auto; align-items: center; gap: 8px;
-  border: 0; background: transparent; border-radius: 8px; padding: 8px; cursor: pointer; text-align: left;
-}
-.ov-rank-row:hover { background: var(--accent-soft); }
-.ov-rank-row i {
-  font-style: normal; width: 22px; height: 22px; border-radius: 6px; background: #eef1f6;
-  display: grid; place-items: center; font-size: 12px; font-weight: 700;
-}
-.ov-rank-row:nth-child(-n+3) i { background: #fde8e8; color: #b42318; }
-.ov-rank-row b { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ov-rank-row em { font-style: normal; color: var(--muted); font-size: 12px; }
 .ov-tactics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; padding: 14px 16px 16px; }
 .ov-tactic {
   border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fafbfd;
@@ -14167,48 +12729,6 @@ tr.wl-off td { opacity: .5; }
 .ov-tactic.on { border-color: #f5c2c2; background: #fff5f5; }
 .ov-tactic.on b { color: var(--ink, #1d2939); }
 .ov-tactic.on em { color: #b42318; }
-@media (max-width: 1280px) {
-  .ov-bottom-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .ov-threat-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .ov-cats-compact { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-@media (max-width: 900px) {
-  .ov-bottom-grid, .ov-threat-rail { grid-template-columns: 1fr; }
-  .ov-fleet-sub.three { flex-direction: column; align-items: stretch; }
-  .ov-fleet-sub.three .ov-fleet-cell { max-width: none; }
-  .ov-body { grid-template-columns: 1fr; }
-}
-.ov-threat-scroll { max-height: min(520px, calc(100vh - 260px)); }
-.ov-side { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; }
-.ov-host-summary {
-  display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
-  padding: 10px 12px; border-bottom: 1px solid var(--line); flex-shrink: 0;
-}
-.ov-host-summary > div {
-  background: #f7f9fc; border-radius: 8px; padding: 8px 10px; text-align: center;
-}
-.ov-host-summary b { display: block; font-size: 18px; font-weight: 700; color: var(--ink); line-height: 1.2; }
-.ov-host-summary span { font-size: 11px; color: var(--muted); }
-.ov-host-list {
-  padding: 6px 8px; display: flex; flex-direction: column; gap: 2px;
-  flex: 1 1 auto; min-height: 0; overflow: auto;
-}
-.ov-host-row {
-  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
-  border: 0; background: transparent; border-radius: 8px; padding: 9px 10px; cursor: pointer;
-}
-.ov-host-row:hover { background: #f5f8fc; }
-.ov-host-main { flex: 1; min-width: 0; }
-.ov-host-main b {
-  display: block; font-size: 13px; font-weight: 650;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.ov-host-main small { color: var(--muted); font-size: 11px; }
-.ov-host-ok { font-size: 11px; color: #059669; font-weight: 600; flex-shrink: 0; }
-.ov-side-links {
-  display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 14px 14px;
-  border-top: 1px solid var(--line); margin-top: auto; flex-shrink: 0;
-}
 .kpi {
   background: #fff; border: 1px solid rgba(15, 23, 42, .06); border-radius: 12px;
   padding: 16px 18px 14px; box-shadow: 0 6px 18px rgba(15, 23, 42, .04);
@@ -14234,17 +12754,6 @@ tr.wl-off td { opacity: .5; }
 .c-offline { color: #667085; }
 .c-danger { color: #f04438; }
 .c-ink { color: #101828; }
-.live-hint {
-  display: inline-flex; align-items: center; gap: 7px;
-  font-size: 12px; color: var(--muted); font-weight: 550;
-  padding: 6px 10px; border-radius: 999px; background: #f2f4f7;
-}
-.live-hint.on { color: #027a48; background: #ecfdf3; }
-.live-dot {
-  width: 7px; height: 7px; border-radius: 50%; background: #98a2b3;
-  display: inline-block;
-}
-.live-hint.on .live-dot { background: #12b76a; box-shadow: 0 0 0 3px rgba(18, 183, 106, .18); }
 .btn.ghost-btn {
   background: #fff; color: var(--ink-2); border-color: var(--line);
   box-shadow: none;
@@ -14255,7 +12764,6 @@ tr.wl-off td { opacity: .5; }
   min-height: 0;
   align-items: start;
 }
-.ov-panel { border-color: rgba(15, 23, 42, .06); box-shadow: 0 8px 24px rgba(15, 23, 42, .04); }
 .ov-threat-table { overflow: auto; flex: 1; padding: 10px 12px 14px; display: flex; flex-direction: column; gap: 8px; }
 .ov-threat-row {
   width: 100%; display: flex; align-items: center; gap: 12px; text-align: left;
@@ -14269,7 +12777,7 @@ tr.wl-off td { opacity: .5; }
 .ot-go { flex-shrink: 0; color: var(--accent); font-size: 12px; font-weight: 650; }
 
 .settings-page {
-  overflow: hidden;
+  overflow: auto;
   padding-bottom: 12px;
 }
 .settings-page > .page-hd { flex-shrink: 0; }
@@ -14282,6 +12790,50 @@ tr.wl-off td { opacity: .5; }
 }
 .settings-addr-row .grow { flex: 1; min-width: 240px; }
 .settings-addr-acts { display: flex; gap: 8px; padding-bottom: 2px; }
+.settings-ai-panel { flex-shrink: 0; }
+.settings-ai-hd {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px;
+}
+.settings-ai-profiles {
+  display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;
+}
+.settings-ai-profile {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  min-width: 140px; max-width: 220px; padding: 8px 10px; text-align: left;
+  border: 1px solid #d0d5dd; border-radius: 10px; background: #fff; cursor: pointer;
+}
+.settings-ai-profile b { font-size: 13px; color: #0f172a; }
+.settings-ai-profile small { font-size: 11px; color: #64748b; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-ai-profile .pill.sm { font-size: 10px; padding: 1px 6px; margin-top: 2px; }
+.settings-ai-profile.on, .settings-ai-profile.active {
+  border-color: #1aa6c8; background: #e8f7fb;
+}
+.settings-ai-profile.add {
+  justify-content: center; align-items: center; color: #0b6e84; font-weight: 650; border-style: dashed;
+}
+.settings-ai-modes { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.settings-ai-modes .chip-btn.ghost {
+  border-style: dashed; color: #64748b; background: #f8fafc;
+}
+.settings-ai-modes .chip-btn.ghost:disabled { opacity: 0.45; cursor: not-allowed; }
+.settings-ai-grid {
+  display: grid; grid-template-columns: 1.4fr 1fr; gap: 10px 12px;
+}
+.settings-ai-grid label { display: flex; flex-direction: column; gap: 4px; }
+.settings-ai-grid label.span-2 { grid-column: 1 / -1; }
+.settings-ai-grid label span { font-size: 12px; color: var(--muted); font-weight: 600; }
+.settings-ai-acts {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px;
+}
+.settings-ai-acts .muted.ok { color: #027a48; }
+.settings-ai-acts .muted.err { color: #b42318; }
+.btn.danger-ghost {
+  background: transparent; border-color: #fecdca; color: #b42318;
+}
+@media (max-width: 900px) {
+  .settings-ai-grid { grid-template-columns: 1fr; }
+  .settings-ai-grid label.span-2 { grid-column: auto; }
+}
 .settings-rules-panel {
   flex: 1; min-height: 0; display: flex; flex-direction: column;
 }
@@ -14314,20 +12866,27 @@ tr.wl-off td { opacity: .5; }
   min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px;
   display: inline-grid; place-items: center; font-size: 11px; font-style: normal;
 }
-.child-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
-.child-list > small { color: var(--muted); font-size: 11px; }
-.child-row {
-  display: flex; justify-content: space-between; gap: 8px; text-align: left;
-  border: 1px solid var(--line); background: #fafbfd; border-radius: 8px;
-  padding: 6px 10px; font-size: 12px; cursor: pointer;
+/* 勿让全局 .chk { display:flex } 作用到 th/td，否则复选框列被撑开成空白 */
+.evt-table th.chk, .evt-table td.chk {
+  width: 36px; max-width: 40px; min-width: 36px;
+  text-align: center; padding-left: 8px; padding-right: 8px;
+  display: table-cell !important; margin: 0 !important; vertical-align: middle;
 }
-.child-row:hover { border-color: #b7c9f0; background: #f4f7fb; }
-.child-row em { color: var(--muted); font-style: normal; }
-.evt-table th.chk, .evt-table td.chk { width: 36px; text-align: center; }
+.evt-table { table-layout: auto; width: 100%; }
+.evt-table th.chk input, .evt-table td.chk input { margin: 0; vertical-align: middle; }
 .evt-table th.sortable { cursor: pointer; user-select: none; }
 .evt-table th.sortable:hover { color: var(--ink); }
 .sort-ico { font-style: normal; color: #98a2b3; font-size: 11px; margin-left: 2px; }
 .tag.judge { background: #eef2ff; color: #3730a3; border-radius: 999px; padding: 2px 10px; }
+.tag.soft { background: #f1f5f9; color: #475569; border-radius: 999px; padding: 1px 8px; font-size: 11px; }
+.dns-ioc-cell { max-width: 280px; }
+.dns-ioc-tags { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.dns-ioc-tag { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; font-size: 12px; line-height: 1.3; }
+.dns-ioc-tag .via {
+  font-style: normal; font-size: 10px; font-weight: 600; opacity: 0.75;
+  background: rgba(55, 48, 163, 0.12); border-radius: 4px; padding: 0 4px;
+}
+.dns-ioc-fam { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 4px; }
 .log-n {
   display: inline-flex; min-width: 26px; justify-content: center; align-items: center;
   padding: 2px 9px; border-radius: 999px; background: #f2f4f7; color: #475467;
@@ -14357,6 +12916,13 @@ tr.wl-off td { opacity: .5; }
 .evt-fl .field { min-width: 140px; }
 .evt-fl-acts {
   display: flex; gap: 8px; align-items: center; padding-bottom: 1px;
+}
+.evt-scope-note {
+  flex: 1 0 100%;
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #475467;
 }
 .evt-fl.chk-inline { min-width: 220px; }
 .dns-checks { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; min-height: 34px; }
@@ -14534,7 +13100,10 @@ tr.wl-off td { opacity: .5; }
 .tl-fv > span.mono { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; }
 .tl-empty { margin: 0; font-size: 12px; color: var(--muted); }
 .tl-acts { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 4px; }
-.chk { display: flex !important; align-items: center; gap: 8px; margin: 8px 0; font-weight: 500; }
+/* 仅用于表单/筛选里的 checkbox 行，排除表格单元格 */
+label.chk, .dlg .chk, .up-hosts .chk, .evt-fl.chk-inline {
+  display: flex !important; align-items: center; gap: 8px; margin: 8px 0; font-weight: 500;
+}
 .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 .panel {
   background: #fff; border: 1px solid var(--line); border-radius: 12px;
@@ -14592,7 +13161,7 @@ th, td {
   padding: 11px 14px; text-align: left; border-bottom: 1px solid var(--line);
   white-space: nowrap; max-width: 280px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
 }
-th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px; position: sticky; top: 0; z-index: 1; }
+th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px; position: sticky; top: 0; z-index: 0; }
 .strong { font-weight: 650; }
 .row-click { cursor: pointer; }
 .row-click:hover { background: #f7f9fc; }
@@ -14612,31 +13181,6 @@ th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px
 .empty { padding: 40px 20px; text-align: center; color: var(--muted); }
 .empty.sm { padding: 28px 16px; }
 .empty.err, .err-text { color: var(--danger); }
-.toast-stack {
-  position: fixed; top: 18px; right: 24px; z-index: 80;
-  display: flex; flex-direction: column; gap: 8px; width: min(420px, calc(100vw - 48px));
-  pointer-events: none;
-}
-.toast {
-  margin: 0; padding: 12px 14px; border-radius: 10px; font-size: 13px;
-  border: 1px solid var(--line); background: #fff; box-shadow: var(--shadow);
-  pointer-events: auto; cursor: pointer;
-}
-.toast.err { background: #fff5f5; border-color: #f3c1c5; color: var(--danger); }
-.toast.ok { background: #f0fdf6; border-color: #b7ebc9; color: #027a48; }
-.toast.wait { background: #fffaeb; border-color: #fedf89; color: #b54708; }
-.toast.float, .toast-with-x {
-  display: flex; align-items: flex-start; gap: 10px; cursor: default;
-}
-.toast-with-x .toast-main { cursor: pointer; }
-.toast-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.toast-main b { font-weight: 700; }
-.toast-main span { font-size: 12px; line-height: 1.45; word-break: break-word; opacity: .92; }
-.toast-x {
-  border: 0; background: transparent; color: inherit; opacity: .55;
-  font-size: 18px; line-height: 1; padding: 0 2px; cursor: pointer;
-}
-.toast-x:hover { opacity: 1; }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; background: #c5ccd8; flex-shrink: 0; }
 .dot.on { background: var(--online); }
@@ -14645,8 +13189,8 @@ th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px
   max-width: none;
   overflow: hidden;
 }
-.events-page > .page-hd { flex-shrink: 0; margin-bottom: 10px; }
-.events-page > .page-hd .desc { display: none; }
+.events-page > .page-hd { flex-shrink: 0; margin-bottom: 8px; }
+.events-page > .evt-filter-bar { margin-left: 0; margin-right: 0; }
 .events-page .event-layout,
 .events-page .event-layout.single {
   flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;
@@ -14681,12 +13225,74 @@ th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px
   padding: 8px 10px 10px;
 }
 .malware-summary {
-  display: flex; flex-wrap: wrap; align-items: flex-end; gap: 16px 24px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(148px, 200px)) minmax(220px, 1fr);
+  gap: 10px;
+  align-items: stretch;
   flex-shrink: 0;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  padding: 0;
 }
-.malware-summary .hint { margin: 0; flex: 1 1 200px; }
-.mal-stat b { display: block; font-size: 22px; font-weight: 800; color: #b45309; line-height: 1.1; }
-.mal-stat span { font-size: 11px; color: var(--muted); font-weight: 650; }
+.mal-stat {
+  appearance: none;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  border-top: 3px solid #e2562c;
+  padding: 12px 14px 14px;
+  box-shadow: var(--shadow);
+  min-width: 0;
+  transition: border-color .12s, box-shadow .12s, transform .12s;
+}
+.mal-stat:hover {
+  transform: translateY(-1px);
+  border-color: #f0b6a0;
+  box-shadow: 0 8px 18px rgba(226, 86, 44, .12);
+}
+.mal-stat.on {
+  border-color: #e2562c;
+  background: #fff7f3;
+  box-shadow: 0 0 0 1px rgba(226, 86, 44, .18), var(--shadow);
+}
+.mal-stat.hot { border-top-color: #b42318; }
+.mal-stat.hot.on {
+  border-color: #b42318;
+  background: #fff5f5;
+}
+.mal-stat span {
+  display: block;
+  font-size: 12px;
+  color: #667085;
+  font-weight: 650;
+  line-height: 1.3;
+  margin-bottom: 6px;
+}
+.mal-stat b {
+  display: block;
+  font-size: 28px;
+  font-weight: 750;
+  letter-spacing: -.04em;
+  color: #101828;
+  line-height: 1;
+}
+.mal-stat.hot b { color: #b42318; }
+.mal-note {
+  margin: 0;
+  align-self: center;
+  padding: 4px 8px 4px 4px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #667085;
+}
+@media (max-width: 1100px) {
+  .malware-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .mal-note { grid-column: 1 / -1; padding: 0 2px; }
+}
 .focus-title { font-size: 13px; font-weight: 650; margin-bottom: 10px; }
 .events-page .focus-title { margin-bottom: 6px; font-size: 12px; }
 .focus-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 8px; }
@@ -14858,58 +13464,7 @@ th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px
 }
 .hr-kind[data-k="threat"] { background: #fee2e2; color: #b91c1c; }
 
-.host-detail {
-  overflow: hidden;
-  gap: 0;
-}
-.host-hdr {
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px 16px 10px;
-  border-bottom: 1px solid var(--line);
-  background: #fff;
-}
-.host-hdr-top {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-}
-.host-hdr-id {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  min-width: 0;
-}
 .host-back { margin-top: 4px; flex-shrink: 0; }
-.host-hdr-title { min-width: 0; }
-.host-hdr-title h1 {
-  margin: 0;
-  font-size: 22px;
-  font-weight: 750;
-  letter-spacing: -0.02em;
-  line-height: 1.2;
-}
-.host-hdr-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 12px;
-  margin: 6px 0 0;
-  font-size: 12px;
-  color: var(--muted);
-}
-.host-hdr-meta .dot { display: inline-block; }
-.host-hdr-acts {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  justify-content: flex-end;
-}
 .host-more { position: relative; }
 .host-more-menu {
   position: absolute;
@@ -14950,56 +13505,6 @@ th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px
 .host-more-item:hover { background: #f4f7fb; }
 .host-more-item.danger { color: var(--danger); }
 .host-more-item:disabled { opacity: 0.45; cursor: not-allowed; }
-.host-hdr-stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-}
-.host-health-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid #bfdbfe;
-  background: #eff6ff;
-  color: #1d4ed8;
-  border-radius: 999px;
-  padding: 2px 10px;
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-}
-.host-health-toggle.warn {
-  border-color: #fdba74;
-  background: #fff7ed;
-  color: #c2410c;
-}
-.host-health-toggle em { font-style: normal; font-weight: 650; opacity: .75; }
-.host-health-card {
-  border: 1px solid #dbeafe;
-  border-radius: 10px;
-  background: #f8fbff;
-  overflow: hidden;
-  max-height: 220px;
-  overflow-y: auto;
-}
-.host-health-body { padding: 10px 12px; }
-.snap-shell {
-  display: flex; flex-direction: column; gap: 10px;
-  flex: 1 1 auto; min-height: 0;
-  overflow: hidden;
-}
-.host-group-nav {
-  display: flex; gap: 8px; padding: 10px 14px 0; flex-wrap: wrap;
-}
-.host-group-btn {
-  border: 1px solid var(--line); background: #fff; color: var(--ink-2);
-  border-radius: 8px; padding: 7px 14px; font-size: 13px; font-weight: 650; cursor: pointer;
-}
-.host-group-btn.on {
-  background: #0f172a; color: #fff; border-color: #0f172a;
-}
-.host-group-btn:hover:not(.on) { background: #f4f7fb; }
 .host-remote-wrap {
   flex: 1 1 auto; min-height: 0; overflow: auto;
   padding: 18px 20px 24px; box-shadow: var(--shadow);
@@ -15052,23 +13557,6 @@ th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px
   padding-right: 6px;
 }
 .btn.sm.ghost:hover { color: var(--ink); background: #f4f7fb; }
-.hsp-chip {
-  display: inline-flex; align-items: center;
-  padding: 2px 8px; border-radius: 999px;
-  background: #fff; border: 1px solid #e2e8f0;
-  color: #334155; font-size: 11px; line-height: 1.4;
-}
-.hsp-chip.soft { background: #f8fafc; color: #64748b; }
-.hsp-chip.ok { background: #ecfdf5; border-color: #a7f3d0; color: #047857; }
-.hsp-chip.warn { background: #fff7ed; border-color: #fdba74; color: #c2410c; }
-.hsp-chips, .hsp-channels { margin-top: 6px; }
-.hsp-label { font-size: 11px; color: #64748b; font-weight: 600; margin-right: 2px; }
-.hsp-drift { margin: 8px 0 0; font-size: 12px; color: #b45309; }
-.hsp-row { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; font-size: 12px; }
-.hsp-score { font-weight: 700; padding: 2px 8px; border-radius: 6px; background: #ecfdf5; color: #047857; }
-.hsp-score[data-lv="fair"] { background: #fffbeb; color: #b45309; }
-.hsp-score[data-lv="poor"] { background: #fef2f2; color: #b91c1c; }
-.hsp-advise { margin: 8px 0 0; padding-left: 18px; color: #92400e; font-size: 12px; line-height: 1.45; }
 .host-remote-links, .host-remote-btns { display: flex; flex-wrap: wrap; gap: 8px; }
 .hr-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
 .hr-field span { font-size: 11px; color: var(--muted); font-weight: 650; }
@@ -15231,44 +13719,6 @@ th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px
 .settings-extra { display: none; }
 .ov-empty { padding: 28px 16px; text-align: center; }
 .ov-empty .hint { margin: 6px 0 12px; }
-.mod-tabs.bar {
-  display: flex; gap: 0; flex-wrap: wrap;
-  background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 4px;
-  box-shadow: var(--shadow); width: 100%; flex-shrink: 0;
-}
-.mod-tab {
-  border: 0; background: transparent; border-radius: 6px;
-  padding: 8px 14px; font-size: 13px; font-weight: 550; color: var(--ink-2);
-}
-.mod-tab.on { background: #c81626; color: #fff; }
-.snap-flags {
-  display: flex; flex-wrap: wrap; gap: 8px; align-items: center; flex-shrink: 0;
-}
-.sflag {
-  display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px;
-  font-size: 12px; font-weight: 650; background: #f1f5f9; color: #475569;
-}
-.sflag[data-t="bad"] { background: #fef2f2; color: #b91c1c; }
-.sflag[data-t="warn"] { background: #fff7ed; color: #c2410c; }
-.sflag[data-t="info"] { background: #eff6ff; color: #1d4ed8; }
-.sflag.muted { background: transparent; color: var(--muted); font-weight: 500; padding-left: 2px; }
-.snap-work {
-  display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(300px, .9fr); gap: 12px;
-  flex: 1 1 auto; min-height: 0; align-items: stretch;
-  overflow: hidden;
-}
-.snap-work.has-detail { grid-template-columns: minmax(0, 1.4fr) minmax(300px, .9fr); }
-.snap-sum { display: flex; flex-direction: column; min-height: 0; overflow: auto; }
-.ss-kpis {
-  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 12px 14px;
-}
-.ss-kpis > div {
-  background: #f5f8fc; border: 1px solid #e8eef6; border-radius: 8px; padding: 10px 12px;
-}
-.ss-kpis span { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
-.ss-kpis strong { font-size: 22px; font-weight: 720; letter-spacing: -.03em; }
-.ss-kpis .c-warn { color: #c2410c; }
-.ss-kpis .c-danger { color: #b91c1c; }
 .ss-list { padding: 0 12px 10px; display: flex; flex-direction: column; gap: 6px; }
 .ss-list h4 { margin: 4px 0 6px; font-size: 12px; color: var(--muted); }
 .ss-row {
@@ -15279,11 +13729,6 @@ th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px
 .ss-row small { grid-column: 2; color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ss-row .sev { grid-row: 1 / span 2; align-self: center; }
 .ss-acts { display: flex; gap: 8px; padding: 10px 14px 14px; border-top: 1px solid var(--line); margin-top: auto; }
-.sd-groups { overflow: auto; flex: 1; }
-.sd-group { padding: 4px 0 8px; border-bottom: 1px solid var(--line-2); }
-.sd-group h4 {
-  margin: 0; padding: 10px 16px 6px; font-size: 12px; color: var(--muted); font-weight: 700;
-}
 .sd-dl.compact-gap { padding-top: 0; }
 .hunt-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px;
@@ -15615,10 +14060,6 @@ th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px
   .events-page .split.has-detail { grid-template-columns: 1fr; }
   .ed-side { max-height: min(56vh, 520px); }
 }
-.snap-list { display: flex; flex-direction: column; min-height: 0; min-width: 0; height: 100%; }
-.snap-list .panel-hd { flex-wrap: wrap; flex-shrink: 0; }
-.snap-table { flex: 1 1 0; min-height: 0; max-height: none; overflow: auto; }
-.snap-table tr.active { background: #eef4ff; }
 .snap-detail {
   display: flex; flex-direction: column; min-height: 0; height: 100%; overflow: hidden;
 }
@@ -15645,15 +14086,12 @@ th { background: #fafbfd; color: var(--muted); font-weight: 600; font-size: 12px
 .sd-actions { padding: 10px 12px 14px; border-top: 1px solid var(--line); }
 .sd-actions h4 { margin: 0 0 8px; font-size: 12px; }
 
-.sysinfo-grid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 10px; padding: 16px;
-}
-.si-item { background: #f7f9fc; border-radius: 8px; padding: 12px; }
-.si-item label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
-.si-item div { font-size: 13px; font-weight: 550; word-break: break-all; }
 
 .deploy-grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 14px; }
+.deploy-feedback { margin: 0 0 12px; padding: 10px 14px; border-radius: 8px; background: var(--panel-2, #e9f5f8); color: var(--ink-2); }
+.linux-download-grid { margin: 14px 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 10px; }
+.linux-download-grid .btn { min-height: 44px; white-space: normal; }
+.linux-package ol { overflow-wrap: anywhere; }
 .rel-box { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--line, #e3e6ea); border-radius: 8px; background: var(--bg-2, #f7f8fa); }
 .rel-box.rel-stale, .rel-box.rel-unverified, .rel-box.rel-mismatch, .rel-box.rel-missing { border-color: #e0a030; }
 .rel-hd { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -15814,6 +14252,17 @@ tr.row-warn td { background: #fff8ec; }
   max-width: 100%; word-break: break-word;
 }
 
+/* 导航兜底页：未知 / 失效 page 不再白屏 */
+.nav-fallback { display: flex; align-items: center; justify-content: center; min-height: 60vh; }
+.nav-fallback-card { max-width: 460px; width: 100%; text-align: center; padding: 32px 28px; }
+.nav-fallback-ico {
+  display: inline-grid; place-items: center; width: 48px; height: 48px; margin-bottom: 12px;
+  border-radius: 14px; background: #fef2f2; color: #dc2626; font-size: 24px;
+}
+.nav-fallback-card h2 { margin: 0 0 10px; font-size: 18px; }
+.nav-fallback-card p { margin: 0 0 18px; }
+.nav-fallback-ops { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+
 /* 威胁详情页 */
 /* 详情页铺满一屏：头部按内容高度，下方左右两栏吃满剩余高度且等高，右侧面板栏内滚动 */
 .threat-detail {
@@ -15846,11 +14295,31 @@ tr.row-warn td { background: #fff8ec; }
   font-size: 12px; color: var(--muted);
 }
 .tv-head-actions {
-  display: flex; gap: 10px 22px; flex-wrap: wrap; align-items: center;
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
   padding-top: 12px; border-top: 1px dashed var(--line);
 }
 .tv-act-group { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .tv-act-label { font-size: 11px; font-weight: 700; color: var(--muted); letter-spacing: .05em; margin-right: 2px; }
+/* 头部动作收敛：主按钮 + 原生 details 下拉，避免 10 个按钮同权重平铺 */
+.tv-act-hint { margin-left: auto; font-size: 11px; color: var(--muted); }
+.tv-resp-bar {
+  display: flex; flex-direction: column; gap: 10px;
+  margin-bottom: 14px; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg-elevated);
+}
+.tv-resp-group { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.tv-resp-lab {
+  font-size: 11px; font-weight: 700; letter-spacing: .04em; color: var(--muted); min-width: 2.5em;
+}
+.policy-stack { display: flex; flex-direction: column; gap: 12px; }
+.policy-fold-body { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.policy-grid-2 {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px;
+}
+.policy-span-2 { grid-column: 1 / -1; }
+@media (max-width: 800px) {
+  .policy-grid-2 { grid-template-columns: minmax(0, 1fr); }
+}
 .cmd-st {
   display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 650;
   background: #f2f4f7; color: #667085;
@@ -15864,9 +14333,10 @@ tr.row-warn td { background: #fff8ec; }
   font-size: 10px; font-style: normal; font-weight: 700;
 }
 .tv-tabs {
-  display: flex; gap: 4px; margin-bottom: 12px;
-  border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 12px; border-bottom: 1px solid var(--line);
 }
+.tv-tab-list { display: flex; gap: 4px; align-items: center; }
 .tv-tab {
   border: 0; background: none; padding: 10px 16px; color: var(--muted);
   font-size: 13px; font-weight: 600; border-bottom: 2px solid transparent; margin-bottom: -1px;
@@ -15904,8 +14374,8 @@ tr.row-warn td { background: #fff8ec; }
 .tv-graph-banner-t { font-size: 14px; font-weight: 700; }
 .sev.lg { font-size: 12px; padding: 4px 12px; }
 .tv-flow-stage {
-  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
-  padding: 36px 24px 20px; min-height: 280px;
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+  padding: 24px 24px 28px; min-height: 280px;
 }
 .tv-canvas.plain { background: #fafbfd; }
 .tv-canvas-tools {
@@ -15913,29 +14383,42 @@ tr.row-warn td { background: #fff8ec; }
 }
 .chip.soft.atk { background: #eef2ff; color: #3730a3; border: 1px solid #c7d2fe; }
 .chip.soft { background: rgba(255,255,255,.9); }
-/* 威胁图：横向流程 主机 → 父进程 → 威胁 */
+/* 威胁图：纵向阶段链 主机 → 父进程 → 威胁（自上而下，信息沿纵向铺开） */
 .tv-flow {
-  display: flex; align-items: center; justify-content: center; width: 100%; max-width: 980px;
+  display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+  width: 100%; max-width: 560px; margin: 0 auto;
 }
 .tvf-node {
-  flex: 1 1 0; min-width: 150px; max-width: 280px; min-height: 118px;
-  background: #fff; border: 1px solid #d7dee9; border-radius: 16px;
-  padding: 18px 16px 14px; text-align: center; position: relative;
-  box-shadow: 0 8px 24px rgba(15,23,42,.08);
-  display: flex; flex-direction: column; align-items: center; gap: 6px;
-  border-top: 3px solid #6366f1; transition: transform .15s, box-shadow .15s;
+  flex: 0 0 auto; width: 100%; max-width: none; min-width: 0; min-height: 0;
+  background: #fff; border: 1px solid #d7dee9; border-radius: 14px;
+  padding: 14px 18px; text-align: left; position: relative;
+  box-shadow: 0 6px 18px rgba(15,23,42,.07);
+  display: flex; flex-direction: row; align-items: flex-start; gap: 14px;
+  border-top: 0; border-left: 3px solid #6366f1; transition: transform .15s, box-shadow .15s;
 }
 .tvf-node:hover { transform: translateY(-2px); box-shadow: 0 10px 26px rgba(16,24,40,.12); }
-.tvf-node.proc { border-top-color: #0ea5e9; }
-.tvf-node.miss { border-top-color: #f79009; background: #fffbeb; }
-.tvf-node.mod { border-top-color: #94a3b8; border-style: dashed; border-top-style: solid; }
+.tvf-node.proc { border-left-color: #0ea5e9; }
+.tvf-node.miss { border-left-color: #f79009; background: #fffbeb; }
+.tvf-node.mod { border-left-color: #94a3b8; border-style: dashed; border-left-style: solid; }
 .tvf-node.hit {
-  border-color: #fca5a5; border-top-color: #ef4444; cursor: pointer;
+  border-color: #fca5a5; border-left-color: #ef4444; cursor: pointer;
   background: linear-gradient(180deg, #fff5f5, #fff 60%);
-  box-shadow: 0 8px 26px rgba(225,29,46,.18); min-width: 170px;
-  flex-grow: 1.5; max-width: 340px;
+  box-shadow: 0 8px 26px rgba(225,29,46,.18);
 }
 .tvf-node.hit.on { outline: 2px solid #ef4444; outline-offset: 2px; }
+/* 阶段序号 + 内容块 + 时间/证据角标 */
+.tvf-stage-no {
+  flex: 0 0 28px; width: 28px; height: 28px; border-radius: 50%;
+  display: grid; place-items: center; margin-top: 2px;
+  background: #eef2ff; color: #3730a3; font-size: 12px; font-weight: 800;
+}
+.tvf-node.proc .tvf-stage-no { background: #e0f2fe; color: #0369a1; }
+.tvf-node.miss .tvf-stage-no { background: #ffedd5; color: #c2410c; }
+.tvf-node.mod .tvf-stage-no { background: #f1f5f9; color: #475569; }
+.tvf-node.hit .tvf-stage-no { background: #fee2e2; color: #b91c1c; }
+.tvf-node-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+.tvf-node-top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.tvf-when { font-size: 11px; color: var(--muted); }
 .tvf-kind {
   font-size: 11px; font-weight: 700; padding: 2px 10px; border-radius: 999px;
   background: #eef2ff; color: #3730a3;
@@ -15964,20 +14447,21 @@ tr.row-warn td { background: #fff8ec; }
 .tvf-meta span.ok { background: #ecfdf3; color: #027a48; }
 .tvf-meta span.warn { background: #fffaeb; color: #b54708; }
 .tvf-edge {
-  flex: 0 0 88px; position: relative; height: 3px; background: linear-gradient(90deg, #cbd5e1, #94a3b8); margin: 0 4px;
-  align-self: center; border-radius: 2px;
+  flex: 0 0 40px; width: 2px; height: auto; position: relative; margin: 2px 0; align-self: center;
+  background: linear-gradient(180deg, #cbd5e1, #94a3b8); border-radius: 2px;
 }
 .tvf-edge::after {
-  content: ''; position: absolute; right: -1px; top: -5px;
-  border-left: 9px solid #b6c2d4; border-top: 6px solid transparent; border-bottom: 6px solid transparent;
+  content: ''; position: absolute; left: -5px; bottom: -1px;
+  border-left: 6px solid transparent; border-right: 6px solid transparent;
+  border-top: 9px solid #b6c2d4;
 }
 .tvf-edge em {
-  position: absolute; left: 50%; top: -11px; transform: translateX(-50%);
+  position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
   font-style: normal; font-size: 11px; font-weight: 600; color: #475569; white-space: nowrap;
-  background: #f4f6fa; padding: 0 8px; border-radius: 999px;
+  background: transparent; padding: 0 2px;
 }
 .tvf-edge.hot { background: #f87171; }
-.tvf-edge.hot::after { border-left-color: #f87171; }
+.tvf-edge.hot::after { border-top-color: #f87171; }
 .tvf-edge.hot em { color: #b91c1c; }
 .tv-graph-foot {
   flex-shrink: 0; width: 100%; box-sizing: border-box;
@@ -16007,20 +14491,10 @@ tr.row-warn td { background: #fff8ec; }
 .tvf-rule b.judge { color: #b45309; }
 .tv-graph-foot .tv-canvas-hint { margin: 10px 0 0; padding: 0; color: var(--muted); font-size: 12px; text-align: center; }
 
-/* 画布较窄时（笔记本 / 侧栏展开）改为竖向流程，避免横向溢出被裁切 */
+/* 画布较窄时（笔记本 / 侧栏展开）：阶段链铺满宽度、规则卡片改两列 */
 @container (max-width: 680px) {
-  .tv-flow { flex-direction: column; max-width: 360px; }
-  .tvf-node { flex: 0 0 auto; width: 100%; max-width: none; min-width: 0; }
-  .tvf-edge {
-    flex: 0 0 46px; width: 2px; height: auto; margin: 2px 0; align-self: center;
-  }
-  .tvf-edge::after {
-    right: auto; left: -5px; top: auto; bottom: -1px;
-    border-left: 6px solid transparent; border-right: 6px solid transparent;
-    border-top: 9px solid #b6c2d4; border-bottom: 0;
-  }
-  .tvf-edge.hot::after { border-top-color: #f87171; border-left-color: transparent; }
-  .tvf-edge em { left: 14px; top: 50%; transform: translateY(-50%); background: transparent; }
+  .tv-flow { max-width: 100%; }
+  .tv-graph-foot { padding: 12px; }
   .tvf-rule { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .tvf-rule-item.span2, .tvf-rule-item.span3, .tvf-rule-item.span4 { grid-column: span 1; }
   .tvf-rule-item:nth-child(2n) { border-right: 0; }
@@ -16415,7 +14889,9 @@ tr.row-warn td { background: #fff8ec; }
   display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;
 }
 .seq-step header b { font-size: 12px; color: #334155; }
-.chk { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; font-size: 13px; color: var(--ink-2); }
+label.chk, .na-toolbar .chk, .af-toolbar .chk {
+  display: inline-flex; align-items: center; gap: 6px; font-weight: 500; font-size: 13px; color: var(--ink-2);
+}
 .switch {
   position: relative; display: inline-block; width: 36px; height: 20px;
 }
@@ -16431,33 +14907,7 @@ tr.row-warn td { background: #fff8ec; }
 .switch input:checked + i::after { transform: translateX(16px); }
 
 /* 终端列表美化 */
-.host-summary {
-  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px;
-}
-.hs {
-  background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
-  display: flex; justify-content: space-between; align-items: center; box-shadow: var(--shadow);
-}
-.hs span { color: var(--muted); font-size: 12px; }
-.hs b { font-size: 20px; font-weight: 700; }
-.hs.on b { color: var(--online); }
-.hs.off b { color: var(--muted); }
-.hs.danger b { color: var(--danger); }
 .host-panel { padding: 0; }
-.host-table { min-height: 320px; }
-.ht-head, .ht-row {
-  display: grid;
-  grid-template-columns: 1.4fr .7fr 1fr .7fr 1.2fr .6fr .5fr 1.2fr;
-  gap: 8px; align-items: center; padding: 12px 16px; font-size: 13px;
-}
-.ht-head {
-  background: #fafbfd; color: var(--muted); font-size: 12px; font-weight: 600;
-  border-bottom: 1px solid var(--line);
-}
-.ht-row { border-bottom: 1px solid var(--line); }
-.ht-row:hover { background: #f7f9fc; }
-.ht-host { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.ht-host b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .alert-n {
   display: inline-flex; min-width: 18px; justify-content: center;
   padding: 1px 6px; border-radius: 999px; background: #fef2f2; color: #e11d2e;
@@ -16468,6 +14918,31 @@ tr.row-warn td { background: #fff8ec; }
   background: #eef2ff; color: #3730a3; border: 1px solid #c7d2fe; font-size: 11px;
 }
 .story-pane { gap: 0; }
+.ai-pane { gap: 12px; overflow: auto; }
+.threat-ai-kpis {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px;
+}
+.threat-ai-kpis > div {
+  background: var(--bg-elevated); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+}
+.threat-ai-kpis span { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.threat-ai-kpis b { font-size: 14px; }
+.threat-ai-kpis em { font-style: normal; color: var(--muted); font-size: 12px; margin-left: 4px; }
+.threat-ai-summary, .threat-ai-pipe, .threat-ai-think {
+  border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: #fff;
+}
+.threat-ai-summary label, .threat-ai-pipe label, .threat-ai-think label {
+  display: block; font-size: 12px; font-weight: 650; color: var(--muted); margin-bottom: 8px;
+}
+.threat-ai-summary pre {
+  margin: 0; white-space: pre-wrap; word-break: break-word; font-family: inherit; font-size: 13px; line-height: 1.55;
+}
+.threat-ai-pipe ol, .threat-ai-think ul { margin: 0; padding-left: 18px; display: grid; gap: 8px; }
+.threat-ai-pipe li, .threat-ai-think li { font-size: 12.5px; line-height: 1.45; }
+.threat-ai-pipe b, .threat-ai-think b { display: block; margin-bottom: 2px; }
+@media (max-width: 900px) {
+  .threat-ai-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .story-techs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
 .stech {
   display: inline-flex; align-items: center; max-width: min(100%, 420px);
@@ -16515,117 +14990,11 @@ tr.row-warn td { background: #fff8ec; }
 .sn-meta em { font-style: normal; color: #98a2b3; font-weight: 600; }
 .attck-page { overflow: hidden; gap: 10px; display: flex; flex-direction: column; }
 .attck-page > .page-hd { margin-bottom: 0; flex-shrink: 0; }
-.attck-page .ak-kpis { flex-shrink: 0; }
-.attck-page .ak-board {
-  flex: 0 0 auto; display: flex; flex-direction: column; gap: 10px; min-height: 0;
-}
 .attck-page .attck-recent {
   flex: 1 1 auto; min-height: 180px; display: flex; flex-direction: column; overflow: hidden;
 }
 .attck-page .attck-recent .table-scroll { flex: 1; min-height: 0; overflow: auto; }
-.ak-kpis { grid-template-columns: repeat(5, minmax(0, 1fr)); margin: 0; }
-.ak-kpis .kpi-den {
-  font-size: 18px; font-weight: 600; color: #98a2b3; margin-left: 2px; letter-spacing: 0;
-}
-.ak-kpis .c-warn { color: #c2410c; }
 
-.ak-chain { padding-bottom: 12px; }
-.ak-steps {
-  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; padding: 4px 16px 12px;
-}
-.ak-step {
-  position: relative; display: flex; flex-direction: column; gap: 8px;
-  min-width: 0; padding: 12px 12px 10px; border: 1px solid #e6eaf0; border-radius: 10px;
-  background: #fafbfc; text-align: left; cursor: pointer; overflow: hidden;
-  transition: border-color .15s, box-shadow .15s, transform .15s;
-}
-.ak-step::before {
-  content: ''; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: #e6eaf0;
-}
-.ak-step.hit { background: var(--ak-bg, #fff5f5); border-color: rgba(225, 29, 46, .22); }
-.ak-step.hit::before { background: var(--ak-bar, #e11d2e); }
-.ak-step:hover { border-color: #94a3b8; transform: translateY(-1px); }
-.ak-step.on { border-color: #e11d2e; box-shadow: 0 0 0 2px rgba(225, 29, 46, .18); }
-.ak-step-top {
-  display: flex; align-items: center; gap: 8px; min-width: 0;
-}
-.ak-no { font-size: 11px; font-weight: 700; color: #a0aab8; letter-spacing: .04em; flex-shrink: 0; }
-.ak-step b {
-  font-size: 13px; font-weight: 650; color: var(--ink); min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.ak-step-bot {
-  display: flex; align-items: baseline; justify-content: space-between; gap: 8px; width: 100%;
-}
-.ak-step strong { font-size: 22px; line-height: 1; font-weight: 700; color: #c0c8d4; }
-.ak-step.hit strong { color: #b4141f; }
-.ak-step em {
-  font-style: normal; font-size: 11.5px; color: #98a2b3; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right;
-}
-.ak-step.hit em { color: #7a2a30; }
-
-.ak-mid {
-  display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(260px, 1fr); gap: 10px; align-items: stretch;
-  min-height: 220px; max-height: 280px;
-}
-.ak-mid > .panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
-.ak-tech-list {
-  display: flex; flex-direction: column; gap: 2px; padding: 4px 12px 14px; flex: 1; min-height: 0; overflow: auto;
-}
-.ak-tech-row {
-  display: grid; grid-template-columns: 72px minmax(0, 1.2fr) minmax(64px, .7fr) minmax(60px, 1fr) 36px;
-  align-items: center; gap: 10px; padding: 9px 8px; border: 0; border-radius: 8px;
-  background: transparent; text-align: left; cursor: pointer;
-}
-.ak-tech-row:hover { background: #f8fafc; }
-.ak-tech-row.on { background: #fff1f2; }
-.ak-tech-row code {
-  font-size: 12px; font-weight: 600; color: #b4141f; background: #fff1f2;
-  padding: 2px 6px; border-radius: 6px; justify-self: start;
-}
-.ak-tech-name {
-  font-size: 13px; font-weight: 600; color: var(--ink);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.ak-tac {
-  font-size: 12px; color: #667085; background: #f2f4f7; border-radius: 6px; padding: 2px 6px;
-  justify-self: start; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
-}
-.ak-tech-row .rank-bar { margin-top: 0; }
-.ak-tech-row strong { font-size: 15px; font-weight: 700; text-align: right; color: var(--ink); }
-.ak-hosts .attck-rank { flex: 1; min-height: 0; overflow: auto; }
-
-.attck-rank {
-  padding: 8px 14px 16px; display: flex; flex-direction: column; gap: 6px;
-}
-.rank-row {
-  display: grid; grid-template-columns: 28px 1fr auto; gap: 10px; align-items: center;
-  text-align: left; border: 0; background: transparent; padding: 8px 6px; border-radius: 10px;
-  cursor: pointer;
-}
-.rank-row:hover { background: #f8fafc; }
-.rank-row.on { background: #eff8ff; }
-.rank-row > em {
-  font-style: normal; font-size: 12px; font-weight: 700; color: #98a2b3;
-  width: 22px; height: 22px; border-radius: 7px; background: #f2f4f7;
-  display: inline-flex; align-items: center; justify-content: center;
-}
-.rank-row:nth-child(-n+3) > em { background: #fff1f0; color: #c2410c; }
-.rank-main { min-width: 0; }
-.rank-main b {
-  display: block; font-size: 13px; font-weight: 650; color: var(--ink);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.rank-bar {
-  display: block; height: 6px; border-radius: 99px; background: #eef2f7; margin-top: 6px; overflow: hidden;
-}
-.rank-bar > i {
-  display: block; height: 100%; border-radius: 99px;
-  background: linear-gradient(90deg, #fb7185, #e11d2e);
-}
-.rank-bar.host > i { background: linear-gradient(90deg, #38bdf8, #0284c7); }
-.rank-row strong { font-size: 15px; font-weight: 700; color: var(--ink); min-width: 28px; text-align: right; }
 
 .ak-title { max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ak-techcell { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: #475467; white-space: nowrap; }
@@ -16636,11 +15005,66 @@ tr.row-warn td { background: #fff8ec; }
 .ak-st[data-s='closed'] { background: #ecfdf3; color: #067647; }
 .ak-st[data-s='ignored'] { background: #f2f4f7; color: #667085; }
 .notify-results { margin-top: 10px; }
+.ioc-add-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(140px, 0.7fr) minmax(140px, 0.9fr) minmax(100px, 0.5fr) auto;
+  gap: 10px 12px;
+  align-items: end;
+  margin-bottom: 12px;
+}
+.ioc-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ioc-field.grow { grid-column: 1 / 2; }
+.ioc-field span { font-size: 12px; color: var(--muted); font-weight: 600; }
+.ioc-field span em { font-style: normal; font-weight: 500; color: #98a2b3; margin-left: 6px; }
+.ioc-add-acts { display: flex; align-items: end; padding-bottom: 1px; }
+.ioc-preview {
+  grid-column: 1 / -1; margin: 0; padding: 8px 12px; border-radius: 8px;
+  background: #f0f7ff; border: 1px solid #d6e6f8; font-size: 12.5px; color: #344054;
+}
+.ioc-preview code { margin: 0 4px; }
+.ioc-batch { margin: 8px 0 4px; border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; background: #fafbfc; }
+.ioc-batch summary { cursor: pointer; font-weight: 650; font-size: 13px; color: #344054; }
+.ioc-batch .hunt-bar { margin: 10px 0 8px; }
+@media (max-width: 1100px) {
+  .ioc-add-form { grid-template-columns: 1fr 1fr; }
+  .ioc-field.grow, .ioc-preview, .ioc-add-acts { grid-column: 1 / -1; }
+}
 .ioc-lib { margin-bottom: 12px; }
 .ioc-lib-row { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
 .ioc-lib-stat { display: flex; gap: 16px; align-items: center; font-size: 13px; }
 .ioc-lib-stat .on { color: var(--online); font-weight: 600; }
 .ioc-lib-stat .off { color: var(--danger); font-weight: 600; }
+.ioc-type-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.ioc-type-chip {
+  border: 1px solid var(--line); background: var(--bg-elevated); color: var(--ink-2);
+  border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 650; cursor: pointer;
+}
+.ioc-type-chip em { font-style: normal; color: var(--muted); margin-left: 4px; }
+.ioc-type-chip.on { background: var(--accent-soft); color: var(--accent-2); border-color: #f0b6a0; }
+.intel-page { gap: 10px; }
+.intel-page .ioc-lib { margin-bottom: 0; }
+.intel-split {
+  display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr); gap: 10px; margin-bottom: 0;
+  flex: 0 0 auto;
+}
+.ioc-local-panel > .ioc-add-form,
+.ioc-local-panel > .ioc-batch,
+.ioc-local-panel > .hint,
+.ioc-local-panel > h3 { flex-shrink: 0; }
+.ioc-local-panel > .fill-rest-body {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.ioc-empty {
+  min-height: 120px;
+  display: grid;
+  place-items: center;
+  margin: 0;
+}
+@media (max-width: 960px) {
+  .intel-split { grid-template-columns: minmax(0, 1fr); }
+}
 .up-hosts {
   max-height: 240px; overflow: auto; display: flex; flex-direction: column; gap: 6px;
   border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-top: 10px;
@@ -16654,39 +15078,11 @@ tr.row-warn td { background: #fff8ec; }
 .hosts-page .host-panel {
   flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;
 }
-.hosts-page .host-table {
-  flex: 1; min-height: 0; overflow: auto;
-}
 .seq-page { overflow: hidden; }
 .seq-page > .page-hd { flex-shrink: 0; }
 .seq-page .seq-explain { flex-shrink: 0; }
 .seq-page .rules-layout { flex: 1; min-height: 0; }
 .timeline-page > .page-hd { flex-shrink: 0; }
-.snap-viewbar {
-  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
-  margin: 0 0 12px; padding: 0 2px;
-}
-.snap-viewbar .meta { font-size: 12px; color: #98a2b3; }
-.dll-list {
-  margin-top: 12px; display: flex; flex-direction: column; gap: 6px;
-}
-.dll-list > small { color: var(--muted); font-size: 12px; font-weight: 650; }
-.dll-row {
-  display: grid; grid-template-columns: minmax(100px, 140px) 1fr auto; gap: 8px; align-items: center;
-  padding: 7px 10px; border-radius: 8px; background: #f8fafc; border: 1px solid #eef2f7;
-  text-align: left; width: 100%; cursor: pointer; color: inherit;
-}
-.dll-row:hover { border-color: #c7d7f0; background: #f5f8ff; }
-.dll-row.hot { background: #fff7ed; border-color: #fed7aa; }
-.dll-row.on { border-color: #93c5fd; background: #eff6ff; box-shadow: 0 0 0 1px #bfdbfe; }
-.dll-row b { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dll-row em { font-style: normal; font-size: 11px; color: #667085; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dll-detail {
-  margin-top: 4px; padding: 12px; border-radius: 10px;
-  border: 1px solid #dbe7f3; background: #fff;
-}
-.dll-detail h5 { margin: 0 0 10px; font-size: 13px; font-weight: 700; }
-.dll-detail .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; word-break: break-all; }
 .inv-top {
   display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; flex-shrink: 0;
   background: #fff; border: 1px solid rgba(15, 23, 42, .06); border-radius: 14px;
@@ -16737,6 +15133,13 @@ tr.row-warn td { background: #fff8ec; }
 }
 .inv-search-row label.inv-hide-noise input { margin-right: 6px; }
 .inv-more-panel { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line-2); }
+.inv-more-quick {
+  grid-column: 1 / -1;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding-top: 4px;
+}
+.inv-more-quick-lab { font-size: 12px; color: var(--ink-3); font-weight: 600; }
+.inv-more-quick .chip.on { border-color: var(--accent); color: var(--accent); background: #fff7f5; }
 .bh-expand {
   display: grid; grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
   gap: 12px; align-items: start;
@@ -16770,9 +15173,10 @@ tr.row-warn td { background: #fff8ec; }
   .bh-expand { grid-template-columns: 1fr; }
   .bh-field-grid { grid-template-columns: 1fr; }
 }
+/* 树选项并入 tab 行右侧：去掉独立横条的背景 / 边框 / 大内边距 */
 .tv-tree-bar {
-  display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
-  padding: 10px 18px; background: rgba(255,255,255,.92); border-bottom: 1px solid var(--line-2);
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+  padding: 0 0 6px; background: transparent; border: 0;
 }
 .tv-tree-opt { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
 .tv-drop-chain {
@@ -16941,6 +15345,22 @@ tr.row-warn td { background: #fff8ec; }
 .inv-cats button.on { color: #e11d2e; border-bottom-color: #e11d2e; }
 .inv-bars { height: 120px; }
 .inv-cats em { font-style: normal; margin-left: 4px; color: #98a2b3; font-variant-numeric: tabular-nums; }
+.inv-topics {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 10px; padding: 0 8px;
+}
+.inv-topics-lab { font-size: 12px; color: #98a2b3; font-weight: 650; }
+.inv-etype-td { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.inv-etype { font-size: 12.5px; }
+.src-chip {
+  font-style: normal; font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 999px;
+  background: #eef2f7; color: #475467;
+}
+.src-chip.sysmon { background: #e0f2fe; color: #0369a1; }
+.src-chip.topic { background: #fce7f3; color: #9d174d; }
+.src-eid {
+  font-style: normal; font-size: 10.5px; font-weight: 700; color: #667085;
+  font-variant-numeric: tabular-nums;
+}
 .inv-layout { display: grid; grid-template-columns: 1fr; min-height: 0; flex: 1; overflow: hidden; }
 .inv-layout.open { grid-template-columns: minmax(0, 1.35fr) minmax(360px, .85fr); }
 .inv-list {
@@ -16960,28 +15380,6 @@ tr.row-warn td { background: #fff8ec; }
 .inv-list td { padding: 8px 12px; border-bottom: 1px solid #eef2f7; vertical-align: middle; }
 .inv-list tr:hover td { background: #f8fafc; }
 .inv-list tr.active td { background: #e8f6fb; }
-.list-pager {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
-  padding: 10px 14px; border-top: 1px solid #e8eef6;
-  background: linear-gradient(180deg, #fafbfd 0%, #f5f8fc 100%);
-}
-.list-pager .pg-info {
-  font-size: 12.5px; color: #667085; font-weight: 550;
-  font-variant-numeric: tabular-nums;
-}
-.list-pager .pg-acts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.list-pager .pg-size {
-  border: 1px solid #e4eaf3; border-radius: 8px; background: #fff;
-  padding: 5px 10px; font-size: 12px; color: var(--ink-2); min-width: 96px;
-  cursor: pointer;
-}
-.list-pager .pg-size:hover { border-color: #c7d7f0; }
-.list-pager .btn.sm:disabled {
-  opacity: .45; cursor: not-allowed; background: #f1f5f9; color: #98a2b3;
-}
-.list-pager .btn.sm {
-  min-width: 68px; border-radius: 8px; font-weight: 600;
-}
 .nat {
   display: inline-flex; padding: 1px 7px; border-radius: 6px; font-size: 11px; font-weight: 700;
   background: #f1f5f9; color: #475569;
@@ -17059,32 +15457,20 @@ tr.row-warn td { background: #fff8ec; }
   font-size: 11.5px; line-height: 1.45; overflow: auto; max-height: 480px; white-space: pre-wrap; word-break: break-all;
 }
 
-@media (max-width: 1280px) {
-  .ak-steps { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  .ak-mid { max-height: none; }
-}
 
 @media (max-width: 1100px) {
-  .app { grid-template-columns: 68px 1fr; }
-  .menu { left: 68px; width: 200px; }
-  .workspace.menu-pinned { padding-left: 0; }
+  .app { grid-template-columns: 76px 1fr; }
+  .workspace.menu-pinned { padding-left: 200px; }
   .ov-kpis, .ov-kpis-4, .focus-grid, .host-summary, .attck-bottom { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .ov-body { grid-template-columns: 1fr; }
   .settings-page { overflow: auto; }
   .settings-rules-panel { min-height: 320px; }
-  .ak-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .ak-mid { grid-template-columns: 1fr; max-height: none; }
-  .ak-steps { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .ov-grid, .ov-body, .event-layout, .deploy-grid, .tv-body, .snap-work, .inv-layout.open, .inv-fg { grid-template-columns: 1fr; }
+  .ov-grid, .event-layout, .deploy-grid, .tv-body, .inv-layout.open, .inv-fg { grid-template-columns: 1fr; }
   .tv-side, .snap-detail { position: static; max-height: none; }
   .tv-body { grid-template-rows: auto; flex: none; min-height: 0; }
   .tv-body > .tv-canvas { min-height: 480px; }
   .tvf-rule { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .tvf-rule-item.span2, .tvf-rule-item.span3, .tvf-rule-item.span4 { grid-column: span 1; }
   .tvf-rule > div:nth-child(2) { border-right: 0; }
-  .ht-head, .ht-row { grid-template-columns: 1.2fr 1fr .7fr 1fr; }
-  .ht-head span:nth-child(n+5), .ht-row span:nth-child(n+5) { display: none; }
-  .ht-row .ops { display: flex !important; }
 }
 @media (min-width: 861px) and (max-width: 1100px) {
   .rules-layout { grid-template-columns: minmax(0, 1.15fr) minmax(360px, .85fr); }
@@ -17391,18 +15777,57 @@ tr.row-warn td { background: #fff8ec; }
 .ai-log-cats .chip.sm { font-size: 11px; padding: 2px 8px; }
 .ai-log-board {
   flex: 1; min-height: 0;
-  display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.85fr); gap: 12px;
+  display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.9fr); gap: 12px;
 }
-.ai-log-main, .ai-log-side {
+.ai-log-board.has-detail {
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 1.05fr);
+}
+.ai-log-main, .ai-log-side, .ai-log-detail {
   min-height: 0; border: 1px solid #e8eef6; border-radius: 12px; background: #fff;
   display: flex; flex-direction: column; overflow: hidden; padding: 10px 12px;
 }
 .ai-log-table-wrap { flex: 1; min-height: 0; overflow: auto; }
-.ai-log-card {
-  margin-top: 8px; border-top: 1px solid #eef2f7; padding-top: 8px; flex-shrink: 0;
+.ai-log-detail { background: #f8fafc; border-color: #c7d2fe; }
+.ai-log-detail-body { flex: 1; min-height: 0; overflow: auto; }
+.ai-log-detail-title { margin: 0 0 4px; font-size: 14px; font-weight: 700; color: #1e293b; line-height: 1.4; }
+.ai-log-kv { margin: 10px 0 0; display: grid; gap: 6px; }
+.ai-log-kv > div { display: grid; grid-template-columns: 72px 1fr; gap: 8px; font-size: 12.5px; }
+.ai-log-kv dt { margin: 0; color: #64748b; font-weight: 600; }
+.ai-log-kv dd { margin: 0; color: #0f172a; word-break: break-word; }
+.ai-log-detail-acts { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.ai-log-raw { margin-top: 8px; font-size: 12px; color: #475569; }
+.ai-log-raw pre {
+  margin: 6px 0 0; max-height: 220px; overflow: auto;
+  background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 10px; font-size: 11.5px;
 }
-.ai-log-card b { font-size: 13px; }
-.ai-log-card p { margin: 4px 0 0; font-size: 12.5px; line-height: 1.45; }
+.ai-mini-tbl tr.row-click { cursor: pointer; }
+.ai-mini-tbl tr.row-click:hover { background: #f1f5f9; }
+.ai-mini-tbl tr.on { background: #eef2ff; }
+.logrules-layout {
+  flex: 1; min-height: 0; overflow: hidden; padding: 4px 2px 8px;
+  display: flex; flex-direction: column;
+}
+.logrules-body {
+  flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 12px;
+}
+.logrules-head { flex-shrink: 0; }
+.logrules-meta { margin-top: 12px; }
+.logrules-meta h4 { margin: 0 0 6px; font-size: 13px; color: #334155; }
+.logrules-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.logrules-sample {
+  flex: 1; min-height: 180px; display: flex; flex-direction: column;
+  border: 1px solid #e8eef6; border-radius: 12px; background: #fff; padding: 10px 12px;
+  overflow: hidden;
+}
+.logrules-sample > .ai-panel-hd { flex-shrink: 0; }
+.logrules-table-wrap {
+  flex: 1; min-height: 0; overflow: auto; margin-top: 6px;
+  border: 1px solid #eef2f7; border-radius: 8px;
+}
+.logrules-table-wrap .ai-mini-tbl { margin: 0; }
+.logrules-table-wrap thead th {
+  position: sticky; top: 0; z-index: 1; background: #f8fafc;
+}
 .ai-think-step.llm { background: #f5f3ff; }
 .ai-think-step.llm.on { background: #ede9fe; box-shadow: inset 3px 0 0 #7c3aed; }
 .ai-evidence-list { margin: 0; padding-left: 16px; }
@@ -17644,4 +16069,267 @@ tr.row-warn td { background: #fff8ec; }
   .ai-threat-card { position: static; }
   .ai-entity-grid { grid-template-columns: 1fr; }
 }
+
+/* ============================================================
+   Tech-console visual layer — presentation only.
+   Palette: graphite sidebars + vermilion accent, warm-sand and
+   slate data cards, blue data bars (per reference screens).
+   Appended last so it wins at equal specificity. No display/flex/
+   height/overflow rules are touched; layout and behavior unchanged.
+   ============================================================ */
+
+/* Brand + primary rail: graphite with vermilion neon */
+
+/* Workspace: faint blueprint grid, purely decorative */
+.workspace {
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(rgba(90, 90, 100, .03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(90, 90, 100, .03) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+
+/* Section headers */
+.overview > .page-hd .live-hint {
+  background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1;
+}
+.overview > .page-hd .live-hint.on {
+  background: #dcfce7; color: #064e3b; border-color: #86efac;
+}
+.overview > .page-hd .ghost-btn {
+  background: #fff; color: var(--ink-2); border-color: var(--line);
+}
+.overview > .page-hd .ghost-btn:hover { background: #f9fafb; }
+
+/* Panels */
+.panel { border-color: #e4e7ec; box-shadow: 0 4px 20px rgba(28, 30, 36, .06); }
+.panel-hd { background: linear-gradient(180deg, #fcfcfd, #ffffff); border-bottom-color: #eceef2; }
+.panel-hd h3 { color: #2b3038; }
+
+/* Buttons + form controls */
+.btn { border-radius: 8px; transition: background .16s, border-color .16s, color .16s, box-shadow .16s; }
+.btn:hover { border-color: #f0b6a0; color: #c8451e; background: #fef7f4; }
+.btn.primary {
+  background: linear-gradient(135deg, #f2683a, #cf471e);
+  border-color: #cf471e;
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(226, 86, 44, .3), inset 0 1px 0 rgba(255, 255, 255, .2);
+}
+.btn.primary:hover:not(:disabled) { background: linear-gradient(135deg, #e2562c, #b93d18); }
+.field, .search, select { border-color: #d7dbe2; border-radius: 8px; background: #fff; }
+.field:focus, .search:focus, select:focus {
+  border-color: #e2562c; box-shadow: 0 0 0 3px rgba(226, 86, 44, .14); outline: none;
+}
+
+/* Tables */
+th {
+  background: linear-gradient(180deg, #f5f6f8, #eef0f3);
+  color: #575f6c;
+  border-bottom-color: #dfe2e8;
+  letter-spacing: .02em;
+}
+td { border-bottom-color: #eceef2; }
+tbody tr:nth-child(even) td { background: #fafbfc; }
+.row-click:hover td, tbody tr:hover td { background: #fdf0ea; }
+
+/* Overview fleet strip + warm-sand / slate data cards */
+
+/* Blue data bars (ref. threat bar / trend columns) */
+
+/* Toasts + dialogs */
+.dlg { box-shadow: 0 24px 70px rgba(12, 14, 20, .34); }
+.dlg h3 { color: #20242b; }
+.dlg-mask { background: rgba(14, 16, 22, .55); backdrop-filter: blur(3px); }
+
+/* ============================================================
+   Layout & interaction refinement layer — visual only.
+   Fold controls use native <details>; no JS state, no business
+   logic touched. No display/flex/height/overflow changes.
+   ============================================================ */
+
+/* ---- Fold / disclosure arrows (native details) ---- */
+.rules-bulk-fold, .ui-fold { border: 1px solid #e4e7ec; border-radius: 12px; background: #fbfcfd; }
+.rules-bulk-fold { border: 0; padding: 0; background: transparent; }
+.rules-fold-sum, .ui-fold-sum {
+  list-style: none; cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; font-weight: 700; color: #475467;
+  padding: 8px 12px; border-radius: 9px; transition: background .15s, color .15s;
+}
+.rules-fold-sum::-webkit-details-marker, .ui-fold-sum::-webkit-details-marker { display: none; }
+.rules-fold-sum:hover, .ui-fold-sum:hover { background: #f2f4f7; color: #20242b; }
+.rules-fold-sum .fold-caret, .ui-fold-sum .fold-caret {
+  width: 14px; height: 14px; flex: 0 0 14px;
+  background: currentColor;
+  -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><path d='M9 18l6-6-6-6'/></svg>") no-repeat center/contain;
+  mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><path d='M9 18l6-6-6-6'/></svg>") no-repeat center/contain;
+  transition: transform .18s ease; opacity: .7;
+}
+details[open] > .rules-fold-sum .fold-caret, details[open] > .ui-fold-sum .fold-caret { transform: rotate(90deg); }
+.rules-fold-note, .ui-fold-note {
+  font-style: normal; margin-left: auto; font-size: 10.5px; font-weight: 600;
+  color: #98a2b3; background: #f2f4f7; padding: 2px 9px; border-radius: 999px;
+}
+.rules-bulk-fold[open] > .rules-fold-sum { margin-bottom: 10px; }
+.ui-fold > .ui-fold-sum { margin: -2px -2px 10px; font-size: 14px; color: #20242b; padding-bottom: 10px; }
+.deploy-fold > .ui-fold-sum { color: #344054; }
+.wl-kind-fold { margin-top: 14px; }
+.wl-kind-fold > .rules-fold-sum { padding: 8px 0; }
+.wl-kind-fold[open] > .rules-fold-sum { margin-bottom: 8px; }
+
+/* ---- Empty states: subtle icon + guided copy ---- */
+.empty, .empty.sm {
+  color: #98a2b3; font-size: 12.5px; line-height: 1.7;
+  padding-top: 4px;
+}
+.rule-editor > .hint:first-of-type {
+  position: relative; padding: 16px 16px 16px 52px; margin: 16px 20px 0 !important;
+  background: linear-gradient(120deg, #fff8f5, #fffdfc);
+  border: 1px dashed #f0c4b4; border-radius: 12px; color: #87564a;
+}
+.rule-editor > .hint:first-of-type::before {
+  content: ''; position: absolute; left: 16px; top: 50%; transform: translateY(-50%);
+  width: 24px; height: 24px; background: #e2562c; opacity: .85;
+  -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 20h9'/><path d='M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z'/></svg>") no-repeat center/contain;
+  mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 20h9'/><path d='M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z'/></svg>") no-repeat center/contain;
+}
+
+/* ---- Tables: denser rows ---- */
+th { padding: 10px 12px; font-size: 12px; white-space: nowrap; }
+td { padding: 9px 12px; font-size: 12.5px; }
+
+/* ---- Buttons: visual hierarchy (primary solid / secondary outline) ---- */
+.btn { font-weight: 600; letter-spacing: .01em; }
+.btn:not(.primary):not(.danger-outline):not(.danger-ghost):not(.ghost) {
+  background: #fff; border-color: #d0d5dd; color: #344054;
+}
+.btn:not(.primary):not(.danger-outline):not(.danger-ghost):not(.ghost):hover {
+  border-color: #e2562c; color: #c2410c; background: #fff8f5;
+}
+.btn.sm { font-size: 12px; }
+
+/* ---- Overview quick-category cards: auto-fit wrap ---- */
+.quick-cats, .ev-quick-row, [class*='quick-cat'] { row-gap: 8px; }
+
+/* ---- Long page headers: comfortable description width ---- */
+
+/* ---- Rule subnav tabs: cleaner pill style ---- */
+.rules-subnav { gap: 6px; }
+.rules-tab { font-weight: 650; }
+
+/* ---- Danger actions: clear but not loud ---- */
+.btn.danger-outline, .btn.danger-ghost {
+  color: #c4321a; border-color: #f0b6a6;
+}
+.btn.danger-outline:hover, .btn.danger-ghost:hover {
+  background: #fff3ef; border-color: #e2562c; color: #a82a15;
+}
+
+/* ---- Generic empty states: a soft dashed frame ---- */
+.table-scroll > .empty, .panel > .empty {
+  margin: 18px; padding: 26px 16px; border-radius: 12px;
+  border: 1px dashed #e4e7ec; background: #fcfcfd;
+}
+
+/* ---- Semantic severity palette ----
+   Five distinguishable levels, independent of the brick-red brand.
+   Applies to .sev badges, threat bars and timeline dots. ---- */
+.sev {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 9px; border-radius: 6px; font-size: 11.5px; font-weight: 700;
+  line-height: 1.6; white-space: nowrap;
+}
+.sev::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+}
+.sev[data-s=critical] { color: var(--sev-critical); background: var(--sev-critical-bg); }
+.sev[data-s=high]     { color: var(--sev-high);     background: var(--sev-high-bg); }
+.sev[data-s=medium]   { color: var(--sev-medium);   background: var(--sev-medium-bg); }
+.sev[data-s=low]      { color: var(--sev-low);      background: var(--sev-low-bg); }
+.sev[data-s=info]     { color: var(--sev-info);     background: var(--sev-info-bg); }
+
+/* Threat bars: align the four levels to the same palette */
+
+/* Timeline dots: one dot color per level */
+.tl-card[data-s="critical"] .tl-dot { background: var(--sev-critical); box-shadow: 0 0 0 3px var(--sev-critical-bg); }
+.tl-card[data-s="high"] .tl-dot     { background: var(--sev-high);     box-shadow: 0 0 0 3px var(--sev-high-bg); }
+.tl-card[data-s="medium"] .tl-dot   { background: var(--sev-medium);   box-shadow: 0 0 0 3px var(--sev-medium-bg); }
+.tl-card[data-s="low"] .tl-dot      { background: var(--sev-low);      box-shadow: 0 0 0 3px var(--sev-low-bg); }
+
+/* ---- Timeline view switch + process tree ---- */
+.tl-view-switch {
+  display: flex; align-items: center; gap: 6px; margin: 0 0 12px;
+  padding: 4px; background: #eef0f3; border-radius: 10px; width: fit-content;
+}
+.tlv {
+  border: 0; background: transparent; padding: 6px 16px; border-radius: 7px;
+  font-size: 12.5px; font-weight: 650; color: #667085; transition: background .15s, color .15s, box-shadow .15s;
+}
+.tlv:hover { color: #20242b; }
+.tlv.on { background: #fff; color: #c2410c; box-shadow: 0 1px 4px rgba(20,22,28,.1); }
+.tlv em { font-style: normal; margin-left: 6px; font-size: 10.5px; color: #98a2b3; background: #f2f4f7; border-radius: 999px; padding: 1px 7px; }
+.tlv.on em { color: #c2410c; background: #fff1ea; }
+.tlv-legend { display: inline-flex; align-items: center; gap: 6px; margin-left: 12px; font-size: 11px; color: #98a2b3; }
+.tlv-legend i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.tlv-legend i[data-k=proc] { background: #12b76a; }
+.tlv-legend i[data-k=net] { background: #2e90fa; }
+.tlv-legend i[data-k=file] { background: #7a5af8; }
+.tlv-legend i[data-k=persist] { background: #f79009; }
+.tlv-legend i[data-k=alert] { background: #e2562c; }
+
+.tl-tree-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.tl-tree-head h3 { margin: 0 0 2px; font-size: 15px; }
+.tl-tree { display: flex; flex-direction: column; gap: 10px; }
+.tl-tree-node { border: 1px solid #e4e7ec; border-radius: 10px; background: #fff; overflow: hidden; margin-left: 0; }
+.tl-tree-node.child { border-style: dashed; background: #fcfcfd; }
+.tpn-row { display: flex; align-items: center; gap: 9px; padding: 10px 14px; cursor: pointer; transition: background .14s; }
+.tpn-row:hover { background: #f9fafb; }
+.tpn-caret { display: inline-block; width: 12px; color: #98a2b3; font-size: 15px; line-height: 1; transition: transform .16s; }
+.tpn-caret.open { transform: rotate(90deg); color: #c2410c; }
+.tpn-branch { color: #c8ccd3; font-family: monospace; }
+.tpn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--sev-info); flex: 0 0 8px; }
+.tl-tree-node[data-s=critical] > .tpn-row .tpn-dot { background: var(--sev-critical); }
+.tl-tree-node[data-s=high] > .tpn-row .tpn-dot { background: var(--sev-high); }
+.tl-tree-node[data-s=medium] > .tpn-row .tpn-dot { background: var(--sev-medium); }
+.tl-tree-node[data-s=low] > .tpn-row .tpn-dot { background: var(--sev-low); }
+.tpn-name { font-size: 13px; color: #20242b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 460px; }
+.tpn-pid { font-size: 11px; color: #98a2b3; }
+.tpn-count { margin-left: auto; font-style: normal; font-size: 11px; color: #667085; font-weight: 600; }
+.tpn-events { padding: 4px 14px 12px 46px; border-top: 1px solid #f2f4f7; background: #fcfcfd; }
+.tpn-ev { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 12px; color: #48505d; border-bottom: 1px dashed #eef0f3; }
+.tpn-ev time { color: #98a2b3; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+.tpn-ev-kind { flex: 0 0 auto; font-size: 10.5px; padding: 1px 7px; border-radius: 5px; background: #f2f4f7; color: #667085; }
+.tpn-ev[data-k=proc] .tpn-ev-kind { background: #ecfdf3; color: #067647; }
+.tpn-ev[data-k=net] .tpn-ev-kind { background: #eff6ff; color: #175cd3; }
+.tpn-ev[data-k=file] .tpn-ev-kind { background: #f4f3ff; color: #5925dc; }
+.tpn-ev[data-k=persist] .tpn-ev-kind { background: #fffaeb; color: #b54708; }
+.tpn-ev[data-k=alert] .tpn-ev-kind { background: #fff4ee; color: #c2410c; }
+.tpn-events .btn { margin-top: 8px; }
+
+/* ---- Deployment: 4-step onboarding diagnostic strip ---- */
+.diag-table { min-width: 660px; }
+.diag-host-cell b { display: block; color: #20242b; font-size: 12.5px; }
+.diag-host-meta { display: block; color: #98a2b3; font-size: 10.5px; margin-top: 2px; }
+.diag-activity { color: #667085; font-size: 11.5px; line-height: 1.7; font-variant-numeric: tabular-nums; }
+.diag-activity span { display: block; white-space: nowrap; }
+.diag-steps { display: inline-flex; align-items: center; flex-wrap: nowrap; }
+.diag-step {
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  font-size: 11px; font-weight: 600; color: #98a2b3; padding-right: 12px; position: relative;
+}
+.diag-step:not(:last-child)::after {
+  content: ''; width: 9px; height: 1px; background: #d0d5dd;
+  position: absolute; right: 1px; top: 50%;
+}
+.diag-step i {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 15px; height: 15px; border-radius: 50%; font-style: normal;
+  font-size: 9px; font-weight: 700; line-height: 1;
+  background: #f2f4f7; color: #98a2b3; border: 1px solid #e4e7ec;
+}
+.diag-step.done { color: #067647; }
+.diag-step.done i { background: #d1fadf; color: #067647; border-color: #a6f4c5; }
+.diag-step.warn { color: #b54708; }
+.diag-step.warn i { background: #fef0c7; color: #b54708; border-color: #fec84b; box-shadow: 0 0 0 3px rgba(254, 200, 75, .16); }
+.diag-step.todo i { background: #f9fafb; color: #b0b7c3; }
 </style>

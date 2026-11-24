@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "node --test src/displayFormat.test.js src/componentHealth.test.js src/resourceHistory.test.js src/sectionPagination.test.js src/latestRequest.test.js src/resourceBudget.test.js src/setupContext.test.js src/agentRulesHelpers.test.js src/deploymentDownloads.test.js src/snapshotPagination.test.js src/hostEvidenceStatus.test.js src/huntRequestOrder.test.js src/consoleNavigation.test.js src/hostHealthComponents.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

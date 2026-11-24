@@ -17,15 +17,24 @@ import (
 // doUpgrade 下载灰度包、校验 sha256 + Ed25519、替换本程序并武装 watchdog（失败自动回滚 N-1）。
 func doUpgrade(cfg Config, params map[string]any) (map[string]any, error) {
 	url := strings.TrimSpace(fmt.Sprint(params["url"]))
-	wantSHA := strings.ToLower(strings.TrimSpace(fmt.Sprint(params["sha256"])))
+	wantSHA, err := normalizeUpgradeSHA256(fmt.Sprint(params["sha256"]))
+	if err != nil {
+		return nil, err
+	}
 	ver := strings.TrimSpace(fmt.Sprint(params["version"]))
-	if url == "" || wantSHA == "" {
-		return nil, fmt.Errorf("缺少 url 或 sha256")
+	if url == "" {
+		return nil, fmt.Errorf("缺少 url")
+	}
+	if err := validateUpgradeURL(cfg, url); err != nil {
+		return nil, err
 	}
 	setUpgradePhase("DOWNLOADING", ver, "UPGRADE")
 	defer clearUpgradePhase()
 	if strings.HasPrefix(url, "/") {
 		url = strings.TrimRight(cfg.ServerURL, "/") + url
+		if err := validateUpgradeURL(cfg, url); err != nil {
+			return nil, err
+		}
 	}
 
 	tmpDir := filepath.Join(cfg.StateDir, "upgrade")
@@ -43,8 +52,7 @@ func doUpgrade(cfg Config, params map[string]any) (map[string]any, error) {
 		req.Header.Set("Authorization", "Bearer "+cfg.Secret)
 		req.Header.Set("X-Agent-Id", cfg.AgentID)
 	}
-	client := &http.Client{Timeout: 3 * time.Minute}
-	resp, err := client.Do(req)
+	resp, err := upgradeHTTPClient(cfg).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("下载失败: %w", err)
 	}

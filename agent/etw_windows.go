@@ -59,25 +59,35 @@ func (w *etwWatcher) drain() []map[string]any {
 	if len(out) > 300 {
 		// 一次最多转发 300 条，剩余留到下一轮，避免突发时整批丢弃
 		w.events = append([]map[string]any(nil), out[300:]...)
+		captureAdd("etw", "drained", 300)
 		return out[:300]
 	}
+	captureAdd("etw", "drained", len(out))
 	return out
 }
 
 func (w *etwWatcher) push(ev map[string]any) {
+	captureTag(ev, "etw")
+	captureAdd("etw", "received", 1)
 	if isTimelineNoiseEvent(ev) {
+		captureFiltered(ev)
 		return
 	}
 	teleIncSource(ev)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.events = append(w.events, ev)
+	captureAdd("etw", "queued", 1)
 	if et, _ := ev["etype"].(string); et == "process_create_etw" || et == "process_create_live" || et == "process_create" {
 		if pe := privEscFromProcessEvent(ev); pe != nil && !isTimelineNoiseEvent(pe) {
 			w.events = append(w.events, pe)
+			captureTag(pe, "etw")
+			captureAdd("etw", "derived", 1)
+			captureAdd("etw", "queued", 1)
 		}
 	}
 	if len(w.events) > 600 {
+		captureAdd("etw", "buffer_dropped", len(w.events)-600)
 		w.events = w.events[len(w.events)-600:]
 	}
 }

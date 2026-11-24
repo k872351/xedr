@@ -74,27 +74,15 @@ func paramStr(params map[string]any, keys ...string) string {
 }
 
 // verifyUpgradeSignature 校验升级包 Ed25519 签名。
-// 已钉扎公钥时：必须带有效签名；未钉扎时：有签名则验（需 params.pubkey），无签名则放行（仅靠 sha256）。
+// 必须使用编译期/配置钉扎公钥；禁止把命令附带 pubkey 当信任根；禁止仅靠 SHA256 放行。
 func verifyUpgradeSignature(cfg Config, params map[string]any, sha256Hex, version string, size int64) error {
 	sigB64 := paramStr(params, "sig_ed25519", "sig")
 	pks := pinnedUpgradePubKeys(cfg)
 	if len(pks) == 0 {
-		if sigB64 == "" {
-			return nil
-		}
-		// 指令自带 pubkey（仅开发兜底；生产应钉扎）
-		pubStr := paramStr(params, "pubkey")
-		if pubStr == "" {
-			return fmt.Errorf("有签名但无可用公钥")
-		}
-		pk, err := parseEd25519Pub(pubStr)
-		if err != nil {
-			return fmt.Errorf("有签名但无可用公钥: %w", err)
-		}
-		pks = append(pks, pk)
+		return fmt.Errorf("未配置升级公钥，拒绝升级（禁止命令附带 pubkey / 禁止仅校验 SHA256）")
 	}
 	if sigB64 == "" {
-		return fmt.Errorf("已配置升级公钥，拒绝未签名升级包")
+		return fmt.Errorf("缺少 Ed25519 签名，拒绝未签名升级包")
 	}
 	sig, err := base64.StdEncoding.DecodeString(sigB64)
 	if err != nil {

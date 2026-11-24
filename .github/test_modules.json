@@ -1,0 +1,95 @@
+{
+  "version": "1.0",
+  "updated_at": "2026-11-22",
+  "note": "路径→测试模块映射。tier0=快速门(PR 必跑)，tier1=全量门(push/main 或规则/协议变更)。default=all 保证任何未匹配变更都回退到全量，绝不漏测。",
+  "defaults": {
+    "on_unmatched": "all",
+    "tier": "tier1",
+    "timeout_minutes": 10
+  },
+  "modules": [
+    {
+      "id": "backend-core",
+      "tier": "tier0",
+      "paths": ["backend/agent_protocol.py", "backend/agent_edr.py", "backend/agent_sync.py", "backend/policy_reconcile.py", "backend/config.py", "backend/db_store.py"],
+      "tests": ["backend/test_agent_identity.py", "backend/test_policy_reconcile.py", "backend/test_shared_formats.py", "backend/test_http_security.py", "backend/test_startup_health.py"],
+      "runner": "python -m unittest discover -s backend -t . -p 'test_*.py'",
+      "timeout_minutes": 5
+    },
+    {
+      "id": "backend-detection",
+      "tier": "tier0",
+      "paths": ["backend/correlation_engine.py", "backend/risk_scoring.py", "backend/building_block.py", "backend/mitre.py", "backend/data/mitre_techniques_cn.json", "config/correlation_rules.json", "backend/matchers/**", "backend/wazuh_ruleset.py"],
+      "tests": ["backend/test_risk_scoring.py", "backend/test_rule_coverage.py", "tests/rule_replay/run_replay.py"],
+      "runner": "python -m unittest discover -s backend -t . -p 'test_*.py'",
+      "extra_commands": ["python tests/rule_replay/run_replay.py", "python scripts/validate_rules.py"],
+      "timeout_minutes": 6
+    },
+    {
+      "id": "backend-reports",
+      "tier": "tier1",
+      "paths": ["backend/report_*.py", "backend/report_db_*.py", "backend/agent_process_tree.py", "backend/event_detail_enrich.py", "backend/services/**"],
+      "tests": ["backend/test_report_*.py", "backend/test_snapshot_*.py", "backend/test_index_*.py"],
+      "runner": "python -m unittest discover -s backend -t . -p 'test_*.py'",
+      "timeout_minutes": 8
+    },
+    {
+      "id": "backend-approval-response",
+      "tier": "tier0",
+      "paths": ["backend/response_approval.py", "backend/agent_rules.py", "backend/agent_rules_api.py", "backend/edr_agent_ioc_routes.py", "backend/es_event_queue.py", "backend/es_client.py"],
+      "tests": ["backend/test_response_approval.py", "backend/test_approval_command_guard.py", "backend/test_es_event_queue.py", "backend/test_index_queue_outage.py", "backend/test_reliability_acceptance.py"],
+      "runner": "python -m unittest discover -s backend -t . -p 'test_*.py'",
+      "timeout_minutes": 5
+    },
+    {
+      "id": "backend-release",
+      "tier": "tier1",
+      "paths": ["backend/agent_release*.py", "scripts/verify_release.py", "scripts/build_agent*.py", "agent/build-manifest.json"],
+      "tests": ["backend/test_release_*.py", "backend/test_dependency_versions.py"],
+      "extra_commands": ["python scripts/verify_release.py agent/build-manifest.json"],
+      "runner": "python -m unittest discover -s backend -t . -p 'test_*.py'",
+      "timeout_minutes": 5
+    },
+    {
+      "id": "agent-core",
+      "tier": "tier0",
+      "paths": ["agent/agent_loop.go", "agent/slow_lane.go", "agent/client.go", "agent/cmd_guard.go", "agent/cmd_scheduler.go", "agent/policy_state.go", "agent/policy_sign.go", "agent/sync_client.go", "agent/queue.go", "agent/state_db.go"],
+      "tests": ["agent/*_test.go"],
+      "runner": "cd agent && go test ./... -count=1",
+      "timeout_minutes": 8
+    },
+    {
+      "id": "agent-platform",
+      "tier": "tier1",
+      "paths": ["agent/*_windows.go", "agent/*_linux.go", "agent/memscan_*.go", "agent/etw_*.go", "agent/dp_*", "agent/driver/**"],
+      "tests": ["agent/*_test.go"],
+      "runner": "cd agent && go test ./... -count=1",
+      "timeout_minutes": 8
+    },
+    {
+      "id": "web",
+      "tier": "tier0",
+      "paths": ["agent_admin/src/**", "agent_admin/index.html", "agent_admin/vite.config.*", "agent_admin/package.json"],
+      "tests": ["agent_admin/src/*.test.js"],
+      "runner": "cd agent_admin && npm test && npm run build",
+      "timeout_minutes": 6
+    },
+    {
+      "id": "rules-assets",
+      "tier": "tier1",
+      "paths": ["rules/**", "config/*.json", "tests/rule_replay/**", "scripts/validate_rules.py", "baselines/**", "log_rules/**"],
+      "tests": ["tests/rule_replay/run_replay.py", "scripts/validate_rules.py"],
+      "extra_commands": ["python tests/rule_replay/run_replay.py", "python scripts/validate_rules.py"],
+      "runner": "python -m unittest discover -s backend -t . -p 'test_*.py'",
+      "timeout_minutes": 10
+    },
+    {
+      "id": "ci-governance",
+      "tier": "tier1",
+      "paths": [".github/**", "scripts/check-edr.ps1", "scripts/check_changelog.py", "scripts/detect_changes.py", "scripts/pre_commit_check.ps1", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"],
+      "tests": ["scripts/detect_changes.py --self-test", "scripts/check_changelog.py --self-test"],
+      "runner": "python -m unittest discover -s backend -t . -p 'test_*.py'",
+      "timeout_minutes": 3
+    }
+  ]
+}

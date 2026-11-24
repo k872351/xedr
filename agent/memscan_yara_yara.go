@@ -12,6 +12,8 @@ import (
 	yara "github.com/hillu/go-yara/v4"
 )
 
+const yaraCompiled = true
+
 var (
 	yaraRules   *yara.Rules
 	yaraRulesMu sync.RWMutex

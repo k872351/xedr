@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"maps"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,7 +29,7 @@ var invVolatile = map[string]bool{
 }
 
 var invKeyFields = map[string][]string{
-	"process":  {"process_guid"},
+	"process":  {"process_guid", "pid"},
 	"network":  {"proto", "local", "remote", "pid"},
 	"listen":   {"proto", "local", "pid"},
 	"service":  {"name"},
@@ -37,9 +38,16 @@ var invKeyFields = map[string][]string{
 	"startup":  {"location", "name", "command"},
 	"file":     {"path"},
 	"user":     {"name"},
-	"software": {"name", "version", "arch"},
+	"software": {"name", "version", "arch", "hive", "user"},
 	"hotfix":   {"kb"},
 	"sysinfo":  {"hostname"},
+	"netif":       {"name", "mac", "ip"},
+	"groups":      {"name", "sid"},
+	"firewall":    {"name", "direction", "action", "profile"},
+	"shares":      {"name", "path"},
+	"certs":       {"thumbprint", "store"},
+	"usb":         {"instance_id"},
+	"browser_ext": {"browser", "ext_id", "user", "version"},
 }
 
 type invModule struct {
@@ -86,7 +94,13 @@ func itemKey(module string, m map[string]any, h string) string {
 	if len(parts) == 0 {
 		return "h:" + h
 	}
-	return strings.Join(parts, "|")
+	key := strings.Join(parts, "|")
+	// Leave space for duplicate suffixes and avoid server-side truncation.
+	if len(key) > 280 {
+		sum := sha256.Sum256([]byte(key))
+		return "key:" + hex.EncodeToString(sum[:])
+	}
+	return key
 }
 
 // planned 一次上报计划：kind 为 outSnapshot（全量）或 outSnapshotDelta；skip 表示无需上报。
@@ -113,10 +127,21 @@ func (iv *inventory) saveGen(module string, gen int64) {
 
 // plan 根据本轮采集结果决定发全量、发增量或跳过。deltaOK=false 时总是全量（v1/旧服务端）。
 func (iv *inventory) plan(module, agentID string, items []any, deltaOK bool) planned {
+	return iv.planMode(module, agentID, items, deltaOK, false)
+}
+
+// Staged snapshots remain full-only, but unchanged data need not be resent
+// on every collection tick. A rejection or elapsed refresh interval overrides it.
+func (iv *inventory) planPaged(module, agentID string, items []any) planned {
+	return iv.planMode(module, agentID, items, false, true)
+}
+
+func (iv *inventory) planMode(module, agentID string, items []any, deltaOK, coalesceUnchanged bool) planned {
 	now := iv.now()
 	keys := make([]string, 0, len(items))
 	hashes := make(map[string]string, len(items))
 	byKey := make(map[string]any, len(items))
+	nextSuffix := make(map[string]int)
 	for _, it := range items {
 		m, ok := it.(map[string]any)
 		if !ok {
@@ -126,9 +151,10 @@ func (iv *inventory) plan(module, agentID string, items []any, deltaOK bool) pla
 		k := itemKey(module, m, h)
 		if _, dup := hashes[k]; dup {
 			// 同键重复（例如 tasklist 兜底无 guid）：追加序号保持唯一
-			for i := 2; ; i++ {
+			for i := max(2, nextSuffix[k]); ; i++ {
 				k2 := k + "#" + strconv.Itoa(i)
 				if _, d := hashes[k2]; !d {
+					nextSuffix[k] = i + 1
 					k = k2
 					break
 				}
@@ -147,6 +173,10 @@ func (iv *inventory) plan(module, agentID string, items []any, deltaOK bool) pla
 	if st == nil {
 		st = &invModule{gen: iv.loadGen(module), forceFull: true}
 		iv.mods[module] = st
+	}
+	if coalesceUnchanged && !st.forceFull && now.Sub(st.lastFull) < invFullMaxAge &&
+		now.Sub(st.lastSend) < invTouchEvery && maps.Equal(st.hashes, hashes) {
+		return planned{skip: true, stats: "unchanged"}
 	}
 
 	var upserts []map[string]any
@@ -207,7 +237,20 @@ func (iv *inventory) invalidate(module string, gen int64) {
 	if st == nil {
 		return
 	}
-	if gen == 0 || gen > st.lastFullGen {
+	if gen == 0 || gen >= st.lastFullGen {
 		st.forceFull = true
 	}
+}
+
+// Keep a failed local enqueue from becoming the base of a later delta.
+func (iv *inventory) enqueuePlan(module string, p planned, enqueue func(outboxKind, int, map[string]any) bool) bool {
+	if p.skip {
+		return true
+	}
+	if enqueue(p.kind, 50, p.payload) {
+		return true
+	}
+	gen, _ := p.payload["generation"].(int64)
+	iv.invalidate(module, gen)
+	return false
 }

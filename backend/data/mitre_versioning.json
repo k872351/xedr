@@ -1,0 +1,22 @@
+{
+  "_comment": "ATT&CK 版本演进登记。借鉴 wazuh tools/mitre/mitredb.py 保留 revoked_by/deprecated/mitre_version/data_sources。维护规则见 docs/架构决策记录.md ADR-015。",
+  "mitre_version": "unversioned",
+  "verified": false,
+  "note": "本文件是字段模型与维护模板，不是权威 ATT&CK 数据快照。将 deprecated/revoked_by/data_sources 填入前，请对照所用 ATT&CK 版本的 change log 核实并把 verified 置为 true。默认全空 => 不改变任何现有技术的展示，完全向后兼容。",
+  "allowed_data_sources": [
+    "Application Log", "Command", "Container", "Drive", "File", "Firmware",
+    "Group", "Image", "Logon Session", "Module", "Network Share",
+    "Network Traffic", "Process", "Process Access", "Service", "User Account",
+    "Windows Registry", "WMI", "Cloud Control Plane", "Cloud Storage",
+    "Cluster", "Instance", "Snapshot", "Volume", "Pod", "Sensor Health"
+  ],
+  "deprecated": [],
+  "revoked_by": {},
+  "data_sources": {},
+  "example_entry_shape": {
+    "_comment": "示例（不生效）：登记一条已废弃并被引用的技术",
+    "deprecated": ["T1086"],
+    "revoked_by": { "T1086": "T1059.001" },
+    "data_sources": { "T1003": ["Process", "Process Access"] }
+  }
+}

@@ -13,7 +13,8 @@ func winevtChannelDefs() []winevtChannel {
 	return []winevtChannel{
 		{
 			ID: "security", Channel: "Security",
-			XPath: `*[System[(EventID=4624 or EventID=4625 or EventID=4648 or EventID=4672 or EventID=4688 or EventID=4720 or EventID=4722 or EventID=4724 or EventID=4728 or EventID=4732 or EventID=4756 or EventID=4697 or EventID=4698 or EventID=4702 or EventID=1102)]]`,
+			// 5140/5142/5143/5145：文件共享访问（需开启「审核对象访问/文件共享」策略才有日志）
+			XPath: `*[System[(EventID=4624 or EventID=4625 or EventID=4648 or EventID=4672 or EventID=4688 or EventID=4720 or EventID=4722 or EventID=4724 or EventID=4728 or EventID=4732 or EventID=4756 or EventID=4697 or EventID=4698 or EventID=4702 or EventID=1102 or EventID=5140 or EventID=5142 or EventID=5143 or EventID=5145)]]`,
 		},
 		{
 			ID: "system", Channel: "System",
@@ -21,7 +22,8 @@ func winevtChannelDefs() []winevtChannel {
 		},
 		{
 			ID: "sysmon", Channel: "Microsoft-Windows-Sysmon/Operational",
-			XPath: `*[System[(EventID=1 or EventID=3 or EventID=5 or EventID=7 or EventID=8 or EventID=10 or EventID=11 or EventID=13 or EventID=15 or EventID=17 or EventID=22 or EventID=23 or EventID=25 or EventID=26)]]`,
+			// 6 DriverLoad · 12/14 注册表增删改名 · 19–21 WMI 永久订阅（补 11/13 持久化侧证）
+			XPath: `*[System[(EventID=1 or EventID=3 or EventID=5 or EventID=6 or EventID=7 or EventID=8 or EventID=10 or EventID=11 or EventID=12 or EventID=13 or EventID=14 or EventID=15 or EventID=17 or EventID=19 or EventID=20 or EventID=21 or EventID=22 or EventID=23 or EventID=25 or EventID=26)]]`,
 		},
 		{
 			ID: "defender", Channel: "Microsoft-Windows-Windows Defender/Operational",

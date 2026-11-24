@@ -18,7 +18,7 @@ from typing import Any, Dict, List
 
 from . import agent_protocol as ap
 
-KINDS = ("timeline", "event", "snapshot", "snapshot_delta", "ack")
+KINDS = ("timeline", "event", "snapshot", "snapshot_delta", "snapshot_part", "ack")
 MAX_BATCH = 200
 RECEIPT_TTL_SEC = 7 * 86400
 _last_purge = 0.0
@@ -38,6 +38,13 @@ def _apply(kind: str, agent_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return ap.report_event(payload)
     if kind == "snapshot":
         return ap.upsert_snapshot(payload)
+    if kind == "snapshot_part":
+        from .agent_snapshot_parts import accept_part
+        conn = ap._connect()
+        try:
+            return accept_part(conn, agent_id, payload, modules=ap.AGENT_MODULES, publish=lambda snapshot: ap.upsert_snapshot(snapshot, staged=True))
+        finally:
+            conn.close()
     if kind == "snapshot_delta":
         return ap.apply_snapshot_delta(payload)
     if kind == "ack":
@@ -72,6 +79,8 @@ def ingest_batch(agent_id: str, events: List[Any], *, stream: str = "main") -> D
     acked: List[str] = []
     rejected: List[Dict[str, str]] = []
     dup = 0
+    accepted = 0
+    newly_rejected = 0
     high_seq = 0
     now = _now()
     ap.ensure_db()
@@ -90,15 +99,20 @@ def ingest_batch(agent_id: str, events: List[Any], *, stream: str = "main") -> D
                 rejected.append({"uuid": uid[:64], "error": "uuid 无效"})
                 continue
             high_seq = max(high_seq, seq)
+            receipt = conn.execute(
+                "SELECT status, error FROM agent_receipts WHERE agent_id=? AND event_uuid=?", (aid, uid)
+            ).fetchone()
+            if receipt is not None:
+                dup += 1
+                if receipt[0] == "rejected":
+                    rejected.append({"uuid": uid, "error": receipt[1] or "rejected"})
+                else:
+                    acked.append(uid)
+                continue
             if kind not in KINDS or not isinstance(payload, dict):
                 _receipt(conn, aid, uid, kind, stream, seq, "rejected", "kind/payload 无效", now)
                 rejected.append({"uuid": uid, "error": "kind/payload 无效"})
-                continue
-            if conn.execute(
-                "SELECT 1 FROM agent_receipts WHERE agent_id=? AND event_uuid=?", (aid, uid)
-            ).fetchone():
-                dup += 1
-                acked.append(uid)
+                newly_rejected += 1
                 continue
             conn.execute("SAVEPOINT ev")
             try:
@@ -112,12 +126,14 @@ def ingest_batch(agent_id: str, events: List[Any], *, stream: str = "main") -> D
                 _receipt(conn, aid, uid, kind, stream, seq, "ok", "", now)
                 conn.execute("RELEASE ev")
                 acked.append(uid)
+                accepted += 1
             else:
                 err = str(out.get("error") or "rejected")[:200]
                 conn.execute("ROLLBACK TO ev")
                 _receipt(conn, aid, uid, kind, stream, seq, "rejected", err, now)
                 conn.execute("RELEASE ev")
                 rejected.append({"uuid": uid, "error": err})
+                newly_rejected += 1
         conn.execute(
             """INSERT INTO agent_streams(agent_id, stream, high_seq, received, rejected, updated_at)
                VALUES(?,?,?,?,?,?)
@@ -126,7 +142,7 @@ def ingest_batch(agent_id: str, events: List[Any], *, stream: str = "main") -> D
                  received=received+excluded.received,
                  rejected=rejected+excluded.rejected,
                  updated_at=excluded.updated_at""",
-            (aid, stream, high_seq, len(acked) - dup, len(rejected), now),
+            (aid, stream, high_seq, accepted, newly_rejected, now),
         )
         _purge_receipts(conn)
 

@@ -20,7 +20,7 @@ func cmdGroup(action string) string {
 		return "scan"
 	case "isolate_network", "unisolate_network", "kill_process", "quarantine_file":
 		return "response"
-	case "collect_diagnostics":
+	case "collect_diagnostics", "pull_file":
 		return "remote"
 	case "reg_read", "fs_list", "fs_stat", "fs_read", "fs_volumes", "live_query", "run_cmd",
 		"shell_open", "shell_write", "shell_poll", "shell_close":
@@ -34,11 +34,13 @@ func cmdSchedulerTry(action string) bool {
 	g := cmdGroup(action)
 	cmdSchedMu.Lock()
 	defer cmdSchedMu.Unlock()
+	// 同组互斥：禁止同批多个 upgrade/uninstall/isolate 并行
+	if cmdBusy[g] {
+		return false
+	}
 	for k := range cmdBusy {
-		if k == g {
-			continue
-		}
-		if (k == "maintenance" && g == "response") || (k == "maintenance" && g == "scan") {
+		if (k == "maintenance" && (g == "response" || g == "scan")) ||
+			(g == "maintenance" && (k == "response" || k == "scan")) {
 			return false
 		}
 	}

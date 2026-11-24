@@ -110,22 +110,24 @@ static BOOLEAN FaPathHot(PCUNICODE_STRING p)
 VOID FaPush(ULONG type, ULONG pid, ULONG ppid, ULONG tid, PCUNICODE_STRING path)
 {
     KIRQL irql;
-    FA_EVENT* ev;
+    FA_EVENT ev;
     if (!g_Ring) return;
-    KeAcquireSpinLock(&g_RingLock, &irql);
-    ev = &g_Ring[g_Head];
-    RtlZeroMemory(ev, sizeof(*ev));
-    ev->Type = type;
-    ev->Pid = pid;
-    ev->Ppid = ppid;
-    ev->Tid = tid;
-    KeQuerySystemTime(&ev->Time);
-    if (path && path->Buffer && path->Length) {
+    // 路径缓冲（映像名、注册表键路径）多在分页池：必须在持锁前、调用方 IRQL 下拷贝，
+    // 持自旋锁时 IRQL 为 DISPATCH_LEVEL，触碰被换出的分页内存会蓝屏。
+    RtlZeroMemory(&ev, sizeof(ev));
+    ev.Type = type;
+    ev.Pid = pid;
+    ev.Ppid = ppid;
+    ev.Tid = tid;
+    KeQuerySystemTime(&ev.Time);
+    if (path && path->Buffer && path->Length && KeGetCurrentIrql() <= APC_LEVEL) {
         USHORT chars = path->Length / sizeof(WCHAR);
         // 保留路径尾部（文件名最有价值）
         USHORT start = chars > (FA_PATH_CHARS - 1) ? (USHORT)(chars - (FA_PATH_CHARS - 1)) : 0;
-        RtlCopyMemory(ev->Path, path->Buffer + start, (chars - start) * sizeof(WCHAR));
+        RtlCopyMemory(ev.Path, path->Buffer + start, (chars - start) * sizeof(WCHAR));
     }
+    KeAcquireSpinLock(&g_RingLock, &irql);
+    RtlCopyMemory(&g_Ring[g_Head], &ev, sizeof(ev));
     g_Head = (g_Head + 1) % FA_RING_SIZE;
     if (g_Count < FA_RING_SIZE) {
         g_Count++;
@@ -144,8 +146,15 @@ static VOID FaProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTI
                HandleToULong(CreateInfo->ParentProcessId), 0,
                CreateInfo->ImageFileName);
     } else {
+        // 受保护的 Agent 进程退出后解除保护，避免 PID 复用后误保护无关进程
+        InterlockedCompareExchange(&g_ProtectedPid, 0, (LONG)HandleToULong(ProcessId));
         FaPush(FA_EV_PROCESS_EXIT, HandleToULong(ProcessId), 0, 0, NULL);
     }
+}
+
+ULONG FaProtectedPid(VOID)
+{
+    return (ULONG)g_ProtectedPid;
 }
 
 static VOID FaImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
@@ -170,11 +179,12 @@ static VOID FaThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
     }
 }
 
-static BOOLEAN FaImageNameIs(PUCHAR img, const char* want)
+BOOLEAN FaImageNameIs(PUCHAR img, const char* want)
 {
     SIZE_T i;
     if (!img || !want) return FALSE;
-    for (i = 0; want[i]; i++) {
+    // ImageFileName 最多 15 字符 + 结尾 0
+    for (i = 0; want[i] && i < 15; i++) {
         char a = img[i];
         char b = want[i];
         if (a >= 'A' && a <= 'Z') a = (char)(a + 32);

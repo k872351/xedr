@@ -121,6 +121,16 @@ func readRegValue(k registry.Key, name string) (regValue, bool) {
 		if e == nil {
 			buf = n
 		}
+		// Winsock PackedCatalogItem：开头是 ANSI 的提供者 DLL 路径
+		if strings.EqualFold(name, "PackedCatalogItem") && len(buf) > 0 {
+			end := 0
+			for end < len(buf) && end < 512 && buf[end] != 0 {
+				end++
+			}
+			if end > 0 {
+				return regValue{Type: "REG_BINARY", Data: string(buf[:end])}, true
+			}
+		}
 		if len(buf) > 64 {
 			buf = buf[:64]
 		}
@@ -133,13 +143,15 @@ func readTree(k registry.Key, display string, spec regSpec, depth int, out map[s
 	if len(out) >= regMaxEntries {
 		return
 	}
-	if names, err := k.ReadValueNames(0); err == nil {
-		for _, n := range names {
-			if !spec.wantValue(n) {
-				continue
-			}
-			if v, ok := readRegValue(k, n); ok {
-				out[display+`\`+n] = v
+	if spec.keyWanted(display) {
+		if names, err := k.ReadValueNames(0); err == nil {
+			for _, n := range names {
+				if !spec.wantValue(n) {
+					continue
+				}
+				if v, ok := readRegValue(k, n); ok {
+					out[display+`\`+n] = v
+				}
 			}
 		}
 	}
@@ -151,6 +163,9 @@ func readTree(k registry.Key, display string, spec regSpec, depth int, out map[s
 		return
 	}
 	for _, s := range subs {
+		if spec.RecordSubkeys && depth == spec.Depth {
+			out[display+`\`+s+`\(key)`] = regValue{Type: "KEY", Data: s}
+		}
 		sk, err := registry.OpenKey(k, s, registry.QUERY_VALUE|registry.ENUMERATE_SUB_KEYS)
 		if err != nil {
 			continue

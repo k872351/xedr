@@ -82,6 +82,32 @@ func TestItemKeyDuplicates(t *testing.T) {
 	}
 }
 
+func TestInventoryFailedEnqueueRequiresFull(t *testing.T) {
+	iv := newInventory(nil)
+	items := invItems("a", "b", "c")
+	p := iv.plan("service", "synthetic", items, true)
+	if iv.enqueuePlan("service", p, func(outboxKind, int, map[string]any) bool { return false }) {
+		t.Fatal("failed enqueue reported success")
+	}
+	p = iv.plan("service", "synthetic", items, true)
+	if p.skip || p.kind != outSnapshot || p.payload["generation"] != int64(2) {
+		t.Fatalf("expected replacement full: %+v", p)
+	}
+	iv.invalidate("service", 2)
+	if p = iv.plan("service", "synthetic", items, true); p.skip || p.kind != outSnapshot {
+		t.Fatalf("rejected latest full must be replaced: %+v", p)
+	}
+}
+
+func TestInventoryLongKeysRemainDistinct(t *testing.T) {
+	prefix := strings.Repeat("a", 320)
+	left := itemKey("file", map[string]any{"path": prefix + "1"}, "")
+	right := itemKey("file", map[string]any{"path": prefix + "2"}, "")
+	if left == right || len(left) > 280 || len(right) > 280 {
+		t.Fatal("long keys must remain distinct and fit the wire format")
+	}
+}
+
 func TestPolicyValidate(t *testing.T) {
 	good := map[string]any{"response_enabled": true, "heartbeat_sec": 5.0,
 		"intervals_sec": map[string]any{"process": 5.0}, "fim_paths": []any{`D:\app|r`}}
@@ -103,6 +129,8 @@ func TestPolicyLKGLifecycle(t *testing.T) {
 	mk := func() *policyManager {
 		pm := newPolicyManager(st, func(p map[string]any) { applied = append(applied, p) })
 		pm.now = func() time.Time { return now }
+		// 单测用 Insecure 跳过生产默认的策略公钥强制要求
+		pm.setConfig(&Config{Insecure: true})
 		return pm
 	}
 	pm := mk()

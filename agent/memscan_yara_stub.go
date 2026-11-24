@@ -2,6 +2,8 @@
 
 package main
 
+const yaraCompiled = false
+
 func reloadYaraCompiledRules(dir string) error {
 	yaraEngineOK = false
 	return nil

@@ -22,15 +22,19 @@ _SNAPSHOT_MODULES = (
 
 def _platform_creds() -> Dict[str, Any]:
     try:
+        return config.resolve_platform_profile_creds()
+    except Exception:
+        pass
+    try:
         config.reload_ai_config()
     except Exception:
         pass
     key = str(getattr(config, "AI_API_KEY", "") or "").strip()
-    base = str(getattr(config, "AI_BASE_URL", "") or "").strip() or "http://192.168.31.220:8085/v1"
-    model = str(getattr(config, "AI_MODEL", "") or "").strip() or "qwen3.8-flash-next-iq3_s"
+    base = str(getattr(config, "AI_BASE_URL", "") or "").strip() or "http://127.0.0.1:8085/v1"
+    model = str(getattr(config, "AI_MODEL", "") or "").strip() or "local-model"
     timeout = float(getattr(config, "AI_TIMEOUT", 90) or 90)
     return {
-        "api_key": key or "strata-c0938a1a4b224201931e41d162698fe9",
+        "api_key": key or "local-no-key",
         "base_url": base,
         "model": model,
         "timeout": timeout,
@@ -443,11 +447,40 @@ def analyze_agent(
     user: Optional[Dict[str, Any]] = None,
     skill_ids: Optional[List[str]] = None,
     use_llm: bool = True,
+    focus_event_id: Optional[Any] = None,
 ) -> Dict[str, Any]:
     t0 = time.time()
     pack = collect_host_pack(agent_id)
     if not pack.get("ok"):
         return pack
+    # 聚焦当前告警：置顶到 threat_events，并写入 focus 元数据
+    focus_meta: Dict[str, Any] = {}
+    if focus_event_id not in (None, ""):
+        fid = str(focus_event_id)
+        events = list(pack.get("threat_events") or [])
+        hit = None
+        rest = []
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            if str(ev.get("id") or "") == fid:
+                hit = ev
+            else:
+                rest.append(ev)
+        if hit is not None:
+            pack["threat_events"] = [hit] + rest
+            focus_meta = {
+                "event_id": hit.get("id"),
+                "title": hit.get("title") or "",
+                "severity": hit.get("severity") or "",
+                "module": hit.get("module") or "",
+                "note": "分析以该告警为主，主机其它威胁/时间线仅作佐证",
+            }
+        else:
+            focus_meta = {
+                "event_id": focus_event_id,
+                "note": "指定告警未在主机近期威胁列表中找到，已按主机全量证据分析",
+            }
 
     blob = _evidence_blob(pack)
     if skill_ids:
@@ -468,6 +501,7 @@ def analyze_agent(
     # 压缩喂给模型的证据包（日志优先，严格控长以免本地推理过慢）
     compact = _slim_for_llm({
         "agent": pack.get("agent"),
+        "focus_event": focus_meta or None,
         "threat_events": (pack.get("threat_events") or [])[:12],
         "log_categories": pack.get("log_categories") or {},
         "security_logs": (pack.get("security_logs") or [])[:24],
@@ -516,7 +550,10 @@ def analyze_agent(
         "investigate_logs": len(pack.get("investigate_logs") or []),
         "security_logs": len(pack.get("security_logs") or []),
         "log_rule_hits": len(pack.get("log_rule_hits") or []),
+        "focus": focus_meta or None,
     }
+    if focus_meta:
+        agentic["focus_event"] = focus_meta
     if not agentic.get("threat_events"):
         agentic["threat_events"] = pack.get("threat_events") or []
     skills_used = [{
@@ -571,11 +608,19 @@ def analyze_agent(
         "dispositions": (agentic.get("dispositions") or [])[:5],
         "root_cause": agentic.get("root_cause"),
     }
+    focus_hint = ""
+    if focus_meta:
+        focus_hint = (
+            f"\n【聚焦告警】请以该告警为主结论，主机其它证据仅作佐证：\n"
+            f"```json\n{json.dumps(focus_meta, ensure_ascii=False)[:800]}\n```\n"
+        )
     user_msg = (
         f"【Skill】\n" + "\n".join(skill_prompt) +
+        focus_hint +
         f"\n【Agent Team 初判 JSON】\n```json\n{json.dumps(seed, ensure_ascii=False)[:3500]}\n```\n"
         f"\n【证据 JSON】\n```json\n{evidence_json}\n```\n"
         f"请在初判基础上精炼调查报告；判决只能是 真实攻击/疑似误报/信息不足 之一。"
+        + ("威胁事件列表首条为当前聚焦告警。" if focus_meta.get("title") else "")
     )
 
     try:

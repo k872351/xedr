@@ -23,6 +23,37 @@ const (
 	fimEventsMin  = 120
 )
 
+var (
+	fimWebRootsMu sync.RWMutex
+	fimWebRoots   []string
+)
+
+// applyFIMWebRoots：策略 fim_web_roots（可选站点目录模板）。
+func applyFIMWebRoots(paths []string) {
+	clean := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		clean = append(clean, p)
+	}
+	fimWebRootsMu.Lock()
+	fimWebRoots = clean
+	fimWebRootsMu.Unlock()
+}
+
+func fimPolicyWebRoots() []string {
+	fimWebRootsMu.RLock()
+	defer fimWebRootsMu.RUnlock()
+	if len(fimWebRoots) == 0 {
+		return nil
+	}
+	out := make([]string, len(fimWebRoots))
+	copy(out, fimWebRoots)
+	return out
+}
+
 type fimPending struct {
 	path    string
 	root    int
@@ -80,6 +111,25 @@ func defaultFIMRoots() []fimRoot {
 	if pub := os.Getenv("PUBLIC"); pub != "" {
 		roots = append(roots, fimRoot{Path: pub, Recursive: true, Exts: hotFileExt, Label: "公共目录", Severity: "high", HashBase: true, MaxFiles: 5000})
 	}
+	// Web 根 / 站点脚本落地（存在才挂；策略 fim.extra_paths / fim.web_roots 可追加）
+	webExt := extSet(".aspx", ".ashx", ".asmx", ".asp", ".php", ".jsp", ".jspx", ".cfm",
+		".exe", ".dll", ".ps1", ".bat", ".cmd", ".vbs", ".js", ".hta", ".config")
+	for _, web := range append([]string{
+		`C:\inetpub\wwwroot`,
+		`C:\inetpub\wwwroot\aspnet_client`,
+		filepath.Join(pd, `Microsoft\Windows Server\DataStore`),
+	}, fimPolicyWebRoots()...) {
+		web = strings.TrimSpace(web)
+		if web == "" {
+			continue
+		}
+		if st, err := os.Stat(web); err == nil && st.IsDir() {
+			roots = append(roots, fimRoot{
+				Path: web, Recursive: true, Exts: webExt,
+				Label: "Web根(" + filepath.Base(web) + ")", Severity: "high", HashBase: true, MaxFiles: 8000,
+			})
+		}
+	}
 	users := filepath.Join(filepath.VolumeName(sys)+`\`, "Users")
 	if ents, err := os.ReadDir(users); err == nil {
 		for _, e := range ents {
@@ -109,6 +159,7 @@ func (w *fimWatcher) drain() []map[string]any {
 	w.mu.Lock()
 	out := w.events
 	w.events = nil
+	captureAdd("fim", "drained", len(out))
 	w.mu.Unlock()
 	if n := w.limiter.takeDropped(); n > 0 {
 		out = append(out, map[string]any{
@@ -127,12 +178,17 @@ func (w *fimWatcher) running() bool {
 }
 
 func (w *fimWatcher) push(ev map[string]any) {
+	captureTag(ev, "fim")
+	captureAdd("fim", "received", 1)
 	if !w.limiter.allow(time.Now()) {
+		captureAdd("fim", "rate_limited", 1)
 		return
 	}
 	w.mu.Lock()
 	w.events = append(w.events, ev)
+	captureAdd("fim", "queued", 1)
 	if len(w.events) > 500 {
+		captureAdd("fim", "buffer_dropped", len(w.events)-500)
 		w.events = w.events[len(w.events)-500:]
 	}
 	w.mu.Unlock()
@@ -149,6 +205,7 @@ func (w *fimWatcher) start(ctx context.Context) {
 	}
 	w.mu.Lock()
 	w.stopEv, w.cancel = ev, cancel
+	resetRootHealth()
 	roots := defaultFIMRoots()
 	for _, s := range w.extra {
 		if r, ok := parseFIMPathSpec(s); ok {
@@ -157,8 +214,13 @@ func (w *fimWatcher) start(ctx context.Context) {
 	}
 	kept := roots[:0]
 	for _, r := range roots {
+		kept = append(kept, r)
 		if st, err := os.Stat(r.Path); err == nil && st.IsDir() {
-			kept = append(kept, r)
+			recordRootHealth(r.Path, "watch", "starting")
+		} else if os.IsNotExist(err) {
+			recordRootHealth(r.Path, "watch", "missing")
+		} else {
+			recordRootHealth(r.Path, "watch", "inaccessible")
 		}
 	}
 	w.roots = kept
@@ -206,6 +268,7 @@ func (w *fimWatcher) stop() {
 	}
 	_ = windows.SetEvent(ev)
 	w.wg.Wait()
+	resetRootHealth()
 	_ = windows.CloseHandle(ev)
 }
 
@@ -301,6 +364,8 @@ func (w *fimWatcher) entryOf(root fimRoot, path string, fi os.FileInfo, old fimE
 
 // scanRoot 遍历目录与基线比对；initial=true 时为启动对账（首次建基线不出事件）。
 func (w *fimWatcher) scanRoot(idx int, initial bool) {
+	finishWork := beginComponentWork("fim")
+	defer finishWork()
 	w.mu.Lock()
 	if idx >= len(w.roots) {
 		w.mu.Unlock()
@@ -308,14 +373,17 @@ func (w *fimWatcher) scanRoot(idx int, initial bool) {
 	}
 	root := w.roots[idx]
 	w.mu.Unlock()
+	recordRootHealth(root.Path, "reconcile", "running")
 	firstKey := "fim_root:" + strings.ToLower(root.Path)
 	first := initial && w.st != nil && w.st.kvGet(firstKey) == ""
 
 	seen := map[string]bool{}
 	count := 0
 	var batch []fimEntry
+	incomplete := false
 	walk := func(p string, d os.DirEntry, err error) error {
 		if err != nil {
+			incomplete = true
 			return nil
 		}
 		if d.IsDir() {
@@ -329,6 +397,7 @@ func (w *fimWatcher) scanRoot(idx int, initial bool) {
 		}
 		count++
 		if root.MaxFiles > 0 && count > root.MaxFiles {
+			incomplete = true
 			return filepath.SkipAll
 		}
 		// 大目录扫描时让出 CPU，减轻安装后卡顿
@@ -337,6 +406,7 @@ func (w *fimWatcher) scanRoot(idx int, initial bool) {
 		}
 		fi, e := d.Info()
 		if e != nil {
+			incomplete = true
 			return nil
 		}
 		k := strings.ToLower(p)
@@ -363,8 +433,16 @@ func (w *fimWatcher) scanRoot(idx int, initial bool) {
 		}
 		return nil
 	}
-	_ = filepath.WalkDir(root.Path, walk)
+	if err := filepath.WalkDir(root.Path, walk); err != nil {
+		incomplete = true
+	}
 	w.saveBatch(batch)
+	if incomplete {
+		recordRootHealth(root.Path, "reconcile", "partial")
+		return // Never infer deletion from an incomplete directory listing.
+	}
+	recordRootHealth(root.Path, "reconcile", "complete")
+	recordRootHealth(root.Path, "last_complete", "ok")
 
 	// 基线里有、现在没有：删除
 	var gone []string
@@ -417,24 +495,52 @@ type fileNotifyInfo struct {
 
 func (w *fimWatcher) watchRoot(ctx context.Context, idx int) {
 	defer w.wg.Done()
+	retry := false
+	for ctx.Err() == nil {
+		w.watchRootOnce(ctx, idx, retry)
+		retry = true
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Minute):
+		}
+	}
+}
+
+func (w *fimWatcher) watchRootOnce(ctx context.Context, idx int, retry bool) {
 	w.mu.Lock()
 	root := w.roots[idx]
 	stopEv := w.stopEv
 	w.mu.Unlock()
+	if st, err := os.Stat(root.Path); err != nil || !st.IsDir() {
+		if os.IsNotExist(err) {
+			recordRootHealth(root.Path, "watch", "missing")
+		} else {
+			recordRootHealth(root.Path, "watch", "inaccessible")
+		}
+		return
+	}
 	p, _ := windows.UTF16PtrFromString(root.Path)
 	h, err := windows.CreateFile(p, windows.FILE_LIST_DIRECTORY,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
 		windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OVERLAPPED, 0)
 	if err != nil {
 		log.Printf("fim: 打开 %s 失败: %v", root.Path, err)
+		recordRootHealth(root.Path, "watch", "open_failed")
 		return
 	}
 	defer windows.CloseHandle(h)
 	ev, err := windows.CreateEvent(nil, 1, 0, nil)
 	if err != nil {
+		recordRootHealth(root.Path, "watch", "event_failed")
 		return
 	}
 	defer windows.CloseHandle(ev)
+	if retry {
+		w.mu.Lock()
+		w.rescan[idx] = true
+		w.mu.Unlock()
+	}
 	buf := make([]byte, 64<<10)
 	mask := uint32(windows.FILE_NOTIFY_CHANGE_FILE_NAME | windows.FILE_NOTIFY_CHANGE_DIR_NAME |
 		windows.FILE_NOTIFY_CHANGE_SIZE | windows.FILE_NOTIFY_CHANGE_LAST_WRITE | windows.FILE_NOTIFY_CHANGE_CREATION)
@@ -444,13 +550,16 @@ func (w *fimWatcher) watchRoot(ctx context.Context, idx int) {
 		_ = windows.ResetEvent(ev)
 		if err := windows.ReadDirectoryChanges(h, &buf[0], uint32(len(buf)), root.Recursive, mask, nil, &ov, 0); err != nil {
 			log.Printf("fim: ReadDirectoryChanges %s: %v", root.Path, err)
+			recordRootHealth(root.Path, "watch", "subscribe_failed")
 			return
 		}
+		recordRootHealth(root.Path, "watch", "active")
 		r, _ := windows.WaitForMultipleObjects([]windows.Handle{ev, stopEv}, false, windows.INFINITE)
 		if r != windows.WAIT_OBJECT_0 {
 			_ = windows.CancelIoEx(h, &ov)
 			var n uint32
 			_ = windows.GetOverlappedResult(h, &ov, &n, true)
+			recordRootHealth(root.Path, "watch", "stopped")
 			return
 		}
 		var n uint32
@@ -459,6 +568,8 @@ func (w *fimWatcher) watchRoot(ctx context.Context, idx int) {
 			w.mu.Lock()
 			w.rescan[idx] = true
 			w.mu.Unlock()
+			recordRootHealth(root.Path, "reconcile", "pending")
+			captureAdd("fim", "notification_gap", 1)
 			continue
 		}
 		w.parseNotify(idx, root, buf[:n])
@@ -647,6 +758,12 @@ func (w *fimWatcher) emitChange(etype string, root fimRoot, cur, old fimEntry, e
 			extra["entity_id"] = a.entity
 		}
 	}
+	// 变更事件尽量补 SHA：计划任务等 HashBase=false 的目录原先不上报哈希，详情页会空白
+	if etype != "fim_delete" && cur.SHA == "" && cur.Size > 0 && cur.Size <= fimHashMax && w.hashLimit.allow(time.Now()) {
+		if sha := fileSHA256(cur.Path); sha != "" {
+			cur.SHA = sha
+		}
+	}
 	ev := fimEvent(etype, root, cur, old, extra)
 	ext := strings.ToLower(filepath.Ext(cur.Path))
 	if fimExecExts[ext] {
@@ -713,6 +830,7 @@ func (w *fimWatcher) signPending() {
 			continue // 未验出：不告警
 		}
 		d["signed"], d["signer"], d["company"] = pm.Signed, pm.Signer, pm.Company
+		attachFileMeta(d, asString(d["path"]))
 		// 仅明确未签名/损坏才上报；Valid（含微软/目录签名）及未知状态一律丢弃
 		if !fimSignedStatusAlert(pm.Signed) {
 			continue

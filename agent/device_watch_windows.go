@@ -63,6 +63,7 @@ func (w *deviceWatcher) start(ctx context.Context) {
 		w.known[p] = driveTypeOf(p)
 	}
 	w.mu.Unlock()
+	recordComponentObservation("device", cStateHealthy, "removable and fixed volume polling active")
 	go func() {
 		t := time.NewTicker(12 * time.Second)
 		defer t.Stop()
@@ -80,6 +81,8 @@ func (w *deviceWatcher) start(ctx context.Context) {
 func (w *deviceWatcher) stop() {}
 
 func (w *deviceWatcher) tick() {
+	finishWork := beginComponentWork("device")
+	defer finishWork()
 	cur := listDriveRoots()
 	curSet := map[string]int{}
 	for _, p := range cur {
@@ -121,6 +124,7 @@ func (w *deviceWatcher) tick() {
 	if len(w.events) > 200 {
 		w.events = w.events[len(w.events)-200:]
 	}
+	recordComponentObservation("device", cStateHealthy, "volume polling completed")
 }
 
 func (w *deviceWatcher) drain() []map[string]any {

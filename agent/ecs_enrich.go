@@ -138,10 +138,29 @@ func ecsMergeFile(ecs map[string]any, d map[string]any, et string) {
 	if path == "" {
 		return
 	}
-	ecs["file"] = map[string]any{
+	f := map[string]any{
 		"path": path,
 		"name": filepath.Base(path),
 	}
+	if h := asString(d["imphash"]); h != "" {
+		f["pe"] = map[string]any{"imphash": h}
+	}
+	if pe, _ := f["pe"].(map[string]any); pe != nil {
+		if ct := asString(d["pe_compile_time"]); ct != "" {
+			pe["compile_time"] = ct
+		}
+	} else if ct := asString(d["pe_compile_time"]); ct != "" {
+		f["pe"] = map[string]any{"compile_time": ct}
+	}
+	if d["motw"] == true {
+		f["motw"] = map[string]any{
+			"zone":       d["motw_zone"],
+			"zone_label": d["motw_zone_label"],
+			"referrer":   d["motw_referrer"],
+			"host_url":   d["motw_host_url"],
+		}
+	}
+	ecs["file"] = f
 }
 
 func enrichTimelineEventsECS(events []map[string]any) {

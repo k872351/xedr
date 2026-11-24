@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import config
+from .rule_metadata import is_elastic_rule, _enrich_rule_item
 
 RULES_FILE = "agent-live-rules.json"
 _LOCK = threading.RLock()
@@ -52,28 +53,6 @@ def _path() -> Path:
     return Path(config.RULES_DIR) / RULES_FILE
 
 
-def is_elastic_rule(r: Dict[str, Any]) -> bool:
-    """Elastic 导入规则（含误标为 custom 的旧数据）。"""
-    if not isinstance(r, dict):
-        return False
-    if str(r.get("source") or "").strip().lower() == "elastic":
-        return True
-    rid = str(r.get("id") or "").strip().lower()
-    if rid.startswith("elastic-"):
-        return True
-    if str(r.get("elastic_rule_id") or "").strip():
-        return True
-    note = str(r.get("note") or "").strip()
-    return note.startswith("Elastic:") or note.startswith("Elastic EVM")
-
-
-def _enrich_rule_item(r: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(r)
-    if is_elastic_rule(out) and str(out.get("source") or "").lower() != "elastic":
-        out["source"] = "elastic"
-    return out
-
-
 def _merge_evm_rules_for_ui(rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """把 elastic_evm_import 中仅时间线执行的规则并入控制台列表（与快照规则区分）。"""
     try:
@@ -95,6 +74,7 @@ def _merge_evm_rules_for_ui(rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             "severity": str(er.get("severity") or (snap or {}).get("severity") or "medium"),
             "source": "elastic",
             "rule_channel": "evm",
+            "platform": str(er.get("platform") or er.get("os") or (snap or {}).get("platform") or (snap or {}).get("os") or ""),
             "etype": str(er.get("etype") or ""),
             "patterns": list(er.get("patterns") or [])[:24],
             "match": str(er.get("match") or "substring"),
@@ -108,262 +88,69 @@ def _merge_evm_rules_for_ui(rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return list(by_id.values())
 
 
-def _default_rules() -> List[Dict[str, Any]]:
-    """内置少量高置信规则，避免平台全量规则误报。"""
+
+
+def _linux_snapshot_rules() -> List[Dict[str, Any]]:
+    """Conservative Linux process rules for procfs snapshots on minimal hosts."""
     return [
         {
-            "id": "agent-ps-enc",
-            "title": "PowerShell 编码执行",
-            "severity": "high",
-            "modules": ["process", "task", "startup"],
-            "fields": ["command_line", "command", "path"],
-            "patterns": ["-enc ", "-encodedcommand", "frombase64string"],
-            "match": "substring",
-            "enabled": True,
-            "note": "命令行含编码执行特征",
-        },
-        {
-            "id": "agent-temp-exe",
-            "title": "临时目录可执行文件",
-            "severity": "high",
-            "modules": ["process", "service", "startup"],
-            "fields": ["path", "command", "command_line"],
-            "patterns": ["\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\"],
-            "match": "substring",
-            "enabled": True,
-            "note": "路径落在临时目录",
-        },
-        {
-            "id": "agent-download-lolbin",
-            "title": "计划任务可疑下载器",
-            "severity": "high",
-            "modules": ["task", "startup"],
-            "fields": ["command", "path"],
-            "patterns": ["certutil", "bitsadmin", "invoke-webrequest", "iwr ", "wget ", "curl "],
-            "match": "substring",
-            "enabled": True,
-            "note": "",
-        },
-        {
-            "id": "agent-svc-userdir",
-            "title": "服务位于用户目录",
+            "id": "agent-linux-temp-exec",
+            "title": "Linux 可写临时目录执行程序",
             "severity": "medium",
-            "modules": ["service"],
-            "fields": ["path"],
-            "patterns": ["\\users\\", "\\appdata\\"],
-            "match": "substring",
-            "enabled": False,
-            "note": "默认关闭：部分合法软件也会装在用户目录",
-        },
-        {
-            "id": "agent-unsigned-exe",
-            "title": "未签名可执行文件",
-            "severity": "medium",
-            "modules": ["process", "file", "startup", "service"],
-            "fields": ["path", "name", "signed"],
-            "patterns": ["*"],
-            "file_exts": ["exe", "dll", "sys", "scr"],
-            "signed_filter": "unsigned",
-            "match": "substring",
-            "enabled": True,
-            "note": "签名状态非 Valid（含未签名/异常）",
-        },
-        {
-            "id": "agent-root-drop",
-            "title": "磁盘根目录投放可执行文件",
-            "severity": "high",
-            "modules": ["file", "process"],
-            "fields": ["path"],
-            "patterns": [r"^[A-Za-z]:\\[^\\]+\.(exe|dll|bat|cmd|ps1|scr)$"],
-            "file_exts": ["exe", "dll", "bat", "cmd", "ps1", "scr"],
-            "match": "regex",
-            "enabled": True,
-            "note": "仅匹配盘符根下一层，如 C:\\evil.exe（需 Agent 文件模块扫到）",
-        },
-        {
-            "id": "agent-progdata-temp-unsigned",
-            "title": "ProgramData/Temp 未签名可执行新增",
-            "severity": "high",
-            "modules": ["file", "process"],
+            "modules": ["process"],
             "fields": ["path", "command_line"],
-            "path_prefixes": [r"C:\ProgramData", r"C:\Windows\Temp"],
-            "file_exts": ["exe", "dll", "bat", "cmd", "ps1", "scr", "msi", "js", "vbs", "hta"],
-            "signed_filter": "unsigned",
-            "patterns": ["*"],
+            "patterns": [r"/(tmp|var/tmp|dev/shm)/[^\s]+"],
+            "match": "regex",
+            "enabled": True,
+            "note": "监控从 /tmp、/var/tmp、/dev/shm 执行的进程；请结合终端用途确认告警。",
+        },
+        {
+            "id": "agent-linux-download-pipe-shell",
+            "title": "Linux 下载内容直接交由 Shell 执行",
+            "severity": "high",
+            "modules": ["process"],
+            "fields": ["command_line"],
+            "patterns": [r"\b(curl|wget)\b[^\n|;]{0,240}\|\s*(sudo\s+)?(ba)?sh\b"],
+            "match": "regex",
+            "enabled": True,
+            "note": "匹配常见的 curl/wget 管道执行形式。",
+        },
+        {
+            "id": "agent-linux-reverse-shell",
+            "title": "Linux 反向 Shell 命令特征",
+            "severity": "high",
+            "modules": ["process"],
+            "fields": ["command_line"],
+            "patterns": [r"/dev/tcp/|\bnc\b[^\n;]{0,180}\s-e\s*/bin/(ba)?sh|python[0-9.]*\s+-c[^\n]{0,240}socket"],
+            "match": "regex",
+            "enabled": True,
+            "note": "检测常见的 /dev/tcp、netcat 与 Python socket Shell 特征。",
+        },
+        {
+            "id": "agent-linux-miner-process",
+            "title": "已知挖矿程序进程名",
+            "severity": "high",
+            "modules": ["process"],
+            "fields": ["name", "path", "command_line"],
+            "patterns": ["xmrig", "kdevtmpfsi", "kinsing", "watchbog"],
             "match": "substring",
             "enabled": True,
-            "note": "实时主要靠 FIM+EVM；快照模块周期复核。Temp 含 Windows\\Temp，用户 Temp 见下方 regex 规则。",
+            "note": "基于进程名及路径的静态特征，误报时可在规则页禁用或调整。",
         },
         {
-            "id": "agent-user-temp-unsigned",
-            "title": "用户 Temp 未签名可执行（regex）",
+            "id": "agent-linux-persistence-shell",
+            "title": "Linux 持久化任务调用临时载荷或反向 Shell",
             "severity": "high",
-            "modules": ["file", "process"],
-            "fields": ["path"],
-            "file_exts": ["exe", "dll", "bat", "cmd", "ps1", "scr", "msi"],
-            "signed_filter": "unsigned",
-            "patterns": [
-                r"(?i)[A-Za-z]:\\Users\\[^\\]+\\AppData\\Local\\Temp\\[^\\]+\.(exe|dll|bat|cmd|ps1|scr|msi)$",
-            ],
+            "modules": ["task", "startup", "service"],
+            "fields": ["command", "path", "execute"],
+            "patterns": [r"(curl|wget)[^\n|;]{0,240}\|\s*(sudo\s+)?(ba)?sh|/dev/tcp/|/(tmp|var/tmp|dev/shm)/[^\s]+"],
             "match": "regex",
-            "enabled": False,
-            "note": "默认关闭（量大）；需要时可开启。",
+            "enabled": True,
+            "note": "针对 cron、systemd unit 和启动项中的高风险命令特征。",
         },
     ]
 
 
-def _sensor_builtin_rules() -> List[Dict[str, Any]]:
-    """Agent 传感器内置检出（ETW / 事件通道 / 差分 / 内核），展示在规则管理中可开关。
-
-    匹配字段供服务端入库过滤：etype / summary_contains。
-    """
-    common = {
-        "source": "sensor",
-        "builtin": True,
-        "modules": ["timeline"],
-        "fields": ["etype", "summary", "path"],
-        "patterns": [],
-        "match": "substring",
-        "file_exts": [],
-        "signed_filter": "",
-        "path_prefixes": [],
-    }
-
-    def R(rid: str, title: str, severity: str, etype: str, summary_contains: str, note: str, *, enabled: bool = True) -> Dict[str, Any]:
-        return {
-            **common,
-            "id": rid,
-            "title": title,
-            "severity": severity,
-            "enabled": enabled,
-            "note": note,
-            "etype": etype,
-            "summary_contains": summary_contains,
-            "patterns": [summary_contains] if summary_contains else [etype],
-        }
-
-    return [
-        R("sensor-etw-hot-file", "ETW 可疑目录文件创建", "high", "file_create", "ETW可疑目录文件创建",
-          "ETW Kernel-File：Temp/Downloads/Public 等目录落地可执行/脚本"),
-        R("sensor-etw-file", "ETW 文件创建", "medium", "file_create", "ETW文件创建",
-          "ETW Kernel-File：热路径下的文件创建（非投放区）"),
-        R("sensor-diff-hot-file", "可疑目录文件创建（差分）", "high", "file_create", "可疑目录文件创建",
-          "快照差分：文件模块扫到热目录新增（标题不含 ETW 前缀）"),
-        R("sensor-etw-hot-proc", "可疑路径进程（ETW）", "medium", "process_create_etw", "可疑路径进程",
-          "ETW 进程创建且映像路径落在 Temp/AppData 等"),
-        R("sensor-etw-proc", "ETW 进程创建", "info", "process_create_etw", "ETW进程创建",
-          "普通进程创建遥测（量大，日志调查可压噪）", enabled=True),
-        R("sensor-wmi-hot-proc", "可疑路径进程（WMI）", "medium", "process_create_live", "可疑路径进程",
-          "WMI 订阅到的可疑路径进程创建"),
-        R("sensor-diff-hot-proc", "可疑路径进程创建（差分）", "medium", "process_create", "可疑路径进程",
-          "进程快照差分检出"),
-        {
-            **R("sensor-etw-dll", "未签名 DLL 加载", "medium", "image_load_etw", "未签名 DLL",
-               "ETW ImageLoad：无签名/签名异常；系统目录只报这类；Valid（含目录签名）一律放过"),
-            "signed_filter": "unsigned",
-            "patterns": ["未签名 DLL", "系统目录未签名 DLL", "可疑目录未签名 DLL", "可疑目录 DLL"],
-        },
-        R("sensor-etw-driver", "未签名驱动加载", "critical", "driver_load_etw", "未签名驱动",
-          "ETW ImageLoad：.sys 且签名非 Valid（含 System32\\drivers）"),
-        R("sensor-etw-net", "ETW 外联", "medium", "network_connect_etw", "ETW外联",
-          "时间线保留；威胁事件仅 IOC 命中时产生"),
-        R("sensor-diff-net", "网络外联（差分）", "medium", "network_connect", "外联",
-          "时间线保留；威胁事件仅 IOC 命中时产生"),
-        R("sensor-dns", "DNS 查询", "info", "dns_query", "DNS",
-          "时间线保留；威胁事件仅 IOC 命中时产生"),
-        R("sensor-dns-summary", "DNS 汇总", "info", "dns_summary", "DNS 汇总",
-          "时间线保留；不晋升威胁事件"),
-        R("sensor-dns-nx-burst", "DNS 大量解析失败（疑似 DGA）", "high", "dns_nx_burst", "DNS 大量解析失败",
-          "同一进程 5 分钟内 ≥25 个不同域名 NXDOMAIN"),
-        R("sensor-etw-proc-exit", "ETW 进程退出", "info", "process_exit_etw", "ETW进程退出",
-          "量大，默认不入时间线；进程实体的退出时间照常记录", enabled=False),
-        R("sensor-reg-security", "注册表安全项变更", "high", "registry_set", "注册表安全项变更",
-          "实时注册表：Defender 排除/策略、LSA、WDigest、UAC、防火墙、UAC 绕过键等"),
-        R("sensor-reg-security-del", "注册表安全项删除", "medium", "registry_delete", "注册表安全项删除",
-          "实时注册表：安全相关值被删除"),
-        R("sensor-fim-add", "FIM 文件新增", "medium", "fim_add", "FIM新增",
-          "可执行文件仅明确未签名才告警；hosts/任务等非 PE 照常"),
-        R("sensor-fim-modify", "FIM 文件修改", "medium", "fim_modify", "FIM修改",
-          "可执行文件仅明确未签名才告警；Valid 一律放过"),
-        R("sensor-fim-delete", "FIM 文件删除", "medium", "fim_delete", "FIM删除",
-          "文件完整性：受监控文件被删除"),
-        R("sensor-fim-rename", "FIM 文件重命名", "medium", "fim_rename", "FIM重命名",
-          "文件完整性：受监控文件被改名"),
-        R("sensor-fim-overflow", "FIM 变更过多", "medium", "fim_overflow", "FIM 变更过多",
-          "每分钟超过 120 条时合并计数"),
-        R("sensor-persist-add", "持久化新增", "high", "persist_add", "持久化新增",
-          "Run/Startup/可疑服务 ImagePath/hosts 等新增"),
-        R("sensor-persist-mod", "持久化修改", "high", "persist_modify", "持久化修改",
-          "持久化点内容变更"),
-        R("sensor-persist-del", "持久化删除", "medium", "persist_delete", "持久化删除",
-          "持久化点被删除"),
-        R("sensor-win-logon", "登录成功", "info", "win_logon", "登录成功",
-          "Security 4624（已过滤系统会话噪声）", enabled=True),
-        R("sensor-win-logon-fail", "登录失败", "medium", "win_logon_fail", "登录失败",
-          "Security 4625"),
-        R("sensor-win-explicit-logon", "显式凭据登录", "medium", "win_explicit_logon", "显式凭据",
-          "Security 4648"),
-        R("sensor-win-account-create", "账号创建", "high", "win_account_create", "账号创建",
-          "Security 4720"),
-        R("sensor-win-account-enable", "账号启用", "medium", "win_account_enable", "账号启用",
-          "Security 4722"),
-        R("sensor-win-password-reset", "密码重置", "medium", "win_password_reset", "密码重置",
-          "Security 4724"),
-        R("sensor-win-group-add", "加入用户组", "high", "win_group_add", "加入",
-          "Security 4728/4732/4756"),
-        R("sensor-win-service", "服务安装", "high", "win_service_install", "服务安装",
-          "System 7045 / Security 4697"),
-        R("sensor-win-task-create", "计划任务创建", "high", "win_task_create", "计划任务创建",
-          "Security 4698"),
-        R("sensor-win-task-update", "计划任务更新", "medium", "win_task_update", "计划任务更新",
-          "Security 4702"),
-        R("sensor-win-task-ops", "计划任务操作", "medium", "win_task_ops", "任务计划",
-          "TaskScheduler Operational；有缓存时带 Command"),
-        R("sensor-win-bits", "BITS 传输", "medium", "win_bits", "BITS",
-          "BITS-Client：Job/URL/本地路径"),
-        R("sensor-win-smb", "SMB 客户端", "medium", "win_smb", "SMB",
-          "SmbClient/Security：共享路径"),
-        R("sensor-wmi-persist-add", "WMI 永久订阅新增", "high", "wmi_persist_add", "WMI 永久订阅新增",
-          "root\\subscription FilterToConsumerBinding"),
-        R("sensor-wmi-persist-mod", "WMI 永久订阅修改", "high", "wmi_persist_modify", "WMI 永久订阅修改",
-          "WMI 永久订阅载荷变更"),
-        R("sensor-wmi-persist-del", "WMI 永久订阅删除", "medium", "wmi_persist_delete", "WMI 永久订阅删除",
-          "WMI 永久订阅移除"),
-        R("sensor-win-audit-clear", "清空安全日志", "critical", "win_audit_clear", "安全日志被清空",
-          "Security 1102"),
-        R("sensor-win-special-priv", "特殊权限分配", "medium", "win_special_priv", "特殊权限",
-          "Security 4672（仅保留 Debug/Impersonate/Tcb/LoadDriver 等）"),
-        R("sensor-win-service-state", "服务状态变更", "info", "win_service_state", "服务状态",
-          "System 7036", enabled=False),
-        R("sensor-win-service-config", "服务启动类型变更", "medium", "win_service_config", "服务启动类型",
-          "System 7040；BITS/Windows Update 等系统服务已在晋升侧压噪"),
-        R("sensor-win-ps-module", "PowerShell 模块日志", "info", "win_ps_module", "PowerShell 模块",
-          "需本机开启 Module Logging；通道 Microsoft-Windows-PowerShell/Operational 4103", enabled=False),
-        R("sensor-win-ps-script", "PowerShell 脚本块", "info", "win_ps_scriptblock", "PowerShell 脚本块",
-          "时间线保留；仅可疑特征(high)晋升威胁事件"),
-        R("sensor-win-ps-script-hot", "可疑 PowerShell 脚本块", "high", "win_ps_scriptblock", "可疑 PowerShell",
-          "ScriptBlock 含 -enc / IEX / DownloadString 等"),
-        R("sensor-process-access", "进程打开（Sysmon）", "medium", "process_access", "进程打开",
-          "Sysmon 10，过滤可疑访问权限；需安装 Sysmon"),
-        R("sensor-remote-thread", "远程线程（Sysmon）", "high", "remote_thread", "远程线程",
-          "Sysmon 8"),
-        R("sensor-registry-write", "注册表写入（Sysmon）", "medium", "registry_write", "注册表写入",
-          "Sysmon 13"),
-        R("sensor-kernel-hot-proc", "可疑路径进程（内核）", "medium", "process_create_kernel", "可疑路径进程",
-          "FaKmon 驱动进程回调"),
-        {
-            **R("sensor-kernel-dll", "可疑目录未签名模块（内核）", "medium", "image_load_kernel", "未签名模块",
-                "FaKmon ImageLoad：投放区且未签名；有签名一律放过"),
-            "signed_filter": "unsigned",
-            "patterns": ["未签名模块", "可疑目录未签名模块", "可疑目录模块"],
-        },
-        R("sensor-kernel-driver", "内核驱动加载", "high", "driver_load_kernel", "内核驱动加载",
-          "FaKmon 驱动加载"),
-        R("sensor-kernel-inject", "远程线程注入（内核）", "high", "remote_thread_kernel", "远程线程注入",
-          "FaKmon 远程线程"),
-        R("sensor-kernel-protect", "自保护拦截", "high", "protect_block_kernel", "拦截对 Agent",
-          "FaKmon 自保护"),
-    ]
 
 
 def _default_doc() -> Dict[str, Any]:
@@ -373,7 +160,7 @@ def _default_doc() -> Dict[str, Any]:
             "version": "1.1",
             "description": "快照规则 + 传感器内置检出（可开关），与主平台规则库独立",
         },
-        "rules": _default_rules(),
+        "rules": _default_rules() + _linux_snapshot_rules(),
         "sensor_overrides": {},
     }
 
@@ -421,6 +208,17 @@ def load_doc(*, force: bool = False) -> Dict[str, Any]:
                 doc["rules"] = []
         except Exception:
             doc = _default_doc()
+        meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+        if not meta.get("linux_snapshot_rules_v2"):
+            existing_ids = {str(r.get("id") or "") for r in doc["rules"] if isinstance(r, dict)}
+            doc["rules"].extend(r for r in _linux_snapshot_rules() if r["id"] not in existing_ids)
+            meta["linux_snapshot_rules_v2"] = True
+            doc["meta"] = meta
+            _atomic_write(p, doc)
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                pass
         _CACHE["mtime"] = mtime
         _CACHE["doc"] = doc
         return doc
@@ -677,10 +475,22 @@ def _normalize_rule(payload: Dict[str, Any], *, existing: Optional[Dict[str, Any
     if not isinstance(path_prefixes, list):
         path_prefixes = []
     path_prefixes = [str(x).strip() for x in path_prefixes if str(x).strip()][:12]
-    if not pats and signed_filter != "unsigned":
-        raise ValueError("至少填写一条匹配特征（或将签名条件设为「未签名」）")
-    if not pats and signed_filter == "unsigned":
-        pats = ["*"]  # 占位，匹配阶段走 signed_filter 专用分支
+    # 异常文件规则：强制 file 模块 + category=abfile
+    category = str(payload.get("category") if "category" in payload else base.get("category") or "").strip().lower()
+    if payload.get("abfile") is True or base.get("abfile") is True:
+        category = "abfile"
+    if category == "abfile":
+        mods = ["file"]
+        if not fields or fields == list(_FIELD_DEFAULT.get("process", [])):
+            fields = ["path", "name"]
+    # 匹配特征：异常文件规则可用「路径前缀 / 扩展名 / 未签名」单独约束，特征可填 *
+    if not pats:
+        if signed_filter == "unsigned" or (category == "abfile" and (path_prefixes or exts)):
+            pats = ["*"]  # 占位：匹配阶段按范围/签名约束放行
+        else:
+            raise ValueError(
+                "至少填写一条匹配特征（异常文件规则也可只填路径前缀/扩展名，或签名条件设为「未签名」）"
+            )
     out = {
         "id": rid[:64],
         "title": title[:120],
@@ -696,6 +506,10 @@ def _normalize_rule(payload: Dict[str, Any], *, existing: Optional[Dict[str, Any
         "note": note,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    if category:
+        out["category"] = category[:32]
+        if category == "abfile":
+            out["abfile"] = True
     for key in ("etype", "summary_contains", "parent_name_contains", "building_block"):
         if key in payload:
             val = payload.get(key)
@@ -1021,8 +835,25 @@ def _path_fields_blob(item: Dict[str, Any]) -> str:
     return "\n".join(parts).replace("/", "\\").lower()
 
 
+def _path_root_only_match(path_line: str, base: str) -> bool:
+    """base 为目录（末尾带 \\）：路径必须是 base + 文件名，且文件名中不再含 \\。"""
+    line = (path_line or "").replace("/", "\\").lower()
+    b = (base or "").replace("/", "\\").lower()
+    if not line or not b:
+        return False
+    if not b.endswith("\\"):
+        b = b + "\\"
+    if not line.startswith(b):
+        return False
+    rest = line[len(b):]
+    return bool(rest) and ("\\" not in rest)
+
+
 def _path_scope_allowed(item: Dict[str, Any], prefixes: List[str]) -> bool:
-    """路径范围：盘符前缀用 startswith；\\temp\\、\\public\\ 等在任意相关字段中出现即命中。"""
+    """路径范围：盘符前缀用 startswith；末尾多一个 \\（如 C:\\Users\\Public\\\\）表示仅该目录根，不含子目录。
+
+    \\temp\\、\\public\\ 等片段在任意相关字段中出现即命中。
+    """
     if not prefixes:
         return True
     blob = _path_fields_blob(item)
@@ -1031,6 +862,15 @@ def _path_scope_allowed(item: Dict[str, Any], prefixes: List[str]) -> bool:
     for p in prefixes:
         pref = str(p or "").replace("/", "\\").strip().lower()
         if not pref:
+            continue
+        # 约定：路径以「双反斜杠」结尾 → 仅匹配该目录根一层（不含子目录）
+        # 例：C:\Users\Public\\  命中 C:\Users\Public\a.exe，不命中 ...\Public\foo\a.exe
+        root_only = pref.endswith("\\\\")
+        if root_only:
+            base = pref.rstrip("\\") + "\\"
+            for line in blob.split("\n"):
+                if _path_root_only_match(line, base):
+                    return True
             continue
         if len(pref) >= 3 and pref[1] == ":" and pref[2] == "\\":
             for line in blob.split("\n"):
@@ -1064,6 +904,9 @@ def _match_text(text: str, patterns: List[str], how: str) -> Optional[str]:
         raw = str(p or "")
         if not raw:
             continue
+        # * = 任意内容（配合 path_prefixes / file_exts / signed_filter 做范围约束）
+        if raw.strip() == "*":
+            return "*"
         if how == "exact":
             if tl == raw.lower() or Path(t).name.lower() == raw.lower():
                 return raw
@@ -1454,6 +1297,10 @@ def _evm_rule_matches(r: Dict[str, Any], ev: Dict[str, Any]) -> bool:
     prefixes = [str(p).strip() for p in (r.get("path_prefixes") or []) if str(p).strip()]
     if prefixes and not _path_scope_allowed(detail, prefixes):
         return False
+    if not _ext_allowed(detail, list(r.get("file_exts") or [])):
+        return False
+    if not _signed_allowed(detail, str(r.get("signed_filter") or "")):
+        return False
     pn = str(r.get("parent_name_contains") or "").strip().lower()
     if pn:
         parent = str(detail.get("parent_name") or "").lower()
@@ -1502,30 +1349,25 @@ def export_evm_document() -> Dict[str, Any]:
         mods = r.get("modules") or []
         if r.get("source") != "sensor" and "timeline" not in mods:
             if "file" in mods or "process" in mods:
-                rules.append({
+                file_rule = {
                     "id": str(r.get("id") or ""),
                     "title": str(r.get("title") or ""),
                     "severity": str(r.get("severity") or "medium"),
-                    "etype": "fim_add",
                     "summary_contains": "",
                     "path_prefixes": [str(p) for p in (r.get("path_prefixes") or []) if str(p).strip()][:12],
                     "patterns": [str(p) for p in (r.get("patterns") or []) if str(p).strip()][:24],
+                    "file_exts": [str(e).strip().lstrip(".").lower() for e in (r.get("file_exts") or []) if str(e).strip()][:24],
                     "match": str(r.get("match") or "substring"),
                     "signed_filter": str(r.get("signed_filter") or ""),
                     "building_block": bool(r.get("building_block")),
-                })
-                rules.append({
-                    "id": str(r.get("id") or "") + ".etw",
-                    "title": str(r.get("title") or "") + " (ETW创建)",
-                    "severity": str(r.get("severity") or "medium"),
-                    "etype": "file_create",
-                    "summary_contains": "",
-                    "path_prefixes": [str(p) for p in (r.get("path_prefixes") or []) if str(p).strip()][:12],
-                    "patterns": [str(p) for p in (r.get("patterns") or []) if str(p).strip()][:24],
-                    "match": str(r.get("match") or "substring"),
-                    "signed_filter": str(r.get("signed_filter") or ""),
-                    "building_block": bool(r.get("building_block")),
-                })
+                }
+                # FIM and ETW use different event names; cover file lifecycle changes.
+                for etype in ("fim_add", "fim_modify", "fim_rename", "file_create", "file_write", "file_write_etw", "file_stream_create", "file_rename", "file_delete"):
+                    item = dict(file_rule)
+                    item["etype"] = etype
+                    if etype != "fim_add":
+                        item["id"] = f"{file_rule['id']}.{etype}"
+                    rules.append(item)
             continue
         evm_item = {
             "id": str(r.get("id") or ""),
@@ -1535,6 +1377,7 @@ def export_evm_document() -> Dict[str, Any]:
             "summary_contains": str(r.get("summary_contains") or "").strip(),
             "path_prefixes": [str(p) for p in (r.get("path_prefixes") or []) if str(p).strip()][:12],
             "patterns": [str(p) for p in (r.get("patterns") or []) if str(p).strip()][:24],
+            "file_exts": [str(e).strip().lstrip(".").lower() for e in (r.get("file_exts") or []) if str(e).strip()][:24],
             "match": str(r.get("match") or "substring"),
             "signed_filter": str(r.get("signed_filter") or ""),
             "building_block": bool(r.get("building_block")),
@@ -1608,10 +1451,175 @@ def rule_registry_fim_paths() -> List[str]:
     return out[:32]
 
 
+def _rule_compilable(rule: Dict[str, Any]) -> bool:
+    """可编译：有可匹配的 pattern / 范围约束，且 match 模式合法。"""
+    if not isinstance(rule, dict):
+        return False
+    how = str(rule.get("match") or "substring").strip().lower()
+    if how not in ("substring", "regex", "exact"):
+        return False
+    pats = [str(p).strip() for p in (rule.get("patterns") or []) if str(p).strip()]
+    if pats:
+        if how == "regex":
+            for p in pats:
+                if p == "*":
+                    continue
+                try:
+                    re.compile(p)
+                except re.error:
+                    return False
+        return True
+    # 异常文件等可用前缀/扩展名/未签名单独约束
+    if rule.get("path_prefixes") or rule.get("file_exts") or str(rule.get("signed_filter") or "") == "unsigned":
+        return True
+    if rule.get("etype") or rule.get("summary_contains"):
+        return True
+    return False
+
+
+def _rule_fields_complete(rule: Dict[str, Any]) -> bool:
+    """字段齐全：标题、模块、匹配字段或 etype 约束齐备。"""
+    if not isinstance(rule, dict):
+        return False
+    if not str(rule.get("title") or "").strip():
+        return False
+    mods = rule.get("modules") if isinstance(rule.get("modules"), list) else []
+    fields = [str(x).strip() for x in (rule.get("fields") or []) if str(x).strip()]
+    if mods and fields:
+        return True
+    # EVM / Elastic 导入规则可能用 note/channel 表达
+    if str(rule.get("rule_channel") or "").strip() or str(rule.get("elastic_rule_id") or "").strip():
+        return bool(str(rule.get("id") or "").strip())
+    if rule.get("etype") or rule.get("summary_contains"):
+        return True
+    return False
+
+
+def _production_hit_rule_ids(limit: int = 5000) -> set:
+    """从 agent_events 粗提取生产命中过的 rule_id。"""
+    ids: set = set()
+    try:
+        from . import agent_protocol
+        agent_protocol.ensure_db()
+        with agent_protocol._lock:
+            conn = agent_protocol._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT detail FROM agent_events ORDER BY id DESC LIMIT ?",
+                    (max(100, min(int(limit), 20000)),),
+                ).fetchall()
+            finally:
+                conn.close()
+        for r in rows:
+            raw = r["detail"] if isinstance(r, dict) or hasattr(r, "keys") else ""
+            try:
+                detail = json.loads(raw or "{}") if not isinstance(raw, dict) else raw
+            except Exception:
+                continue
+            if not isinstance(detail, dict):
+                continue
+            for key in ("rule_id", "id", "agent_rule_id"):
+                rid = str(detail.get(key) or "").strip()
+                if rid:
+                    ids.add(rid)
+            for nested in (detail.get("rule"), detail.get("matched_rule")):
+                if isinstance(nested, dict):
+                    rid = str(nested.get("id") or nested.get("rule_id") or "").strip()
+                    if rid:
+                        ids.add(rid)
+    except Exception:
+        pass
+    return ids
+
+
+def classify_rule_coverage(rule: Dict[str, Any], *, hit_ids: Optional[set] = None) -> Dict[str, Any]:
+    """规则覆盖率五态：已导入 / 可编译 / 字段齐全 / 已回放 / 生产有命中。"""
+    rid = str(rule.get("id") or "").strip()
+    imported = bool(rid)
+    compilable = imported and _rule_compilable(rule)
+    fields_ok = imported and _rule_fields_complete(rule)
+    replayed = bool(
+        rule.get("replayed")
+        or rule.get("replay_at")
+        or rule.get("last_replay_at")
+        or rule.get("validated")
+        or rule.get("ai_draft_validated")
+    )
+    hits = hit_ids if hit_ids is not None else set()
+    prod_hit = bool(rid and rid in hits) or int(rule.get("hits") or rule.get("hit_count") or 0) > 0
+    # 最高达到的阶梯状态（五态互斥展示用）
+    if prod_hit:
+        state = "production_hit"
+    elif replayed:
+        state = "replayed"
+    elif fields_ok and compilable:
+        state = "fields_complete"
+    elif compilable:
+        state = "compilable"
+    else:
+        state = "imported"
+    return {
+        "id": rid,
+        "state": state,
+        "imported": imported,
+        "compilable": compilable,
+        "fields_complete": fields_ok,
+        "replayed": replayed,
+        "production_hit": prod_hit,
+    }
+
+
+def rule_coverage_stats(*, include_items: bool = True) -> Dict[str, Any]:
+    """覆盖率五态汇总：已导入 / 可编译 / 字段齐全 / 已回放 / 生产有命中。"""
+    rules = _merge_evm_rules_for_ui(list_rules())
+    hit_ids = _production_hit_rule_ids()
+    ladder = {
+        "imported": 0,
+        "compilable": 0,
+        "fields_complete": 0,
+        "replayed": 0,
+        "production_hit": 0,
+    }
+    items: List[Dict[str, Any]] = []
+    for r in rules:
+        cov = classify_rule_coverage(r, hit_ids=hit_ids)
+        ladder[cov["state"]] = ladder.get(cov["state"], 0) + 1
+        if include_items:
+            items.append({
+                "id": cov["id"],
+                "title": str(r.get("title") or "")[:120],
+                "enabled": bool(r.get("enabled", True)),
+                "source": r.get("source") or ("sensor" if r.get("builtin") else "custom"),
+                **{k: cov[k] for k in (
+                    "state", "imported", "compilable", "fields_complete", "replayed", "production_hit",
+                )},
+            })
+    labels = {
+        "imported": "已导入",
+        "compilable": "可编译",
+        "fields_complete": "字段齐全",
+        "replayed": "已回放",
+        "production_hit": "生产有命中",
+    }
+    return {
+        "ok": True,
+        "total": len(rules),
+        "ladder": ladder,
+        "labels": labels,
+        "states": [
+            {"key": k, "label": labels[k], "count": ladder[k]}
+            for k in ("imported", "compilable", "fields_complete", "replayed", "production_hit")
+        ],
+        "hit_ids_sampled": len(hit_ids),
+        "items": items if include_items else [],
+    }
+
+
 def list_platform_rule_stats() -> Dict[str, Any]:
     """兼容旧接口：返回独立规则库统计。"""
     rules = _merge_evm_rules_for_ui(list_rules())
     enabled = [r for r in rules if r.get("enabled", True)]
+    coverage = rule_coverage_stats(include_items=False)
     return {
         "ok": True,
         "source": "Agent 独立规则库",
@@ -1619,5 +1627,13 @@ def list_platform_rule_stats() -> Dict[str, Any]:
         "count": len(rules),
         "enabled": len(enabled),
         "counts": {"agent_rules": len(rules), "enabled": len(enabled)},
+        "coverage": {
+            "ladder": coverage.get("ladder") or {},
+            "labels": coverage.get("labels") or {},
+            "states": coverage.get("states") or [],
+            "total": coverage.get("total") or 0,
+        },
         "items": rules,
     }
+
+from .agent_rule_defaults import _default_rules, _sensor_builtin_rules

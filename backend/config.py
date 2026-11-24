@@ -531,37 +531,127 @@ def reload_ai_config() -> None:
         _scrub_ai_file_plaintext(file_cfg, AI_API_KEY)
 
 
-def save_ai_config(data: Dict[str, Any]) -> Dict[str, Any]:
-    """写入 ai_config.json（密钥加密，不覆盖未传入的已有密钥）。"""
-    global AI_CONFIG_PATH
-    cur = _load_ai_file()
+def _mask_ai_key(key: str) -> str:
+    key = str(key or "")
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "****"
+    return f"{key[:3]}****{key[-4:]}"
+
+
+def _infer_provider_mode(base_url: str, mode: str = "") -> str:
+    m = str(mode or "").strip().lower()
+    if m in ("local", "online"):
+        return m
+    base = str(base_url or "").lower()
+    if any(x in base for x in ("127.0.0.1", "localhost", "192.168.", "10.", "172.")):
+        return "local"
+    return "online"
+
+
+def _new_ai_profile_id() -> str:
+    import uuid
+    return "p" + uuid.uuid4().hex[:10]
+
+
+def _legacy_ai_as_profiles(cur: Dict[str, Any]) -> Dict[str, Any]:
+    """旧单套配置 → profiles 文档。"""
+    if isinstance(cur.get("profiles"), list) and cur.get("profiles"):
+        return cur
+    base = str(cur.get("base_url") or AI_BASE_URL or "https://api.openai.com/v1").strip()
+    model = str(cur.get("model") or AI_MODEL or "gpt-4o-mini").strip()
     key = _file_ai_key(cur)
-    if "api_key" in data:
-        incoming = str(data.get("api_key") or "").strip()
-        if incoming and not set(incoming) <= {"*", "•"} and "****" not in incoming:
-            key = incoming
-    if "base_url" in data and data.get("base_url") is not None:
-        cur["base_url"] = str(data.get("base_url") or "").strip() or cur.get("base_url") or "https://api.openai.com/v1"
-        try:
-            from .ai.analyzer import validate_ai_base_url
-            validate_ai_base_url(str(cur["base_url"]))
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise ValueError(f"AI Base URL 校验失败: {e}") from e
-    if "model" in data and data.get("model") is not None:
-        cur["model"] = str(data.get("model") or "").strip() or cur.get("model") or "gpt-4o-mini"
-    if "timeout" in data and data.get("timeout") is not None:
-        try:
-            cur["timeout"] = float(data.get("timeout"))
-        except (TypeError, ValueError):
-            pass
+    if not base and not model and not key:
+        cur = dict(cur)
+        cur.setdefault("profiles", [])
+        cur.setdefault("active_id", "")
+        return cur
+    pid = str(cur.get("active_id") or "default")
+    profile = {
+        "id": pid,
+        "name": str(cur.get("name") or model or "默认").strip()[:64] or "默认",
+        "base_url": base,
+        "model": model,
+        "timeout": float(cur.get("timeout") or AI_TIMEOUT or 60),
+        "provider_mode": _infer_provider_mode(base, str(cur.get("provider_mode") or "")),
+        "api_key_enc": str(cur.get("api_key_enc") or ""),
+    }
+    if cur.get("api_key") and not profile["api_key_enc"]:
+        profile["api_key"] = str(cur.get("api_key") or "")
+    out = dict(cur)
+    out["active_id"] = pid
+    out["profiles"] = [profile]
+    return out
+
+
+def list_ai_profiles() -> Dict[str, Any]:
+    """平台多模型列表（公开字段，不含明文 Key）。"""
+    cur = _legacy_ai_as_profiles(_load_ai_file())
+    profiles = [p for p in (cur.get("profiles") or []) if isinstance(p, dict) and p.get("id")]
+    active_id = str(cur.get("active_id") or "")
+    if profiles and active_id not in {str(p.get("id")) for p in profiles}:
+        active_id = str(profiles[0].get("id") or "")
+    pub = []
+    for p in profiles:
+        pid = str(p.get("id") or "")
+        base = str(p.get("base_url") or "")
+        key = _file_ai_key(p) if (p.get("api_key") or p.get("api_key_enc")) else ""
+        # 兼容：密钥可能只在顶层
+        if not key and pid == active_id:
+            key = _file_ai_key(cur)
+        mode = _infer_provider_mode(base, str(p.get("provider_mode") or ""))
+        pub.append({
+            "id": pid,
+            "name": str(p.get("name") or p.get("model") or "未命名"),
+            "base_url": base,
+            "model": str(p.get("model") or ""),
+            "timeout": float(p.get("timeout") or 60),
+            "provider_mode": mode,
+            "configured": bool(key) or mode == "local",
+            "api_key_masked": _mask_ai_key(key) if key else ("(本地可无 Key)" if mode == "local" else ""),
+            "has_api_key": bool(key),
+            "active": pid == active_id,
+        })
+    return {
+        "active_id": active_id,
+        "profiles": pub,
+        "profile_count": len(pub),
+    }
+
+
+def _write_ai_doc(cur: Dict[str, Any], *, active_key: str = "") -> Dict[str, Any]:
+    """持久化 ai_config（含 profiles），并把 active 镜像到顶层字段。"""
+    global AI_CONFIG_PATH
+    cur = _legacy_ai_as_profiles(dict(cur or {}))
+    profiles = [p for p in (cur.get("profiles") or []) if isinstance(p, dict) and p.get("id")]
+    active_id = str(cur.get("active_id") or "")
+    active = None
+    for p in profiles:
+        if str(p.get("id")) == active_id:
+            active = p
+            break
+    if not active and profiles:
+        active = profiles[0]
+        active_id = str(active.get("id") or "")
+    key = active_key
+    if active and not key:
+        key = _file_ai_key(active) or _file_ai_key(cur)
+    if active:
+        cur["base_url"] = str(active.get("base_url") or "")
+        cur["model"] = str(active.get("model") or "")
+        cur["timeout"] = float(active.get("timeout") or 60)
+        cur["provider_mode"] = _infer_provider_mode(cur["base_url"], str(active.get("provider_mode") or ""))
+        cur["name"] = str(active.get("name") or cur["model"] or "")
+    cur["active_id"] = active_id
+    cur["profiles"] = profiles
     try:
         from . import platform_store
         if key:
             cur["api_key_enc"] = platform_store.encrypt_secret(key)
-        elif cur.get("api_key_enc"):
-            pass
+            if active is not None:
+                active["api_key_enc"] = cur["api_key_enc"]
+                active.pop("api_key", None)
         cur.pop("api_key", None)
         platform_store.save_ai(
             str(cur.get("model") or "gpt-4o-mini"),
@@ -580,21 +670,196 @@ def save_ai_config(data: Dict[str, Any]) -> Dict[str, Any]:
     return ai_public_status()
 
 
+def save_ai_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    """写入/更新一套平台模型（支持多 profiles）；不传 id 则更新当前启用项或新建。"""
+    cur = _legacy_ai_as_profiles(_load_ai_file())
+    profiles: List[Dict[str, Any]] = [p for p in (cur.get("profiles") or []) if isinstance(p, dict)]
+    as_new = bool(data.get("as_new"))
+    pid = str(data.get("id") or "").strip()
+    existing = None
+    if pid and not as_new:
+        for p in profiles:
+            if str(p.get("id")) == pid:
+                existing = p
+                break
+        if existing is None:
+            raise ValueError("模型配置不存在")
+    elif not as_new and not pid:
+        aid = str(cur.get("active_id") or "")
+        for p in profiles:
+            if str(p.get("id")) == aid:
+                existing = p
+                pid = aid
+                break
+    if existing is None:
+        if len(profiles) >= 20:
+            raise ValueError("最多保存 20 套模型配置")
+        pid = pid or _new_ai_profile_id()
+        existing = None
+
+    base_url = str(
+        data.get("base_url") if data.get("base_url") is not None
+        else (existing or {}).get("base_url") or cur.get("base_url") or "https://api.openai.com/v1"
+    ).strip().rstrip("/")
+    model = str(
+        data.get("model") if data.get("model") is not None
+        else (existing or {}).get("model") or cur.get("model") or "gpt-4o-mini"
+    ).strip()
+    name = str(
+        data.get("name") if data.get("name") is not None
+        else (existing or {}).get("name") or model or "未命名"
+    ).strip()[:64] or model
+    try:
+        timeout = float(
+            data.get("timeout") if data.get("timeout") is not None
+            else (existing or {}).get("timeout") or cur.get("timeout") or 60
+        )
+    except (TypeError, ValueError):
+        timeout = 60.0
+    mode = _infer_provider_mode(base_url, str(data.get("provider_mode") or (existing or {}).get("provider_mode") or ""))
+    if not base_url:
+        raise ValueError("请填写 Base URL")
+    if not model:
+        raise ValueError("请填写模型名")
+    try:
+        from .ai.analyzer import validate_ai_base_url
+        validate_ai_base_url(base_url)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise ValueError(f"AI Base URL 校验失败: {e}") from e
+
+    key = _file_ai_key(existing) if existing else (_file_ai_key(cur) if not as_new else "")
+    if "api_key" in data:
+        incoming = str(data.get("api_key") or "").strip()
+        if incoming and not set(incoming) <= {"*", "•"} and "****" not in incoming:
+            key = incoming
+    if not key and mode == "local":
+        key = "local-no-key"
+
+    enc: Dict[str, str] = {}
+    try:
+        from . import platform_store
+        if key:
+            enc["api_key_enc"] = platform_store.encrypt_secret(key)
+    except Exception:
+        if key:
+            enc["api_key"] = key
+
+    row = {
+        "id": pid,
+        "name": name,
+        "base_url": base_url,
+        "model": model,
+        "timeout": timeout,
+        "provider_mode": mode,
+        **enc,
+    }
+    if existing is None:
+        profiles.append(row)
+    else:
+        profiles = [row if str(p.get("id")) == pid else p for p in profiles]
+
+    activate = bool(data.get("activate", True))
+    active_id = str(cur.get("active_id") or "")
+    if activate or not active_id or active_id not in {str(p.get("id")) for p in profiles}:
+        active_id = pid
+    cur["profiles"] = profiles
+    cur["active_id"] = active_id
+    return _write_ai_doc(cur, active_key=key if activate or pid == active_id else _file_ai_key(
+        next((p for p in profiles if str(p.get("id")) == active_id), {})
+    ) or key)
+
+
+def activate_ai_profile(profile_id: str) -> Dict[str, Any]:
+    cur = _legacy_ai_as_profiles(_load_ai_file())
+    pid = str(profile_id or "").strip()
+    profiles = [p for p in (cur.get("profiles") or []) if isinstance(p, dict)]
+    hit = next((p for p in profiles if str(p.get("id")) == pid), None)
+    if not hit:
+        raise ValueError("模型配置不存在")
+    cur["active_id"] = pid
+    cur["profiles"] = profiles
+    return _write_ai_doc(cur, active_key=_file_ai_key(hit) or _file_ai_key(cur))
+
+
+def delete_ai_profile(profile_id: str) -> Dict[str, Any]:
+    cur = _legacy_ai_as_profiles(_load_ai_file())
+    pid = str(profile_id or "").strip()
+    profiles = [p for p in (cur.get("profiles") or []) if isinstance(p, dict) and str(p.get("id")) != pid]
+    if len(profiles) == len(cur.get("profiles") or []):
+        raise ValueError("模型配置不存在")
+    if not profiles:
+        raise ValueError("至少保留一套模型配置")
+    active = str(cur.get("active_id") or "")
+    if active == pid:
+        active = str(profiles[0].get("id") or "")
+    cur["active_id"] = active
+    cur["profiles"] = profiles
+    hit = next((p for p in profiles if str(p.get("id")) == active), profiles[0])
+    return _write_ai_doc(cur, active_key=_file_ai_key(hit) or _file_ai_key(cur))
+
+
+def resolve_platform_profile_creds(profile_id: str = "") -> Dict[str, Any]:
+    """解析平台某套（或当前启用）模型的调用凭据。"""
+    cur = _legacy_ai_as_profiles(_load_ai_file())
+    profiles = [p for p in (cur.get("profiles") or []) if isinstance(p, dict)]
+    pid = str(profile_id or "").strip() or str(cur.get("active_id") or "")
+    hit = next((p for p in profiles if str(p.get("id")) == pid), None)
+    if not hit and profiles:
+        hit = profiles[0]
+    if not hit:
+        reload_ai_config()
+        return {
+            "api_key": AI_API_KEY,
+            "base_url": AI_BASE_URL,
+            "model": AI_MODEL,
+            "timeout": AI_TIMEOUT,
+            "source": "platform",
+            "profile_id": "",
+            "name": "",
+        }
+    key = _file_ai_key(hit) or (_file_ai_key(cur) if str(hit.get("id")) == str(cur.get("active_id") or "") else "")
+    return {
+        "api_key": key,
+        "base_url": str(hit.get("base_url") or AI_BASE_URL),
+        "model": str(hit.get("model") or AI_MODEL),
+        "timeout": float(hit.get("timeout") or AI_TIMEOUT or 60),
+        "source": "platform",
+        "profile_id": str(hit.get("id") or ""),
+        "name": str(hit.get("name") or hit.get("model") or ""),
+        "provider_mode": _infer_provider_mode(str(hit.get("base_url") or ""), str(hit.get("provider_mode") or "")),
+    }
+
+
+def ai_provider_mode() -> str:
+    file_cfg = _load_ai_file()
+    mode = str(file_cfg.get("provider_mode") or "").strip().lower()
+    if mode in ("local", "online"):
+        return mode
+    return _infer_provider_mode(AI_BASE_URL)
+
+
 def ai_public_status() -> Dict[str, Any]:
     key = AI_API_KEY or ""
-    masked = ""
-    if key:
-        masked = "****"
     path = ai_config_file()
+    pack = list_ai_profiles()
+    active = next((p for p in pack.get("profiles") or [] if p.get("active")), None)
     return {
-        "configured": bool(key),
-        "api_key_masked": masked,
-        "model": AI_MODEL,
-        "base_url": AI_BASE_URL,
+        "configured": bool(key) or bool((active or {}).get("configured")),
+        "api_key_masked": _mask_ai_key(key) or str((active or {}).get("api_key_masked") or ""),
+        "has_api_key": bool(key) or bool((active or {}).get("has_api_key")),
+        "model": AI_MODEL or str((active or {}).get("model") or ""),
+        "base_url": AI_BASE_URL or str((active or {}).get("base_url") or ""),
         "timeout": AI_TIMEOUT,
+        "provider_mode": ai_provider_mode(),
+        "name": str((active or {}).get("name") or ""),
+        "active_id": pack.get("active_id") or "",
+        "profiles": pack.get("profiles") or [],
+        "profile_count": pack.get("profile_count") or 0,
         "config_file": str(path),
         "env_override": bool(os.getenv("FORENSIC_AI_API_KEY") or os.getenv("OPENAI_API_KEY")),
-        "hint": "在系统设置保存大模型配置（Key 加密写入 MySQL；本地 json 仅作回退），或设置环境变量 FORENSIC_AI_API_KEY / FORENSIC_AI_BASE_URL / FORENSIC_AI_MODEL",
+        "hint": "可保存多套本地/在线模型，点「使用」切换；保存后可用「测试连接」验证。",
     }
 
 

@@ -7,18 +7,19 @@ import (
 )
 
 type evmRule struct {
-	ID              string   `json:"id"`
-	Title           string   `json:"title"`
-	Severity        string   `json:"severity"`
-	Etype           string   `json:"etype"`
-	SummaryContains string   `json:"summary_contains"`
-	PathPrefixes    []string `json:"path_prefixes"`
-	Patterns        []string `json:"patterns"`
-	Match           string   `json:"match"`
-	SignedFilter         string   `json:"signed_filter"`
-	ExcludePatterns      []string `json:"exclude_patterns"`
-	ParentNameContains   string   `json:"parent_name_contains"`
-	BuildingBlock        bool     `json:"building_block"`
+	ID                 string   `json:"id"`
+	Title              string   `json:"title"`
+	Severity           string   `json:"severity"`
+	Etype              string   `json:"etype"`
+	SummaryContains    string   `json:"summary_contains"`
+	PathPrefixes       []string `json:"path_prefixes"`
+	FileExts           []string `json:"file_exts"`
+	Patterns           []string `json:"patterns"`
+	Match              string   `json:"match"`
+	SignedFilter       string   `json:"signed_filter"`
+	ExcludePatterns    []string `json:"exclude_patterns"`
+	ParentNameContains string   `json:"parent_name_contains"`
+	BuildingBlock      bool     `json:"building_block"`
 }
 
 var (
@@ -45,13 +46,13 @@ func loadEVMDocument(doc map[string]any) {
 		pats := stringsFromAnySlice(m["patterns"])
 		rules = append(rules, evmRule{
 			ID: asString(m["id"]), Title: asString(m["title"]), Severity: asString(m["severity"]),
-			Etype: strings.ToLower(asString(m["etype"])),
+			Etype:           strings.ToLower(asString(m["etype"])),
 			SummaryContains: asString(m["summary_contains"]),
-			PathPrefixes: pr, Patterns: pats, Match: asString(m["match"]),
-			SignedFilter: asString(m["signed_filter"]),
-			ExcludePatterns: stringsFromAnySlice(m["exclude_patterns"]),
+			PathPrefixes:    pr, FileExts: stringsFromAnySlice(m["file_exts"]), Patterns: pats, Match: asString(m["match"]),
+			SignedFilter:       asString(m["signed_filter"]),
+			ExcludePatterns:    stringsFromAnySlice(m["exclude_patterns"]),
 			ParentNameContains: asString(m["parent_name_contains"]),
-			BuildingBlock: m["building_block"] == true,
+			BuildingBlock:      m["building_block"] == true,
 		})
 	}
 	evmMu.Lock()
@@ -88,6 +89,9 @@ func evmEvaluate(ev map[string]any) []map[string]any {
 		if len(r.PathPrefixes) > 0 && !pathScopeAllowed(r.PathPrefixes, path, d) {
 			continue
 		}
+		if len(r.FileExts) > 0 && !evmFileExtAllowed(r.FileExts, path, d) {
+			continue
+		}
 		if len(r.Patterns) > 0 {
 			if !evmPatternsMatch(r, sum, path, d) {
 				continue
@@ -107,8 +111,8 @@ func evmEvaluate(ev map[string]any) []map[string]any {
 				continue
 			}
 		}
-		if r.SignedFilter == "unsigned" {
-			if evmProcessTrusted(d) {
+		if r.SignedFilter == "unsigned" || r.SignedFilter == "signed" {
+			if !evmSignatureAllowed(r.SignedFilter, d) {
 				continue
 			}
 		}
@@ -140,7 +144,7 @@ func evmEvaluate(ev map[string]any) []map[string]any {
 		out = append(out, map[string]any{
 			"etype": "evm_hit", "severity": sev,
 			"summary": "EVM: " + r.Title,
-			"detail": dhit,
+			"detail":  dhit,
 		})
 	}
 	return out
@@ -157,13 +161,22 @@ func evmCopyDetailFields(dhit, d map[string]any) {
 		"name", "path", "image", "command_line", "parent_name", "process_name",
 		"remote", "remote_ip", "domain", "local", "proto", "key", "reg_key",
 		"value", "value_name", "operation", "module_name",
+		// BITS / 文件 / 签名类字段：否则 EVM「BITS 传输」等命中详情空白
+		"job_name", "remote_url", "local_path", "owner", "payload_path",
+		"signed", "signer", "sha256", "md5", "sha1", "company", "file_version",
+		"user", "entity_id", "parent_entity_id", "ppid", "ext", "size", "size_kb",
+		"matched", "share", "status", "channel", "event_id",
 	} {
 		if v := asString(d[k]); v != "" {
-			dhit[k] = v
+			if _, exists := dhit[k]; !exists || asString(dhit[k]) == "" {
+				dhit[k] = d[k]
+			}
 		}
 	}
-	if cmd := asString(d["command_line"]); cmd != "" {
-		dhit["matched"] = cmd
+	if asString(dhit["matched"]) == "" {
+		if cmd := asString(d["command_line"]); cmd != "" {
+			dhit["matched"] = cmd
+		}
 	}
 }
 
@@ -171,6 +184,15 @@ func evmBuildMatched(dhit map[string]any, summary string) string {
 	var parts []string
 	if s := strings.TrimSpace(summary); s != "" {
 		parts = append(parts, s)
+	}
+	if job := asString(dhit["job_name"]); job != "" {
+		parts = append(parts, "job="+job)
+	}
+	if url := asString(dhit["remote_url"]); url != "" {
+		parts = append(parts, url)
+	}
+	if lp := asString(dhit["local_path"]); lp != "" {
+		parts = append(parts, lp)
 	}
 	if rm := asString(dhit["remote"]); rm != "" {
 		line := rm
@@ -204,6 +226,54 @@ func evmProcessTrusted(d map[string]any) bool {
 			return true
 		}
 		if cs, ok := px["code_signature"].(map[string]any); ok && cs["trusted"] == true {
+			return true
+		}
+	}
+	return false
+}
+
+func evmSignatureAllowed(filter string, detail map[string]any) bool {
+	status := strings.ToLower(strings.TrimSpace(asString(detail["signed"])))
+	if status == "" {
+		if ext, ok := detail["process_ext"].(map[string]any); ok {
+			if sig, ok := ext["code_signature"].(map[string]any); ok && sig["trusted"] == true {
+				status = "valid"
+			} else {
+				status = strings.ToLower(strings.TrimSpace(asString(ext["reputation"])))
+			}
+		}
+	}
+	if status == "" || status == "unknown" || status == "undefined" || status == "n/a" || status == "-" {
+		return false
+	}
+	valid := status == "valid" || status == "valid signature" || status == "signed" || status == "trusted" || status == "true"
+	if filter == "signed" {
+		return valid
+	}
+	if filter != "unsigned" || valid {
+		return false
+	}
+	return status == "unsigned" || status == "notsigned" || status == "hashmismatch" || status == "nottrusted" || status == "incompatible" || status == "untrusted" || strings.Contains(status, "expired")
+}
+
+func evmFileExtAllowed(allowed []string, path string, detail map[string]any) bool {
+	ext := strings.ToLower(strings.TrimSpace(asString(detail["ext"])))
+	ext = strings.TrimPrefix(ext, ".")
+	if ext == "" {
+		base := strings.ToLower(strings.ReplaceAll(path, "/", "\\"))
+		if i := strings.LastIndex(base, "\\"); i >= 0 {
+			base = base[i+1:]
+		}
+		if i := strings.LastIndex(base, "."); i >= 0 && i < len(base)-1 {
+			ext = base[i+1:]
+		}
+	}
+	if ext == "" {
+		return false
+	}
+	for _, candidate := range allowed {
+		candidate = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(candidate), "."))
+		if candidate == ext {
 			return true
 		}
 	}

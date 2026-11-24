@@ -92,6 +92,8 @@ def _timeline_evidence(row: sqlite3.Row) -> Dict[str, Any]:
         "command_line", "command", "remote", "remote_ip", "domain", "local", "proto", "pid",
         "parent_name", "ppid", "operation", "image", "module_name", "entity_id",
         "process_path", "script_block", "payload",
+        "job_name", "remote_url", "local_path", "owner", "payload_path",
+        "signed", "signer", "sha256", "md5", "company", "user",
     ):
         if d.get(k) not in (None, ""):
             out[k] = d[k]
@@ -277,6 +279,35 @@ def _find_persist_evidence(
     return _timeline_evidence(rows[0])
 
 
+def _find_bits_evidence(
+    conn: sqlite3.Connection,
+    agent_id: str,
+    *,
+    around_ts: str = "",
+) -> Optional[Dict[str, Any]]:
+    """回填 BITS 任务：job / URL / 本地路径。"""
+    try:
+        rows = conn.execute(
+            """SELECT etype, summary, detail_json, ts FROM agent_timeline
+               WHERE agent_id=? AND etype='win_bits' ORDER BY id DESC LIMIT 12""",
+            (agent_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    if not rows:
+        return None
+    # 优先带 local_path / remote_url 的行
+    best = None
+    for r in rows:
+        ev = _timeline_evidence(r)
+        if ev.get("local_path") or ev.get("remote_url") or ev.get("job_name"):
+            best = ev
+            break
+        if best is None:
+            best = ev
+    return best
+
+
 def _find_network_evidence(
     conn: sqlite3.Connection,
     agent_id: str,
@@ -435,6 +466,20 @@ def enrich_detail_from_timeline(
                 if not d.get("source_summary") and ev.get("summary"):
                     d["source_summary"] = ev["summary"]
                 changed = True
+        elif src_et in ("win_bits",) or "BITS" in t.upper() or "bits" in str(d.get("rule_title") or "").lower():
+            ev = _find_bits_evidence(conn, agent_id, around_ts=str(d.get("event_ts") or created_at))
+            if ev:
+                for k, v in ev.items():
+                    if v not in (None, "") and not d.get(k):
+                        d[k] = v
+                hint = " · ".join(
+                    str(x) for x in (ev.get("job_name"), ev.get("remote_url"), ev.get("local_path")) if x
+                )
+                d["matched"] = d.get("matched") or hint or str(ev.get("summary") or "")[:500]
+                d.setdefault("source_etype", "win_bits")
+                if ev.get("summary"):
+                    d["source_summary"] = ev["summary"]
+                changed = True
         elif src_et.startswith("registry") or "注册表" in t:
             chain = _find_registry_chain(conn, agent_id, [{"etype": "registry_set"}], limit=2)
             if chain:
@@ -458,6 +503,21 @@ def enrich_detail_from_timeline(
                 if ev.get("summary"):
                     d["source_summary"] = ev["summary"]
                 changed = True
+
+    # 直接晋升的 win_bits 缺字段时也回填
+    if (et == "win_bits" or str(d.get("source_etype") or "") == "win_bits") and not (
+        d.get("local_path") or d.get("remote_url") or d.get("job_name")
+    ):
+        ev = _find_bits_evidence(conn, agent_id, around_ts=str(d.get("event_ts") or created_at))
+        if ev:
+            for k, v in ev.items():
+                if v not in (None, "") and not d.get(k):
+                    d[k] = v
+            if not d.get("matched"):
+                d["matched"] = " · ".join(
+                    str(x) for x in (ev.get("job_name"), ev.get("remote_url"), ev.get("local_path")) if x
+                ) or str(ev.get("summary") or "")[:500]
+            changed = True
 
     # 直接晋升的 persist_/registry_ 告警（无 EVM 前缀）也从时间线回填
     if (et.startswith("persist") or et.startswith("registry")) and not (d.get("key") or d.get("reg_key") or d.get("value")):

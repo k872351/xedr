@@ -33,6 +33,9 @@ _DEFAULTS = {
     "database": "forensic_platform",
     "charset": "utf8mb4",
     "pool_size": 20,  # 20～50 人：与分析并发匹配；可在 db_config.json 覆盖
+    # When MySQL is enabled, never silently split writes into a node-local DB.
+    # Operators can explicitly set strict=false to request legacy fallback.
+    "strict": True,
 }
 
 _status: Dict[str, Any] = {
@@ -69,9 +72,20 @@ def load_db_config() -> Dict[str, Any]:
         cfg["user"] = os.getenv("FORENSIC_MYSQL_USER", "").strip()
     if os.getenv("FORENSIC_MYSQL_PASSWORD") is not None:
         cfg["password"] = os.getenv("FORENSIC_MYSQL_PASSWORD", "")
+    if os.getenv("FORENSIC_MYSQL_STRICT") is not None:
+        cfg["strict"] = os.getenv("FORENSIC_MYSQL_STRICT", "").strip().lower() in ("1", "true", "yes", "on")
     if os.getenv("FORENSIC_MYSQL_DATABASE"):
         cfg["database"] = os.getenv("FORENSIC_MYSQL_DATABASE", "").strip()
     return cfg
+
+
+class StorageUnavailable(RuntimeError):
+    """Raised when required shared storage is unavailable."""
+
+
+def strict_storage_required(cfg: Optional[Dict[str, Any]] = None) -> bool:
+    cfg = cfg or load_db_config()
+    return bool(cfg.get("enabled") and cfg.get("strict"))
 
 
 def save_db_config_example() -> Path:
@@ -361,15 +375,17 @@ def reset_mysql_pool() -> None:
 
 
 def mark_mysql_down(error: str = "") -> None:
-    """连接失败时降级为 sqlite，避免 sticky ok 导致整站挂死。"""
+    """记录 MySQL 连接失败；严格模式下保留不可用状态，不切换到另一份 SQLite 数据。"""
     global _status
     prev = bool(_status.get("ok"))
     _status["ok"] = False
-    _status["backend"] = "sqlite"
+    strict = strict_storage_required()
+    _status["backend"] = "mysql-unavailable" if strict else "sqlite"
     if error:
         _status["error"] = str(error)[:400]
     if prev:
-        print(f"[mysql] marked down → sqlite: {_status.get('error')}")
+        target = "strict unavailable" if strict else "sqlite fallback"
+        print(f"[mysql] marked down → {target}: {_status.get('error')}")
         try:
             reset_mysql_pool()
         except Exception:
@@ -383,7 +399,8 @@ def ensure_database_and_schema() -> Dict[str, Any]:
     cfg = load_db_config()
     _status = {
         "ok": False,
-        "backend": "sqlite",
+        "enabled": bool(cfg.get("enabled", True)),
+        "backend": "mysql-unavailable" if strict_storage_required(cfg) else "sqlite",
         "error": "",
         "database": cfg.get("database") or "",
         "version": "",
@@ -456,9 +473,12 @@ def ensure_database_and_schema() -> Dict[str, Any]:
         print(f"[mysql] connected {cfg['host']}:{cfg['port']}/{dbname} ver={msg}")
     except Exception as e:
         _status["ok"] = False
-        _status["backend"] = "sqlite"
+        _status["backend"] = "mysql-unavailable" if strict_storage_required(cfg) else "sqlite"
         _status["error"] = f"{type(e).__name__}: {e}"
-        print(f"[mysql] setup failed, fallback sqlite: {e}")
+        if strict_storage_required(cfg):
+            print(f"[mysql] strict storage unavailable; refusing sqlite fallback: {e}")
+        else:
+            print(f"[mysql] setup failed, fallback sqlite: {e}")
         try:
             reset_mysql_pool()
         except Exception:
@@ -528,20 +548,33 @@ def mysql_ready() -> bool:
         return False
     now = time.time()
     if now - _last_reprobe_ts < _REPROBE_SEC:
+        if strict_storage_required(cfg):
+            raise StorageUnavailable("configured MySQL storage is unavailable")
         return False
     _last_reprobe_ts = now
     ok, msg = probe_mysql(cfg)
     if not ok:
         _status["error"] = msg
+        if strict_storage_required(cfg):
+            _status["backend"] = "mysql-unavailable"
+            raise StorageUnavailable(f"configured MySQL storage is unavailable: {msg}")
         return False
     try:
         st = ensure_database_and_schema()
         if st.get("ok"):
             print("[mysql] recovered from downtime")
             _catchup_after_mysql_recovery()
+        if not st.get("ok") and strict_storage_required(cfg):
+            raise StorageUnavailable(str(st.get("error") or "configured MySQL storage is unavailable"))
         return bool(st.get("ok"))
     except Exception as e:
         _status["error"] = f"{type(e).__name__}: {e}"
+        if strict_storage_required(cfg):
+            _status["ok"] = False
+            _status["backend"] = "mysql-unavailable"
+            if isinstance(e, StorageUnavailable):
+                raise
+            raise StorageUnavailable(f"configured MySQL storage is unavailable: {e}") from e
         return False
 
 

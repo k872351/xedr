@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 	_ = ensureDir(cfg.StateDir)
 	setupFileLog(cfg.StateDir)
+	ensureAgentKeepalive()
 	checkUpgradeWatchdog(cfg)
 
 	api := newClient(cfg)
@@ -42,30 +44,67 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 	setProtectStateDir(cfg.StateDir)
 	// 先启原生 ETW：成功则不再拉 WMI PowerShell 进程监控（否则双重采集 + 每进程 SHA256 会拖死测试机）
 	etw := newETWWatcher()
+	if runtime.GOOS == "windows" {
+		recordComponentObservation("etw", cStateStarting, "ETW sensor initialization in progress")
+	}
 	etw.start(ctx)
 	defer etw.stop()
-	setSensorPipeline("starting", "winevent", "")
+	if runtime.GOOS == "windows" {
+		setSensorPipeline("starting", "winevent", "")
+	} else if runtime.GOOS == "linux" {
+		setSensorPipeline("linux_inventory", "linux_journal", "")
+	} else {
+		setSensorPipeline("inventory_only", "unsupported", "")
+	}
 	startSensorHealLoop(ctx, etw)
 	etwMode := etw.waitMode(4 * time.Second)
+	if etwMode == "etw_native" || etwMode == "etw_evt" {
+		recordComponentObservation("etw", cStateHealthy, etwMode)
+	} else if etwMode != "stopped" && etwMode != "" {
+		recordComponentObservation("etw", cStateDegraded, etwMode)
+	} else if runtime.GOOS == "windows" {
+		recordComponentObservation("etw", cStateFailed, "ETW sensor did not start")
+	}
 	captureETWStatusFn = func() (string, bool) {
 		m := etw.status()
 		return m, m == "etw_native" || m == "etw_evt"
 	}
 	startCmdBackfillLoop(ctx)
 	watch := newProcessWatcher()
-	wmiProc := etwMode != "etw_native" || integrationEnabled("wmi_process")
+	wmiProc := runtime.GOOS == "windows" && (etwMode != "etw_native" || integrationEnabled("wmi_process"))
 	if wmiProc {
+		recordComponentObservation("wmi_process", cStateStarting, "process watcher initialization in progress")
 		watch.start(ctx)
 		log.Printf("process watcher: ETW=%s，WMI 进程监控=%v", etwMode, integrationEnabled("wmi_process") || etwMode != "etw_native")
-	} else {
+	} else if runtime.GOOS == "windows" {
 		log.Printf("process watcher: ETW 原生已接管，跳过 WMI")
 	}
 	defer watch.stop()
+	// 在 winevent 订阅前尽量装好 Sysmon，否则会跳过 Sysmon 通道。
+	// busy 时再试一次：安装器后台 ensure 可能刚占用互斥锁。
+	for attempt := 0; runtime.GOOS == "windows" && attempt < 2; attempt++ {
+		st := ensureSysmonManaged(api)
+		if st == nil {
+			break
+		}
+		log.Printf("sysmon ensure[#%d]: action=%v present=%v installed=%v err=%v",
+			attempt+1, st["action"], st["present"], st["installed"], st["error"])
+		act, _ := st["action"].(string)
+		if act != "busy" {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(8 * time.Second):
+		}
+	}
 	// winevent 延后启动，避免与 ETW/注册/首轮采集抢 CPU
 	logTailGlobal = newLogTailWatcher()
 	logTailGlobal.start(ctx)
 	wevt := newWinEventWatcher()
 	wevt.bookmarkDir = filepath.Join(cfg.StateDir, "bookmarks")
+	globalWinEvent = wevt
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -75,12 +114,37 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 		wevt.start(ctx)
 	}()
 	defer wevt.stop()
+	// Sysmon 自愈：被停止/卸载/配置被改后自动恢复，无需人工介入
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			st := ensureSysmonManaged(api)
+			if act, _ := st["action"].(string); act == "installed" || act == "config_updated" {
+				// 清 Sysmon 书签以触发 catch-up，避免「已装但时间线无 EventID」
+				if dir := wevt.bookmarkDir; dir != "" {
+					_ = os.Remove(filepath.Join(dir, "sysmon.xml"))
+				}
+				wevt.restart(ctx)
+			}
+		}
+	}()
 	persist := newPersistWatcher()
 	wmiPersist := newWMIPersistWatcher()
 	wmiPersist.start(ctx)
 	regw := newRegWatcher(box.st)
 	globalRegWatcher = regw
 	regOn := regw.start(ctx)
+	if regOn {
+		recordComponentObservation("registry", cStateHealthy, "registry change watcher active")
+	} else if integrationEnabled("registry") {
+		recordComponentObservation("registry", cStateDegraded, "registry realtime watcher unavailable; polling remains available")
+	}
 	applyRegistryFIMSync(regw)
 	defer regw.stop()
 	persist.setRegistryRealtime(regOn)
@@ -102,6 +166,7 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 	kern := newKernelWatcher()
 	kernelOn := kern.start(ctx)
 	defer kern.stop()
+	go dpDrv.run(ctx, cfg.StateDir)
 	devw := newDeviceWatcher()
 	if integrationEnabled("device") {
 		devw.start(ctx)
@@ -113,13 +178,7 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 		tl.setNetEnabled(false)
 		log.Printf("timeline snapshot-diff: 已关闭（由 ETW/FIM 接管）")
 	}
-	sensor := "etw+winevent"
-	if wmiProc {
-		sensor = "etw+wmi+winevent"
-	}
-	if kernelOn {
-		sensor = "kernel+" + sensor
-	}
+	sensor := platformSensorMode(runtime.GOOS, wmiProc, kernelOn)
 
 	hn := hostname()
 	ip := primaryIP()
@@ -128,20 +187,40 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 	box.cmdPurge()
 	health := newHealthCollector()
 	health.sensorsFn = func() map[string]any {
+		if runtime.GOOS == "linux" {
+			secondary := "disabled"
+			if integrationEnabled("linux_journal") {
+				secondary = "linux_journal"
+			}
+			setSensorPipeline("linux_inventory", secondary, "")
+		}
+		// Only publish HEALTHY when the runtime exposes a positive active signal.
+		// Lack of an active signal remains UNKNOWN instead of inferring success from policy.
+		if wmiProc && watch.activeNow() {
+			recordComponentObservation("wmi_process", cStateHealthy, "WMI process event watcher active")
+		}
+		if fim.running() {
+			recordComponentObservation("fim", cStateHealthy, "file integrity watcher active")
+		}
+		if regw.running() {
+			recordComponentObservation("registry", cStateHealthy, "registry change watcher active")
+		}
 		s := map[string]any{
 			"etw": etw.status(), "kernel": kernelOn, "mode": sensor,
 			"registry_realtime": regOn, "fim": fim.running(), "entities": procEntities.size(),
-			"entities_rev":      procEntities.revision(),
-			"capture_status":    captureStatusSnapshot(),
-			"components":        componentHealthSnapshot(),
-			"telemetry":         telemetryMetricsSnapshot(),
-			"sensor_pipeline":   sensorPipelineSnapshot(),
-			"winevent_channels": len(winevtChannelDefsFiltered()),
-			"winevent_manifest": winevtChannelManifest(),
-			"host_metrics":      hostMetricsSnapshot(),
-			"live_query_tables": liveQueryManifest(),
-			"elastic_parity":    elasticParitySnapshot(),
-			"dynamic_fim":       dynamicFIMCount(),
+			"entities_rev":         procEntities.revision(),
+			"capture_status":       captureStatusSnapshot(),
+			"components":           componentHealthSnapshot(),
+			"inventory_components": inventoryComponentHealthSnapshot(cfg.Modules),
+			"telemetry":            telemetryMetricsSnapshot(),
+			"sensor_pipeline":      sensorPipelineSnapshot(),
+			"winevent_channels":    len(winevtChannelDefsFiltered()),
+			"winevent_manifest":    winevtChannelManifest(),
+			"winevent_stats":       winevtChannelStatsSnapshot(),
+			"host_metrics":         hostMetricsSnapshot(),
+			"live_query_tables":    liveQueryManifest(),
+			"elastic_parity":       elasticParitySnapshot(),
+			"dynamic_fim":          dynamicFIMCount(),
 		}
 		s["capture_health"] = computeCaptureHealthScore(s)
 		return s
@@ -215,6 +294,11 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 		useV2 := r.ProtocolSelected >= 2 && hasCap(r.EnabledCaps, "ingest.v2")
 		box.useV2.Store(useV2)
 		deltaCap.Store(useV2 && hasCap(r.EnabledCaps, "inventory.delta"))
+		box.snapshotParts.Store(useV2 && hasCap(r.EnabledCaps, "inventory.parts.v1"))
+		box.softwareExtended.Store(useV2 && hasCap(r.EnabledCaps, "inventory.parts.v1") && hasCap(r.EnabledCaps, "inventory.software.extended.v1"))
+		box.softwarePaged.Store(useV2 && hasCap(r.EnabledCaps, "inventory.parts.v1") && hasCap(r.EnabledCaps, "inventory.software.paged.v1"))
+		box.assetsPaged.Store(useV2 && hasCap(r.EnabledCaps, "inventory.parts.v1") && hasCap(r.EnabledCaps, "inventory.assets.paged.v1"))
+		box.usersPaged.Store(useV2 && hasCap(r.EnabledCaps, "inventory.parts.v1") && hasCap(r.EnabledCaps, "inventory.user.paged.v1"))
 		if b, err := json.Marshal(map[string]any{"proto": r.ProtocolSelected, "caps": r.EnabledCaps}); err == nil {
 			box.st.kvSet("negotiated", string(b))
 		}
@@ -277,6 +361,7 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 		cfg.AgentID, cfg.Modules, buildID, reg.ProtocolSelected, box.useV2.Load(), reg.ServerCaps)
 	if !cfg.Once {
 		go box.run(ctx, api)
+		startPlatformJournal(ctx, box, aidNow)
 	}
 
 	for k, v := range reg.IntervalsSec {
@@ -286,29 +371,51 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 	}
 
 	refreshCh := make(chan struct{}, 1)
-	responseEnabled := true
+	// 有界慢车道：心跳/同步/命令_OFFLOAD。快车道只记要与更新，慢任务单 worker 串行执行。
+	slow := newSlowLane(4)
+	// responseEnabled 由心跳/同步路径写、命令与实时管道读；用原子避免慢车道引入数据竞争
+	var responseEnabled atomic.Bool
+	responseEnabled.Store(true)
 	fimWanted, fimPaths := true, []string(nil)
 	var ruleFIMPaths []string
 	fimApplied := ""
+	// fimMu 保护 FIM 策略配置：applyPolicy（快车道）与 sync bundle（慢车道）都会改
+	var fimMu sync.Mutex
 
 	// syncFIM 按策略启停 FIM；自定义目录或规则目录变化时重启监控
 	syncFIM := func() {
 		if cfg.Once {
 			return
 		}
+		fimMu.Lock()
+		defer fimMu.Unlock()
+		fimEnabled := fimWanted && integrationEnabled("fim")
 		dyn := snapshotDynamicFIMPaths()
 		all := append(append(append([]string(nil), fimPaths...), ruleFIMPaths...), dyn...)
-		want := fmt.Sprintf("%v|%s", fimWanted, strings.Join(all, ";"))
+		want := fmt.Sprintf("%v|%s", fimEnabled, strings.Join(all, ";"))
 		if want == fimApplied {
 			return
 		}
 		fimApplied = want
 		if fim.running() {
+			recordComponentObservation("fim", cStateConfiguring, "restarting file integrity watcher with updated paths")
 			fim.stop()
 		}
-		if fimWanted {
+		if fimEnabled {
 			fim.setExtra(all)
+			recordComponentObservation("fim", cStateStarting, "file integrity watcher initialization in progress")
 			fim.start(ctx)
+			if fim.running() {
+				recordComponentObservation("fim", cStateHealthy, "file integrity watcher active")
+			} else {
+				recordComponentObservation("fim", cStateDegraded, "file integrity watcher did not become active")
+			}
+		} else {
+			message := "file integrity monitoring disabled by policy"
+			if fimWanted && !integrationEnabled("fim") {
+				message = "file integrity sensor disabled by integration policy"
+			}
+			recordComponentObservation("fim", cStateStopped, message)
 		}
 	}
 
@@ -316,6 +423,8 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 		if pol == nil {
 			return
 		}
+		setAppliedPolicy(pol)
+		fimMu.Lock()
 		if v, ok := pol["fim_enabled"].(bool); ok {
 			fimWanted = v
 		}
@@ -326,6 +435,16 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 					fimPaths = append(fimPaths, s)
 				}
 			}
+		}
+		fimMu.Unlock()
+		if arr, ok := pol["fim_web_roots"].([]any); ok {
+			roots := make([]string, 0, len(arr))
+			for _, x := range arr {
+				if s := strings.TrimSpace(asString(x)); s != "" {
+					roots = append(roots, s)
+				}
+			}
+			applyFIMWebRoots(roots)
 		}
 		if iv, ok := pol["intervals_sec"].(map[string]any); ok {
 			for k, v := range iv {
@@ -342,7 +461,7 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 			}
 		}
 		if v, ok := pol["response_enabled"].(bool); ok {
-			responseEnabled = v
+			responseEnabled.Store(v)
 		}
 		applyRemoteOpsPolicy(pol)
 		if v, ok := pol["timeline_process"].(bool); ok {
@@ -367,12 +486,29 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 			}
 		}
 		applyMemoryScanPolicy(pol)
+		applyDropScanPolicy(pol)
 		applyIntegrationsPolicy(pol)
 		applyLogTailPolicy(pol)
 		applyWineventChannelsPolicy(pol)
+		// 策略开启托管时补装/刷新 Sysmon，并重订 winevent 通道
+		if sysmonManagedEnabled() {
+			go func() {
+				st := ensureSysmonManaged(api)
+				if st != nil && (st["action"] == "installed" || st["action"] == "config_updated") {
+					if globalWinEvent != nil {
+						if dir := globalWinEvent.bookmarkDir; dir != "" {
+							_ = os.Remove(filepath.Join(dir, "sysmon.xml"))
+						}
+						globalWinEvent.restart(ctx)
+					}
+				}
+			}()
+		}
 	}
 	ruleFIMSyncFn = func(paths []string) {
+		fimMu.Lock()
 		setRuleFIMPathsFromSync(paths, &ruleFIMPaths)
+		fimMu.Unlock()
 	}
 
 	// 所有上行数据一律先落盘 outbox，再由后台发送器批量投递（崩溃/断网都不丢）
@@ -388,14 +524,45 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 		}
 		annotateEntities(events)
 		enrichTimelineEventsECS(events)
+		stampEventsSchema(events)
 		raw := make([]any, 0, len(events))
+		bySource := map[string]int{}
+		var acknowledgements []func()
 		for _, e := range events {
+			if source, ok := e[qualitySourceKey].(string); ok {
+				bySource[source]++
+			}
+			delete(e, qualitySourceKey)
+			if ack, ok := e[bookmarkAckKey].(func()); ok {
+				acknowledgements = append(acknowledgements, ack)
+			}
+			delete(e, bookmarkAckKey)
 			raw = append(raw, e)
 		}
-		box.enqueue(outTimeline, 80, map[string]any{
+		beforeDrops := box.dropped.Load()
+		committed := box.enqueue(outTimeline, 80, map[string]any{
 			"agent_id": aidNow(), "hostname": hostname(), "events": raw,
 		})
+		durable := committed && box.st != nil && box.st.path != ":memory:" && box.dropped.Load() == beforeDrops
+		for source, count := range bySource {
+			if durable {
+				captureAdd(source, "persisted", count)
+			} else {
+				captureAdd(source, "durability_unconfirmed", count)
+			}
+		}
+		if durable {
+			for _, ack := range acknowledgements {
+				ack()
+			}
+		}
 	}
+	spWatch.setEmit(func(ev map[string]any) {
+		if ev == nil {
+			return
+		}
+		pushTimeline([]map[string]any{ev})
+	})
 
 	responseEvent := func(sev, title, detail string, prio int) {
 		box.enqueue(outEvent, prio, map[string]any{
@@ -414,6 +581,16 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 			return
 		}
 		responseEvent("high", "处置失败："+act, detail, 90)
+	}
+
+	isUrgentCommand := func(action string) bool {
+		switch strings.ToLower(strings.TrimSpace(action)) {
+		case "kill_process", "quarantine_file", "restore_file", "pull_file", "sample_pull", "collect_sample",
+			"isolate_network", "unisolate_network", "uninstall_agent":
+			return true
+		default:
+			return false
+		}
 	}
 
 	handleCommands := func(cmds []agentCommand) {
@@ -436,39 +613,59 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 			// 2) 超过截止时间不再执行
 			if commandExpired(cmd.Deadline) {
 				res := map[string]any{"error": "deadline exceeded，命令已过期未执行"}
-				box.cmdBegin(cmd.ID, cmd.Action)
+				_ = box.cmdBegin(cmd.ID, cmd.Action)
 				box.cmdFinish(cmd.ID, false, res)
 				ackReliable(cmd.ID, false, res)
 				continue
 			}
-			if !responseEnabled && !isRemoteOpsAction(cmd.Action) &&
-				cmd.Action != "refresh_modules" && cmd.Action != "upgrade" && cmd.Action != "uninstall_agent" && cmd.Action != "scan_memory" {
+			if !responseEnabled.Load() && !isRemoteOpsAction(cmd.Action) &&
+				cmd.Action != "refresh_modules" && cmd.Action != "upgrade" && cmd.Action != "uninstall_agent" &&
+				cmd.Action != "scan_memory" && cmd.Action != "pull_file" && cmd.Action != "collect_diagnostics" {
 				res := map[string]any{"error": "response disabled by policy"}
-				box.cmdBegin(cmd.ID, cmd.Action)
+				_ = box.cmdBegin(cmd.ID, cmd.Action)
 				box.cmdFinish(cmd.ID, false, res)
 				ackReliable(cmd.ID, false, res)
 				continue
 			}
 			if !cmdSchedulerTry(cmd.Action) {
 				res := map[string]any{"error": "命令调度：与维护/扫描任务互斥，稍后重试"}
-				box.cmdBegin(cmd.ID, cmd.Action)
+				_ = box.cmdBegin(cmd.ID, cmd.Action)
 				box.cmdFinish(cmd.ID, false, res)
 				ackReliable(cmd.ID, false, res)
 				continue
 			}
-			defer cmdSchedulerDone(cmd.Action)
 			log.Printf("exec command %s action=%s attempt=%d", cmd.ID, cmd.Action, cmd.Attempt)
-			box.cmdBegin(cmd.ID, cmd.Action)
+			if !box.cmdBegin(cmd.ID, cmd.Action) && nonIdempotentAction(strings.ToLower(cmd.Action)) {
+				cmdSchedulerDone(cmd.Action)
+				fail := map[string]any{"error": "无法写入命令执行回执，已拒绝执行", "refused": true}
+				ackReliable(cmd.ID, false, fail)
+				emitCommandOutcome(cmd.Action, false, "no receipt", fail)
+				continue
+			}
 			res, err := execCommand(cfg, cmd)
+			cmdSchedulerDone(cmd.Action)
 			if err != nil {
 				log.Printf("command %s failed: %v", cmd.ID, err)
 				out := map[string]any{"error": err.Error(), "result": res}
-				box.cmdFinish(cmd.ID, false, out)
+				if !box.cmdFinish(cmd.ID, false, out) {
+					out["verification_required"] = true
+				}
 				ackReliable(cmd.ID, false, out)
 				emitCommandOutcome(cmd.Action, false, err.Error(), res)
 				continue
 			}
-			box.cmdFinish(cmd.ID, true, res)
+			if res["verification_required"] == true {
+				if !box.cmdFinish(cmd.ID, false, res) {
+					res["receipt_error"] = "execution result could not be durably recorded"
+				}
+				ackReliable(cmd.ID, false, res)
+				continue
+			}
+			if !box.cmdFinish(cmd.ID, true, res) {
+				uncertain := map[string]any{"verification_required": true, "error": "execution result could not be durably recorded"}
+				ackReliable(cmd.ID, false, uncertain)
+				continue
+			}
 			ackReliable(cmd.ID, true, res)
 			emitCommandOutcome(cmd.Action, true, mustJSON(res), res)
 			if cmd.Action == "refresh_modules" {
@@ -480,6 +677,44 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 		}
 	}
 
+	// 紧急处置独立 worker：不跟规则同步抢同一慢车道
+	urgentCh := make(chan []agentCommand, 16)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case batch := <-urgentCh:
+				handleCommands(batch)
+			}
+		}
+	}()
+
+	dispatchCommands := func(cmds []agentCommand) {
+		if len(cmds) == 0 {
+			return
+		}
+		var urgent, rest []agentCommand
+		for _, c := range cmds {
+			if isUrgentCommand(c.Action) {
+				urgent = append(urgent, c)
+			} else {
+				rest = append(rest, c)
+			}
+		}
+		if len(urgent) > 0 {
+			select {
+			case urgentCh <- urgent:
+			default:
+				// 通道满时仍走慢车道，避免丢命令
+				rest = append(urgent, rest...)
+			}
+		}
+		if len(rest) > 0 {
+			slow.offerCommands(rest)
+		}
+	}
+
 	// 策略：先应用本地 LKG（离线重启也保持上次有效策略），之后由心跳驱动原子生效/试用/回滚
 	bindEvmStore(box.st)
 	_ = loadEvmLKGOffline()
@@ -487,20 +722,42 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 		applyPolicy(p, 0)
 		syncFIM()
 	})
+	pm.setConfig(&cfg)
 	globalPolicyManager = pm
 	pm.boot()
 	startRootcheckLoop(ctx, box, aidNow)
 	startSCALoop(ctx, box, aidNow)
+
+	// 慢车道单 worker：同步与命令执行串行，绝不阻塞心跳主循环。
+	go slow.run(ctx, func(job slowLaneJob) {
+		switch job.kind {
+		case slowLaneSync:
+			maybeSyncFromServer(api, aidNow(), job.syncRev, pm, syncFIM)
+		case slowLaneCommands:
+			handleCommands(job.cmds)
+		}
+	})
+	// 启动后延迟一次全量同步，同样走慢车道，避免与心跳路径并发 applySyncBundle。
 	go func() {
 		time.Sleep(2 * time.Second)
-		maybeSyncFromServer(api, cfg.AgentID, 1<<30, pm, syncFIM)
+		slow.offerSync(1 << 30)
 	}()
 
+	var actualHeartbeatPeriod atomic.Int64
+	actualHeartbeatPeriod.Store(3)
 	healthSnap := func() map[string]any {
 		s := health.snapshot(box)
+		s["heartbeat_period_sec"] = int(actualHeartbeatPeriod.Load())
+		s["capture_quality"] = captureQualitySnapshot()
+		s["loop_quality"] = loopQualitySnapshot()
+		s["fim_root_health"] = rootHealthSnapshot()
+		s["inventory_quality"] = inventoryQualitySnapshot()
+		s["memory_scan_quality"] = memoryQualitySnapshot()
 		s["policy"] = pm.state()
 		s["fleet"] = fleetSnapshot(pm)
 		s["host"] = hostMetadata()
+		s["capability_status"] = capabilityStatusReport()
+		s["yara_compiled"] = yaraCompiled
 		if ud := upgradeDetailsSnapshot(cfg); ud != nil {
 			s["upgrade_details"] = ud
 		}
@@ -545,9 +802,19 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 					setIv(k, v)
 				}
 			}
-			pm.offer(hb.PolicyRev, hb.Policy)
-			maybeSyncFromServer(api, cfg.AgentID, hb.SyncRev, pm, syncFIM)
-			handleCommands(hb.Commands)
+			if pm.offer(hb.PolicyRev, hb.Policy) {
+				applyHeartbeatPolicyPatch(hb.Policy)
+				applyIntegrationsPolicy(hb.Policy)
+				dpDrv.applyPolicy(hb.Policy)
+			}
+			// 快车道只更新状态；同步走慢车道，紧急处置走独立通道
+			if !cfg.Once {
+				slow.offerSync(hb.SyncRev)
+				dispatchCommands(hb.Commands)
+			} else {
+				maybeSyncFromServer(api, cfg.AgentID, hb.SyncRev, pm, syncFIM)
+				handleCommands(hb.Commands)
+			}
 		}
 		if !cfg.Once {
 			return // 常驻模式由采集 goroutine 首轮全量采集，主循环不等
@@ -589,17 +856,41 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 	}
 
 	// 模块采集：首轮全量（lastRun 为空），之后按周期；refresh_modules 命令触发立即全量
-	// software/hotfix/driver 启动即全量会与传感器抢磁盘/CPU，首轮先占位等满周期再采
-	heavyFirst := map[string]bool{"software": true, "hotfix": true, "driver": true, "browser": true}
+	// 重模块（software 等）启动即采会抢 CPU，首轮延后并错开；但不再等满 30 分钟周期。
+	heavyFirst := map[string]bool{
+		"software": true, "hotfix": true, "driver": true, "netif": true, "groups": true,
+		"firewall": true, "shares": true, "certs": true, "usb": true,
+	}
 	go func() {
 		lastRun := map[string]time.Time{}
 		boot := time.Now()
-		// 首轮错开：启动 45s 后开始，每个模块间隔 20s，避免与 FIM/ETW 初始化同时拉起多个 PowerShell
+		// 首轮错开：轻模块约 45s 起；重模块约 90s 起，模块间间隔 20~25s
 		for i, mod := range cfg.Modules {
-			if heavyFirst[mod] {
-				continue
+			var firstAt time.Time
+			if runtime.GOOS == "linux" {
+				// Linux collection uses local procfs/package databases; send the first
+				// inventory promptly so a newly enrolled host is useful within seconds.
+				delay := 3*time.Second + time.Duration(i)*3*time.Second
+				switch mod {
+				case "sysinfo":
+					delay = 1 * time.Second
+				case "process":
+					delay = 3 * time.Second
+				case "network":
+					delay = 5 * time.Second
+				case "service":
+					delay = 8 * time.Second
+				case "task":
+					delay = 11 * time.Second
+				case "startup":
+					delay = 14 * time.Second
+				}
+				firstAt = boot.Add(delay)
+			} else if heavyFirst[mod] {
+				firstAt = boot.Add(90*time.Second + time.Duration(i)*25*time.Second)
+			} else {
+				firstAt = boot.Add(45*time.Second + time.Duration(i)*20*time.Second)
 			}
-			firstAt := boot.Add(45*time.Second + time.Duration(i)*20*time.Second)
 			lastRun[mod] = firstAt.Add(-ivOf(mod))
 		}
 		t := time.NewTicker(2 * time.Second)
@@ -612,12 +903,6 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 				now := time.Now()
 				if last, ok := lastRun[mod]; ok && !force && now.Sub(last) < ivOf(mod) {
 					continue
-				}
-				if !force {
-					if _, ok := lastRun[mod]; !ok && heavyFirst[mod] {
-						lastRun[mod] = boot
-						continue
-					}
 				}
 				reportModule(box, inv, aidNow(), mod, deltaCap.Load() && box.useV2.Load())
 				lastRun[mod] = time.Now()
@@ -655,8 +940,62 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 	liveTick := time.NewTicker(1 * time.Second)
 	defer liveTick.Stop()
 
+	// FIM 重挂独立 worker：fim.stop() 会 Wait 基线扫描，绝不能堵心跳
+	fimNeedSync := make(chan struct{}, 1)
+	requestFIMSync := func() {
+		select {
+		case fimNeedSync <- struct{}{}:
+		default:
+		}
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-fimNeedSync:
+				time.Sleep(2 * time.Second)
+				for i := 0; i < 64; i++ {
+					select {
+					case <-fimNeedSync:
+					default:
+						i = 64
+					}
+				}
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("syncFIM panic recovered: %v", r)
+						}
+					}()
+					syncFIM()
+				}()
+			}
+		}
+	}()
+
 	// pushLive 汇总各实时传感器缓冲并落 outbox
+	triggerQueue := newTriggerScanQueue()
+	go triggerQueue.run(ctx, func(job triggerScanJob) {
+		if !integrationEnabled("memory_scan") || memoryScanSettingsSnapshot().Mode != memModeYaraTriggered {
+			captureAdd("trigger_scan_requests", "disabled", 1)
+			return
+		}
+		started := time.Now()
+		defer func() { recordLoopDuration("trigger_scan_worker", time.Since(started), time.Second) }()
+		res := runTriggeredMemoryScanJob(job.pid, job.reason)
+		if res["ok"] == true && res["scan_status"] != "partial" {
+			recordComponentObservation("memory_scan", cStateHealthy, "event-triggered memory scan completed")
+		} else {
+			recordComponentObservation("memory_scan", cStateDegraded, "event-triggered memory scan incomplete")
+		}
+		if asInt(res["finding_count"]) > 0 {
+			enqueueMemoryFindings(box, aidNow(), res)
+		}
+	})
 	pushLive := func() {
+		started := time.Now()
+		defer func() { recordLoopDuration("live_cycle", time.Since(started), time.Second) }()
 		live := watch.drain()
 		live = append(live, etw.drain()...)
 		live = append(live, wevt.drain()...)
@@ -668,6 +1007,8 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 			live = append(live, logTailGlobal.drain()...)
 		}
 		live = append(live, kern.drain()...)
+		live = append(live, dpDrv.drain()...)
+		live = append(live, dropScan.drain()...)
 		if integrationEnabled("device") {
 			live = append(live, devw.drain()...)
 		}
@@ -678,33 +1019,56 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 			if et == "etw_status" || et == "winevent_status" {
 				sum, _ := ev["summary"].(string)
 				if strings.Contains(sum, "不可用") {
+					captureFiltered(ev)
 					continue
 				}
 			}
 			filtered = append(filtered, ev)
 		}
 		filtered = normalizeLiveProcessEvents(filtered)
-		filtered = processLiveEvents(filtered, cfg, responseEnabled, eventThrottle)
+		filtered = processLiveEvents(filtered, cfg, responseEnabled.Load(), eventThrottle)
+		filtered = enrichLateralEvents(filtered)
 		for _, ev := range filtered {
 			notePayloadFromEvent(ev)
 			correlateProcessWithPayload(ev)
+		}
+		// Save the existing telemetry before running potentially slow follow-up work.
+		pushTimeline(filtered)
+		for _, ev := range filtered {
+			dropScan.observe(ev)
+			enqueueDropScanAlert(box, aidNow(), ev)
 			if !integrationEnabled("memory_scan") {
 				continue
 			}
-			if res := runTriggeredMemoryScan(ev); res != nil {
-				if n, _ := res["finding_count"].(int); n > 0 {
-					enqueueMemoryFindings(box, aidNow(), res)
-				} else if fn, ok := res["finding_count"].(float64); ok && int(fn) > 0 {
-					enqueueMemoryFindings(box, aidNow(), res)
-				}
+			if pid, reason := memoryScanTriggeredByEvent(ev); pid > 0 {
+				triggerQueue.offer(pid, reason)
 			}
 		}
-		// 载荷临时 FIM：动态路径变化时重挂 FIM（与策略路径合并）
-		syncFIM()
-		pushTimeline(filtered)
+		// 动态 FIM 异步重挂，避免恶意样本风暴堵死心跳导致假掉线
+		requestFIMSync()
 	}
 
+	// 实时采集与心跳解耦：检出风暴时控制台仍保持 online
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-liveTick.C:
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("pushLive panic recovered: %v", r)
+						}
+					}()
+					pushLive()
+				}()
+			}
+		}
+	}()
+
 	var lastMemScheduledScan time.Time
+	lastIntegritySweep := time.Now()
 	go func() {
 		t := time.NewTicker(60 * time.Second)
 		defer t.Stop()
@@ -713,7 +1077,26 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				spWatch.tick()
 				ms := memoryScanSettingsSnapshot()
+				if integrationEnabled("memory_scan") && ms.Mode == memModeYaraScheduled {
+					recordComponentObservation("memory_scan", cStateHealthy, "scheduled memory scan worker active")
+				}
+				// 内存完整性巡检独立于 YARA 调度：默认「事件触发」模式下也定时全量检查
+				if ms.Mode != memModeYaraScheduled && ms.IntegrityChecks && integrationEnabled("memory_scan") {
+					iv := ms.IntegrityInterval
+					if iv <= 0 {
+						iv = 1800
+					}
+					if time.Since(lastIntegritySweep) >= time.Duration(iv)*time.Second {
+						lastIntegritySweep = time.Now()
+						if res := runIntegritySweep(); res != nil {
+							if fc, _ := res["finding_count"].(int); fc > 0 {
+								enqueueMemoryFindings(box, aidNow(), res)
+							}
+						}
+					}
+				}
 				if ms.Mode != memModeYaraScheduled {
 					continue
 				}
@@ -727,8 +1110,10 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 				lastMemScheduledScan = time.Now()
 				res, err := scanMemory(map[string]any{"trigger": "schedule"})
 				if err != nil {
+					recordComponentObservation("memory_scan", cStateDegraded, "scheduled memory scan failed: "+err.Error())
 					continue
 				}
+				recordComponentObservation("memory_scan", cStateHealthy, "scheduled memory scan completed")
 				if fc, _ := res["finding_count"].(int); fc > 0 {
 					enqueueMemoryFindings(box, aidNow(), res)
 				}
@@ -750,19 +1135,29 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 		return true
 	}
 
+	hbFailStreak := 0
+	// soft-offline / 启动离线时用短周期重试注册，避免等完整心跳拍导致「网通却不上线」
+	offlineRetry := time.NewTicker(5 * time.Second)
+	defer offlineRetry.Stop()
 	for {
 		if offline {
 			select {
 			case <-ctx.Done():
 				log.Println("agent 停止")
 				return nil
-			case <-hb.C:
-				// 离线启动：每个心跳周期补一次注册，成功后进入正常流程
+			case <-offlineRetry.C:
 				if reRegister() {
 					offline = false
+					hbFailStreak = 0
+					log.Printf("network/register recovered, back online")
 				}
-			case <-liveTick.C:
-				pushLive()
+			case scheduled := <-hb.C:
+				recordLoopDuration("heartbeat_schedule_delay", time.Since(scheduled), time.Duration(actualHeartbeatPeriod.Load())*time.Second)
+				if reRegister() {
+					offline = false
+					hbFailStreak = 0
+					log.Printf("network/register recovered, back online")
+				}
 			}
 			continue
 		}
@@ -770,18 +1165,28 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 		case <-ctx.Done():
 			log.Println("agent 停止")
 			return nil
-		case <-hb.C:
+		case <-offlineRetry.C:
+			// 在线时忽略短周期 ticker，仅消费避免堆积
+		case scheduled := <-hb.C:
+			recordLoopDuration("heartbeat_schedule_delay", time.Since(scheduled), time.Duration(actualHeartbeatPeriod.Load())*time.Second)
 			out, err := doHeartbeat()
 			if err != nil {
-				log.Printf("heartbeat: %v", err)
+				hbFailStreak++
+				log.Printf("heartbeat: %v (fail_streak=%d)", err, hbFailStreak)
 				if strings.Contains(err.Error(), "未知") {
 					reRegister()
 				} else if isCredentialRejected(err) {
 					// 服务端记录被删 / 数据库重建：独立凭据已失效，退回接入密钥重新注册
 					api.setCredential("", cfg.AgentID)
 					reRegister()
+				} else if hbFailStreak >= 3 {
+					// 连续失败：进入 soft-offline，5s 短周期重试注册（网络恢复后快速上线）
+					log.Printf("heartbeat soft-offline after %d failures, will re-register", hbFailStreak)
+					offline = true
+					hbFailStreak = 0
 				}
 			} else {
+				hbFailStreak = 0
 				noteServerRevs(out.SyncRev, out.PolicyRev)
 				if len(out.AckedCommandIDs) > 0 {
 					confirmHeartbeatAcks(out.AckedCommandIDs)
@@ -791,29 +1196,46 @@ func runAgent(ctx context.Context, cfg Config, cfgPath string) error {
 						setIv(k, v)
 					}
 				}
-				pm.offer(out.PolicyRev, out.Policy)
-				applyHeartbeatPolicyPatch(out.Policy)
+				if pm.offer(out.PolicyRev, out.Policy) {
+					applyHeartbeatPolicyPatch(out.Policy)
+					applyIntegrationsPolicy(out.Policy)
+					dpDrv.applyPolicy(out.Policy)
+				}
+				dpDrv.applyCrypto(out.DPCrypto)
 				pullMemoryYaraIfNeeded(out.MemoryYaraRev)
-				maybeSyncFromServer(api, cfg.AgentID, out.SyncRev, pm, syncFIM)
-				handleCommands(out.Commands)
+				// 快车道：同步走慢车道；紧急处置独立执行
+				slow.offerSync(out.SyncRev)
+				hadCmds := len(out.Commands) > 0
+				dispatchCommands(out.Commands)
 				if out.RuleFIMPaths != nil {
 					rp := out.RuleFIMPaths
 					if len(rp) > 20 {
 						rp = rp[:20]
 					}
-					if strings.Join(rp, ";") != strings.Join(ruleFIMPaths, ";") {
+					fimMu.Lock()
+					changed := strings.Join(rp, ";") != strings.Join(ruleFIMPaths, ";")
+					if changed {
 						ruleFIMPaths = append([]string(nil), rp...)
-						log.Printf("规则监控目录: %v", ruleFIMPaths)
-						syncFIM()
+					}
+					fimMu.Unlock()
+					if changed {
+						log.Printf("规则监控目录: %v", rp)
+						requestFIMSync()
 					}
 				}
-				if out.HeartbeatSec >= 3 && out.HeartbeatSec <= 120 && out.HeartbeatSec != hbSec {
-					hbSec = out.HeartbeatSec
+				nextHB := out.HeartbeatSec
+				// 刚拿到指令：下一拍用最短心跳，尽快 ACK / 取后续批次
+				if hadCmds {
+					nextHB = 3
+				}
+				if nextHB >= 3 && nextHB <= 120 && nextHB != hbSec {
+					hbSec = nextHB
+					actualHeartbeatPeriod.Store(int64(hbSec))
 					hb.Reset(time.Duration(hbSec) * time.Second)
+				} else if hadCmds {
+					hb.Reset(3 * time.Second)
 				}
 			}
-		case <-liveTick.C:
-			pushLive()
 		}
 	}
 }
@@ -862,24 +1284,107 @@ func hasCap(caps []string, want string) bool {
 }
 
 func reportModule(box *outbox, inv *inventory, agentID, module string, deltaOK bool) {
-	items, err := collectModule(module)
+	finishWork := beginComponentWork("inventory_" + module)
+	var items []any
+	var err error
+	limit := inventoryCollectionLimit(module)
+	if module == "software" {
+		if box.useV2.Load() && box.softwareExtended.Load() && box.snapshotParts.Load() {
+			limit = extendedSoftwareLimit
+		}
+		if box.useV2.Load() && box.softwarePaged.Load() && box.snapshotParts.Load() {
+			limit = pagedSoftwareLimit
+		}
+		items, err = collectSoftwareLimited(limit + 1)
+	} else if module == "service" || module == "hotfix" {
+		if box.useV2.Load() && box.assetsPaged.Load() && box.snapshotParts.Load() {
+			limit = pagedSoftwareLimit
+		}
+		if module == "service" {
+			items, err = collectServicesLimited(limit + 1)
+		} else {
+			items, err = collectHotfixLimited(limit + 1)
+		}
+	} else if module == "user" {
+		if box.useV2.Load() && box.usersPaged.Load() && box.snapshotParts.Load() {
+			limit = pagedSoftwareLimit
+		}
+		items, err = collectUsersLimited(limit + 1)
+	} else {
+		items, err = collectModule(module)
+	}
+	finishWork()
+	possibleTruncation := false
+	if module == "software" || module == "service" || module == "hotfix" || module == "user" {
+		items, possibleTruncation = boundInventoryProbe(items, limit)
+		possibleTruncation = recordInventoryQualityWithLimit(module, len(items), limit, possibleTruncation, err)
+	} else {
+		possibleTruncation = recordInventoryQuality(module, len(items), err)
+	}
 	if err != nil {
+		recordComponentObservation("inventory_"+module, cStateDegraded, err.Error())
 		log.Printf("[%s] collect: %v", module, err)
 		box.enqueue(outEvent, 90, map[string]any{
 			"agent_id": agentID, "module": module, "severity": "high",
-			"title": "采集失败：" + module, "detail": err.Error(),
+			"title": "采集失败：" + module,
+			"detail": map[string]any{
+				"collect_status": "error",
+				"error_code":     "collect_failed",
+				"message":        err.Error(),
+				"module":         module,
+			},
 		})
 		return
 	}
 	if items == nil {
 		items = []any{}
 	}
-	p := inv.plan(module, agentID, items, deltaOK)
+	if possibleTruncation {
+		recordComponentObservation("inventory_"+module, cStateDegraded, fmt.Sprintf("returned %d items at collection limit; previous authoritative snapshot retained", len(items)))
+		// An exact-cap result may be incomplete; do not turn a partial view into removals.
+		return
+	}
+	collectStatus := "ok"
+	if len(items) == 0 {
+		collectStatus = "empty"
+		recordComponentObservation("inventory_"+module, cStateHealthy, "collected empty (no data)")
+	} else {
+		recordComponentObservation("inventory_"+module, cStateHealthy, fmt.Sprintf("collected %d items", len(items)))
+	}
+	paged := (module == "software" && len(items) > extendedSoftwareLimit) || ((module == "service" || module == "hotfix" || module == "user") && len(items) > maxItems)
+	var p planned
+	if paged {
+		p = inv.planPaged(module, agentID, items)
+	} else {
+		p = inv.plan(module, agentID, items, deltaOK)
+	}
 	if p.skip {
 		return
 	}
+	if p.payload != nil {
+		if paged {
+			if module == "software" {
+				p.payload["paged_software"] = true
+			} else {
+				p.payload["paged_inventory"] = true
+			}
+			if raw, marshalErr := json.Marshal(p.payload); marshalErr != nil || len(raw) > snapshotPartsMaxBytes {
+				inv.invalidate(module, 0)
+				recordComponentObservation("inventory_"+module, cStateDegraded, "paged inventory exceeds transfer budget; previous snapshot retained")
+				return
+			}
+		}
+		p.payload["collect_status"] = collectStatus
+		if collectStatus == "empty" {
+			p.payload["error_code"] = ""
+		}
+	}
 	// 先落盘 outbox：全量会取代同模块旧全量与未发出的增量
-	box.enqueue(p.kind, 50, p.payload)
+	if !inv.enqueuePlan(module, p, box.enqueue) {
+		recordComponentObservation("inventory_"+module, cStateDegraded, "inventory enqueue failed; full snapshot required")
+		captureAdd("inventory_"+module, "enqueue_failed", 1)
+		return
+	}
 	if p.kind == outSnapshotDelta {
 		ups, _ := p.payload["upserts"].([]map[string]any)
 		rms, _ := p.payload["removes"].([]string)

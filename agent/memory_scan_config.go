@@ -21,6 +21,8 @@ type memoryScanSettings struct {
 	MaxProcesses      int
 	MaxRegionReadKB   int
 	ScheduleInterval  int
+	IntegrityChecks   bool
+	IntegrityInterval int
 	Triggers          map[string]bool
 	ExcludeSignedVend map[string]bool
 }
@@ -31,11 +33,15 @@ var (
 		Mode:             memModeYaraTriggered,
 		RulesRev:         "2026.10.31.1",
 		MaxProcesses:     20,
-		MaxRegionReadKB:  512,
-		ScheduleInterval: 1800,
+		MaxRegionReadKB:   512,
+		ScheduleInterval:  1800,
+		IntegrityChecks:   true,
+		IntegrityInterval: 1800,
 		Triggers: map[string]bool{
 			"remote_thread_kernel": true,
 			"process_access":       true,
+			"credential_access":    true,
+			"lateral_tool":         true,
 			"image_load_etw":       true,
 			"priv_escalation":      true,
 			"evm_hit":              true,
@@ -88,6 +94,12 @@ func applyMemoryScanPolicy(pol map[string]any) {
 	if n, ok := numberOf(raw["schedule_interval_sec"]); ok && n >= 300 {
 		memScan.ScheduleInterval = int(n)
 	}
+	if b, ok := raw["integrity_checks"].(bool); ok {
+		memScan.IntegrityChecks = b
+	}
+	if n, ok := numberOf(raw["integrity_interval_sec"]); ok && n >= 300 {
+		memScan.IntegrityInterval = int(n)
+	}
 	if arr, ok := raw["triggers"].([]any); ok {
 		tr := map[string]bool{}
 		for _, x := range arr {
@@ -126,6 +138,7 @@ func applyHeartbeatPolicyPatch(pol map[string]any) {
 	if ms, ok := pol["memory_scan"].(map[string]any); ok {
 		applyMemoryScanPolicy(map[string]any{"memory_scan": ms})
 	}
+	applyDropScanPolicy(pol)
 }
 
 func pullMemoryYaraIfNeeded(rev string) {

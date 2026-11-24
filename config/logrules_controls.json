@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "groups": {
+    "log_rules_curated": true,
+    "logrules_hayabusa": true,
+    "logrules_sigma": true
+  },
+  "sigma_min_level": "medium",
+  "max_no_eid": 240
+}

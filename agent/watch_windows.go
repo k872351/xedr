@@ -21,6 +21,7 @@ type processWatcher struct {
 	events  []map[string]any
 	cancel  context.CancelFunc
 	running bool
+	active  bool
 }
 
 func newProcessWatcher() *processWatcher {
@@ -46,7 +47,14 @@ func (w *processWatcher) stop() {
 		w.cancel()
 	}
 	w.running = false
+	w.active = false
 	w.mu.Unlock()
+}
+
+func (w *processWatcher) activeNow() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.active
 }
 
 func (w *processWatcher) drain() []map[string]any {
@@ -75,6 +83,11 @@ func (w *processWatcher) push(ev map[string]any) {
 }
 
 func (w *processWatcher) loop(ctx context.Context) {
+	defer func() {
+		w.mu.Lock()
+		w.active = false
+		w.mu.Unlock()
+	}()
 	ps := `
 $ErrorActionPreference='SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
@@ -173,9 +186,15 @@ while($true){
 			time.Sleep(5 * time.Second)
 			continue
 		}
+		w.mu.Lock()
+		w.active = true
+		w.mu.Unlock()
 		log.Printf("process watcher started (WMI)")
 		w.readLines(ctx, stdout)
 		_ = cmd.Wait()
+		w.mu.Lock()
+		w.active = false
+		w.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return

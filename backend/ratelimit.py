@@ -1,4 +1,4 @@
-"""登录失败限流（内存；多进程各自计数，仍能挡住单点爆破）。"""
+"""登录失败限流（进程内存 + 容量约束；多实例请在反代层叠加共享限流）。"""
 from __future__ import annotations
 import time
 import threading
@@ -12,15 +12,37 @@ _actions: Dict[str, Tuple[int, float]] = {}
 WINDOW = 600.0
 MAX_FAILS = 8
 LOCK_SECS = 900.0
+_MAX_KEYS = 20_000
 
 
 def _key(ip: str, username: str) -> str:
     return f"{(ip or '?').strip()[:64]}|{(username or '').strip().lower()[:64]}"
 
 
+def _prune_locked(now: float) -> None:
+    if len(_hits) + len(_lockout) + len(_actions) < _MAX_KEYS:
+        return
+    stale_hits = [k for k, (_, start) in _hits.items() if now - start > WINDOW]
+    for k in stale_hits[: max(1, len(stale_hits) // 2)]:
+        _hits.pop(k, None)
+    stale_lock = [k for k, until in _lockout.items() if until <= now]
+    for k in stale_lock:
+        _lockout.pop(k, None)
+    # 仍过大则淘汰最旧 half
+    if len(_hits) > _MAX_KEYS // 2:
+        ordered = sorted(_hits.items(), key=lambda kv: kv[1][1])
+        for k, _ in ordered[: len(ordered) // 2]:
+            _hits.pop(k, None)
+    if len(_lockout) > _MAX_KEYS // 2:
+        ordered = sorted(_lockout.items(), key=lambda kv: kv[1])
+        for k, _ in ordered[: len(ordered) // 2]:
+            _lockout.pop(k, None)
+
+
 def check_login_allowed(ip: str, username: str) -> None:
     now = time.time()
     with _lock:
+        _prune_locked(now)
         for k in (_key(ip, username), _key(ip, "*")):
             until = _lockout.get(k) or 0
             if until > now:
@@ -33,6 +55,7 @@ def check_login_allowed(ip: str, username: str) -> None:
 def record_login_failure(ip: str, username: str) -> None:
     now = time.time()
     with _lock:
+        _prune_locked(now)
         for k, threshold in ((_key(ip, username), MAX_FAILS), (_key(ip, "*"), MAX_FAILS * 3)):
             n, start = _hits.get(k) or (0, now)
             if now - start > WINDOW:
@@ -62,6 +85,7 @@ def check_action_allowed(
     now = time.time()
     k = f"action:{str(action)[:40]}:{str(key or '?')[:128]}"
     with _lock:
+        _prune_locked(now)
         n, start = _actions.get(k) or (0, now)
         if now - start >= window:
             n, start = 0, now

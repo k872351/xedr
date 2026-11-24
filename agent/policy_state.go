@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -45,6 +46,7 @@ var globalPolicyManager *policyManager
 
 type policyManager struct {
 	st    *stateDB
+	cfg   *Config
 	apply func(map[string]any)
 	now   func() time.Time
 
@@ -63,6 +65,12 @@ type policyManager struct {
 
 func newPolicyManager(st *stateDB, apply func(map[string]any)) *policyManager {
 	return &policyManager{st: st, apply: apply, now: time.Now, status: policyStatusNone}
+}
+
+func (pm *policyManager) setConfig(cfg *Config) {
+	pm.mu.Lock()
+	pm.cfg = cfg
+	pm.mu.Unlock()
 }
 
 func (pm *policyManager) loadDoc(k string) *policyDoc {
@@ -108,6 +116,10 @@ func (pm *policyManager) boot() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.lkg = pm.loadDoc(kvPolicyLKG)
+	if pm.lkg != nil && !pm.validStoredPolicy(pm.lkg) {
+		pm.lkg = nil
+		pm.status, pm.errMsg = policyStatusReject, "Stored LKG verification failed"
+	}
 	if b := pm.loadDoc(kvPolicyBad); b != nil {
 		pm.bad = b.Rev
 	}
@@ -118,6 +130,11 @@ func (pm *policyManager) boot() {
 	}
 	pend := pm.loadDoc(kvPolicyPending)
 	if pend == nil {
+		return
+	}
+	if !pm.validStoredPolicy(pend) {
+		pm.saveDoc(kvPolicyPending, nil)
+		pm.status, pm.errMsg = policyStatusReject, "Stored pending policy verification failed"
 		return
 	}
 	pend.Boots++
@@ -139,6 +156,11 @@ func (pm *policyManager) boot() {
 	pm.applied, pm.status, pm.since, pm.okBeats = pend.Rev, policyStatusProb, pm.now(), 0
 }
 
+func (pm *policyManager) validStoredPolicy(doc *policyDoc) bool {
+	return doc != nil && doc.Policy != nil && len(validatePolicy(doc.Policy)) == 0 &&
+		(pm.cfg == nil || verifyPolicySignature(*pm.cfg, doc.Rev, doc.Policy) == nil)
+}
+
 func (pm *policyManager) lkgLabel() string {
 	if pm.lkg == nil {
 		return "内置默认策略"
@@ -146,33 +168,55 @@ func (pm *policyManager) lkgLabel() string {
 	return fmt.Sprintf("LKG rev %d", pm.lkg.Rev)
 }
 
-// offer 心跳带来的服务端策略。
-func (pm *policyManager) offer(rev int, pol map[string]any) {
+// offer 尝试应用服务端策略。
+// 返回 true：pol 已是/已成为当前已接受策略，调用方才可用其对驱动/集成等做副作用应用。
+// 返回 false：无效或已拒绝，调用方必须忽略原始 pol（保留 LKG，不改驱动状态）。
+func (pm *policyManager) offer(rev int, pol map[string]any) bool {
 	if rev <= 0 || pol == nil {
-		return
+		return false
 	}
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.offered = rev
-	if rev == pm.applied || rev == pm.bad {
-		return
+	if rev == pm.applied {
+		if pm.cfg != nil && verifyPolicySignature(*pm.cfg, rev, pol) != nil {
+			return false
+		}
+		accepted := pm.loadDoc(kvPolicyPending)
+		if accepted == nil || accepted.Rev != rev {
+			accepted = pm.lkg
+		}
+		return accepted != nil && accepted.Rev == rev && bytes.Equal(policySignMessage(rev, accepted.Policy), policySignMessage(rev, pol))
+	}
+	if rev == pm.bad {
+		return false
+	}
+	if pm.cfg != nil {
+		if err := verifyPolicySignature(*pm.cfg, rev, pol); err != nil {
+			pm.bad = rev
+			pm.saveDoc(kvPolicyBad, &policyDoc{Rev: rev})
+			pm.status, pm.errMsg, pm.changedAt = policyStatusReject, "签名: "+err.Error(), pm.now()
+			log.Printf("策略 rev %d 签名校验失败，整份拒绝: %v", rev, err)
+			return false
+		}
 	}
 	if errs := validatePolicy(pol); len(errs) > 0 {
 		pm.bad = rev
 		pm.saveDoc(kvPolicyBad, &policyDoc{Rev: rev})
 		pm.status, pm.errMsg, pm.changedAt = policyStatusReject, strings.Join(errs, "；"), pm.now()
 		log.Printf("策略 rev %d 校验失败，整份拒绝: %s", rev, pm.errMsg)
-		return
+		return false
 	}
 	pm.saveDoc(kvPolicyPending, &policyDoc{Rev: rev, Policy: pol})
 	if err := pm.safeApply(pol); err != nil {
 		pm.applied = rev
 		pm.rollbackLocked(err.Error())
-		return
+		return false
 	}
 	pm.applied, pm.status, pm.errMsg = rev, policyStatusProb, ""
 	pm.since, pm.okBeats, pm.overCount, pm.changedAt = pm.now(), 0, 0, pm.now()
 	log.Printf("策略 rev %d 已生效，进入试用期 %s", rev, policyProbation)
+	return true
 }
 
 // heartbeatOK 每次心跳成功后调用；附带本进程资源占用用于试用期判定。
@@ -259,6 +303,7 @@ func defaultAgentPolicy() map[string]any {
 var policyBoolKeys = []string{
 	"response_enabled", "timeline_process", "timeline_file", "timeline_network", "self_protect",
 	"fim_enabled", "isolate_allow_server", "whitelist_skip_rules", "mysql_dual_write",
+	"sysmon_managed",
 }
 
 func numberOf(v any) (float64, bool) {

@@ -185,7 +185,9 @@ func (w *etwWatcher) runNative(ctx context.Context) error {
 	if err := s.EnableProvider(etw.Provider{GUID: guidKernelNetwork.String(), EnableLevel: 0xff, MatchAnyKeyword: 0x10}); err != nil {
 		log.Printf("etw: Kernel-Network 不可用: %v", err)
 	}
-	if err := s.EnableProvider(etw.Provider{GUID: guidKernelFile.String(), EnableLevel: 0xff, MatchAnyKeyword: 0x1000}); err != nil {
+	// Kernel-File：CREATE_NEW_FILE(0x1000)|RENAME(0x800)|DELETE_PATH(0x400)|CREATE(0x80)
+	// 与 FIM 对账，减少「改名绕过落地检测」；仍由 convertFile 做热路径过滤。
+	if err := s.EnableProvider(etw.Provider{GUID: guidKernelFile.String(), EnableLevel: 0xff, MatchAnyKeyword: 0x1C80}); err != nil {
 		log.Printf("etw: Kernel-File 不可用: %v", err)
 	}
 	// DNS-Client 事件关键字在高 32 位（含通道位），必须用 64 位全掩码
@@ -212,15 +214,43 @@ func (w *etwWatcher) runNative(ctx context.Context) error {
 		}
 	}
 
+	// 注册表写入方归属（不产出事件，只给 RegNotify 检出的变更补 PID）
+	if integrationEnabled("registry") {
+		if err := s.EnableProvider(etw.Provider{GUID: guidKernelRegistry.String(), EnableLevel: 0xff, MatchAnyKeyword: regETWKeywords}); err != nil {
+			log.Printf("etw: Kernel-Registry 不可用: %v", err)
+		} else {
+			regETW.active.Store(true)
+		}
+	}
+	// HTTP Host/URL（WinINet + WebIO/WinHTTP 栈）
+	if err := s.EnableProvider(etw.Provider{GUID: guidWinINet.String(), EnableLevel: 0xff, MatchAnyKeyword: winINetHTTPKeywords}); err != nil {
+		log.Printf("etw: WinINet 不可用: %v", err)
+	}
+	if err := s.EnableProvider(etw.Provider{GUID: guidWebIO.String(), EnableLevel: 0xff, MatchAnyKeyword: webIOAPIKeyword}); err != nil {
+		log.Printf("etw: WebIO 不可用: %v", err)
+	}
+	if err := setETWFlushTimer(etwSessionName, 1); err != nil {
+		log.Printf("etw: 设置刷新间隔失败（低频事件可能延迟）: %v", err)
+	}
+
 	st := newETWNativeState()
 	st.emit = w.push
+	beaconWatch.setEmit(w.push)
 	debugDNS := os.Getenv("FA_ETW_DEBUG") == "dns"
 	c := etw.NewRealTimeConsumer(ctx)
 	c.FromSessions(s)
+	c.PreparedCallback = func(h *etw.EventRecordHelper) error {
+		if h.EventRec.EventHeader.ProviderId.Equals(guidKernelRegistry) {
+			regETW.onPrepared(h)
+		}
+		return nil
+	}
 	c.EventRecordCallback = func(er *etw.EventRecord) bool {
 		id := er.EventHeader.EventDescriptor.Id
 		pg := &er.EventHeader.ProviderId
 		switch {
+		case pg.Equals(guidKernelRegistry):
+			return regETW.active.Load() && regETWWantIDs[id]
 		case pg.Equals(guidKernelProcess):
 			return etwWantIDs["process"][id]
 		case pg.Equals(guidKernelNetwork):
@@ -240,6 +270,10 @@ func (w *etwWatcher) runNative(ctx context.Context) error {
 			return integrationEnabled("api_etw") && wmiActivityEvents[id]
 		case pg.Equals(guidLDAPClient):
 			return integrationEnabled("api_etw") && ldapClientEvents[id]
+		case pg.Equals(guidWinINet):
+			return winINetWantIDs[id]
+		case pg.Equals(guidWebIO):
+			return webIOWantIDs[id]
 		}
 		return false
 	}
@@ -271,6 +305,7 @@ func (w *etwWatcher) runNative(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			regETW.active.Store(false)
 			_ = c.Stop()
 			_ = s.Stop()
 			return nil
@@ -346,6 +381,10 @@ func (st *etwNativeState) convert(e *etw.Event) map[string]any {
 		return st.convertWMIActivity(e, ts)
 	case "Microsoft-Windows-LDAP-Client":
 		return st.convertLDAPClient(e, ts)
+	case "Microsoft-Windows-WinINet":
+		return st.convertWinINet(e, ts)
+	case "Microsoft-Windows-WebIO":
+		return st.convertWebIO(e, ts)
 	}
 	return nil
 }
@@ -500,19 +539,31 @@ func (st *etwNativeState) convertThreatIntelAPI(e *etw.Event, ts string) map[str
 	}
 	p := st.proc(pid)
 	at := filetimeOf(e.System.TimeCreated.SystemTime)
+	tgtPID := propU32(e, "TargetProcessId")
 	detail := map[string]any{
 		"source": "threat_intel_etw", "pid": pid, "api_name": api,
-		"process_name": p.name, "target_pid": propU32(e, "TargetProcessId"),
+		"process_name": p.name, "target_pid": tgtPID,
 	}
 	enrichProcessExt(detail, at)
 	sev := "medium"
+	etype := "api_call"
+	sum := "内核 API: " + api + " " + p.name
 	switch api {
 	case "WriteProcessMemory", "VirtualProtect", "QueueUserAPC", "SetThreadContext":
 		sev = "high"
 	}
+	// 目标为 LSASS：升级为凭据访问信号，触发内存扫描
+	tgtName := strings.ToLower(st.proc(tgtPID).name)
+	if tgtPID != 0 && (tgtName == "lsass.exe" || strings.HasSuffix(tgtName, `\lsass.exe`)) {
+		sev = "high"
+		etype = "credential_access"
+		detail["target_name"] = "lsass.exe"
+		detail["technique"] = "T1003.001"
+		detail["credential_access"] = true
+		sum = "凭据访问(TI): " + p.name + " → lsass · " + api
+	}
 	return map[string]any{
-		"etype": "api_call", "summary": "内核 API: " + api + " " + p.name,
-		"severity": sev, "ts": ts, "detail": detail,
+		"etype": etype, "summary": sum, "severity": sev, "ts": ts, "detail": detail,
 	}
 }
 
@@ -645,7 +696,9 @@ func (st *etwNativeState) convertProcess(e *etw.Event, id uint16, ts string) map
 					"detail": detail,
 				}
 			}
-			if strings.HasSuffix(lowImg, ".dll") && pathLooksInterestingDLL(img) {
+			// .NET NGen 本机映像（*.ni.dll）由 ngen 在本机生成，天然无 Authenticode
+			if strings.HasSuffix(lowImg, ".dll") && pathLooksInterestingDLL(img) &&
+				!strings.Contains(lowImg, `\assembly\nativeimages_`) {
 				p := st.proc(pid)
 				at := e.System.TimeCreated.SystemTime
 				entID := ""
@@ -794,6 +847,9 @@ func (st *etwNativeState) convertProcess(e *etw.Event, id uint16, ts string) map
 			}
 		}
 		enrichLOLBinFields(detail)
+		attachFileMetaCached(detail, img)
+		winevtEnrichProcessImage(detail, img)
+		sev = bumpSeverityForFileMeta(sev, detail)
 		return map[string]any{
 			"etype": "process_create_etw", "summary": sum, "severity": sev, "ts": ts, "detail": detail,
 		}
@@ -864,6 +920,7 @@ func (st *etwNativeState) convertNetwork(e *etw.Event, ts string) map[string]any
 	atNet := filetimeOf(e.System.TimeCreated.SystemTime)
 	procEntities.annotate(detail, atNet)
 	attachHostProcessDetails(detail, atNet)
+	beaconWatch.observeNet(detail, e.System.TimeCreated.SystemTime)
 	return map[string]any{
 		"etype": "network_connect_etw", "summary": fmt.Sprintf("ETW外联: %s → %s", nameOr2(p.name, pid), target),
 		"severity": sev, "ts": ts, "detail": detail,
@@ -872,6 +929,9 @@ func (st *etwNativeState) convertNetwork(e *etw.Event, ts string) map[string]any
 
 func (st *etwNativeState) convertFile(e *etw.Event, ts string) map[string]any {
 	fp := st.dosPath(propStr(e, "FileName"))
+	if fp == "" {
+		fp = st.dosPath(propStr(e, "FilePath"))
+	}
 	if fp == "" || isAgentSelfNoisePath(fp) {
 		return nil
 	}
@@ -899,29 +959,57 @@ func (st *etwNativeState) convertFile(e *etw.Event, ts string) map[string]any {
 	if i := strings.LastIndexAny(fp, `\/`); i >= 0 {
 		base = fp[i+1:]
 	}
-	detail := map[string]any{"source": "etw", "path": fp, "name": base, "ext": ext, "pid": pid}
+	detail := map[string]any{
+		"source": "etw", "path": fp, "name": base, "ext": ext, "pid": pid,
+		"event_id": e.System.EventID,
+	}
 	if pname != "" {
 		detail["process_name"] = pname
 	}
 	if entID != "" {
 		detail["entity_id"] = entID
 	}
-	// 投放区可执行/脚本落地：时间线记录；后台只对脚本类晋升告警
+	// Kernel-File：12/14 创建类；26 删除；27 重命名（关键字 0x1000 以创建为主，有则尽量区分）
+	etype := "file_create"
 	sev := "info"
 	sum := "ETW文件创建: " + base
-	if pathAtDriveRoot(fp) && hotFileExt[ext] {
-		sev = "high"
-		sum = "盘符根目录文件创建: " + base
-	} else if pathInDropZone(fp) {
+	switch e.System.EventID {
+	case 26:
+		etype = "file_delete"
 		sev = "medium"
-		sum = "ETW可疑目录文件创建: " + base
-		switch ext {
-		case ".ps1", ".vbs", ".js", ".jse", ".hta", ".bat", ".cmd", ".scr", ".wsf":
+		sum = "ETW文件删除: " + base
+	case 27:
+		etype = "file_rename"
+		sev = "medium"
+		sum = "ETW文件重命名: " + base
+		if np := st.dosPath(propStr(e, "FileName")); np != "" && !strings.EqualFold(np, fp) {
+			detail["new_path"] = np
+		}
+	default:
+		if pathAtDriveRoot(fp) && hotFileExt[ext] {
 			sev = "high"
+			sum = "盘符根目录文件创建: " + base
+		} else if pathInDropZone(fp) {
+			sev = "medium"
+			sum = "ETW可疑目录文件创建: " + base
+			switch ext {
+			case ".ps1", ".vbs", ".js", ".jse", ".hta", ".bat", ".cmd", ".scr", ".wsf":
+				sev = "high"
+			}
+		}
+		attachFileMetaCached(detail, fp)
+		if next := bumpSeverityForFileMeta(sev, detail); next != sev {
+			sev = next
+			if sev == "high" && pathInDropZone(fp) && peExtHot(fp) {
+				sum = "ETW可疑文件创建(MOTW/加壳): " + base
+			}
 		}
 	}
+	if etype != "file_create" && pathInDropZone(fp) {
+		sev = "high"
+	}
 	return map[string]any{
-		"etype": "file_create", "summary": sum, "severity": sev, "ts": ts,
+		"etype": etype, "summary": sum, "severity": sev, "ts": ts,
 		"detail": detail,
 	}
 }
@@ -948,7 +1036,10 @@ func pathLooksInterestingDriver(p string) bool {
 
 func pathInDropZone(p string) bool {
 	l := strings.ToLower(p)
-	for _, k := range []string{`\temp\`, `\tmp\`, `\downloads\`, `\users\public\`} {
+	for _, k := range []string{
+		`\temp\`, `\tmp\`, `\downloads\`, `\users\public\`, `\desktop\`,
+		`\inetpub\`, `\wwwroot\`,
+	} {
 		if strings.Contains(l, k) {
 			return true
 		}

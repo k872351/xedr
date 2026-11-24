@@ -1,6 +1,22 @@
 # FaKmon 内核监控驱动
 
-**默认安装包不再下发、不安装本驱动**（测试过程有蓝屏风险；生产需正式签名与充分验证）。
+**默认安装包不下发、不安装本驱动**（蓝屏风险；生产需 EV/Attestation 签名）。
+图形安装器（`Install-GUI.ps1`）可勾选「可选驱动」——仅当包内附带 `fakmon.sys` 时才会 `sc create/start`。
+
+## 与 DataProtector 的分层对齐（只学架构，不拷 GPL 代码）
+
+开源 DataProtector 把重检测放在用户态，内核做事件发现与可选阻断：
+`minifilter` 透明保护、`ObRegisterCallbacks` 凭据/自保护、`WFP` 网络、LateralDefense 等。
+
+本仓库对应策略：
+
+| 能力 | 用户态（默认） | 内核（FaKmon 可选） |
+| --- | --- | --- |
+| 横向移动 | Winlog 5140–5145 + 命令行规则（schtasks/sc/wmic/WinRM/PsExec） | 不仿 LateralDefense 阻断 |
+| Web/脚本落地 | FIM Web 根 + dropScan | — |
+| 凭据访问 | Sysmon 10 + Threat-Intelligence ETW → 内存扫描 | ObRegister 打开 lsass |
+| 文件改名绕过 | Kernel-File ETW 重命名/删除 + FIM | — |
+| 自保护 | 用户态服务监视 | ObRegister / 注册表回调 |
 
 以下为实验室可选能力：驱动加载后 Agent 可上报 `kernel_*` 时间线；未加载时使用 ETW / WMI / 事件日志等用户态采集，不影响运行。
 

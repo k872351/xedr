@@ -28,8 +28,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from . import config
+from .sqlite_schema_tools import _col_exists, _add_col
+from .agent_event_detail import fit_detail, _detail_richer
+from .agent_package_builder import agent_binary_path, build_install_package, clear_install_package_cache
 
-_pkg_lock = threading.Lock()
 
 # Agent 默认同步模块（与 forensic 侧栏对齐，先做高价值轻量项）
 AGENT_MODULES = (
@@ -41,11 +43,16 @@ AGENT_MODULES = (
     "process",
     "file",   # 高危目录近期文件
     "user",   # 本地用户 / 登录会话
-    "software",  # 已装软件清单
+    "software",  # 已装软件清单（HKLM/HKCU/AppX）
     "hotfix",    # 补丁 KB
     "listen",    # 监听端口
     "driver",    # 内核/文件系统驱动
-    "browser",   # 浏览器访问记录
+    "netif",     # 网卡 / IP / 网关
+    "groups",    # 本地用户组
+    "firewall",  # 防火墙启用规则
+    "shares",    # SMB 共享
+    "certs",     # 计算机证书
+    "usb",       # USB 设备快照
 )
 
 # 采集周期（秒）——威胁相关模块尽量压到秒级，抓住黄金时间
@@ -63,7 +70,12 @@ MODULE_INTERVAL_SEC = {
     "hotfix": 7200,
     "listen": 300,
     "driver": 1800,
-    "browser": 900,
+    "netif": 600,
+    "groups": 900,
+    "firewall": 900,
+    "shares": 900,
+    "certs": 1800,
+    "usb": 600,
 }
 
 PROTOCOL_VERSION = 1
@@ -73,6 +85,11 @@ DB_NAME = "agents.db"
 SERVER_PROTOCOL_MIN = 1
 SERVER_PROTOCOL_MAX = 2
 SERVER_CAPABILITIES = (
+    "inventory.parts.v1",
+    "inventory.software.extended.v1",
+    "inventory.software.paged.v1",
+    "inventory.assets.paged.v1",
+    "inventory.user.paged.v1",
     "snapshot.v1",
     "timeline.v1",
     "command.ack.v1",
@@ -80,6 +97,8 @@ SERVER_CAPABILITIES = (
     "sensor.etw",
     "sensor.wevt",
     "upgrade.replace",
+    "upgrade.ed25519",
+    "upgrade.watchdog",
     # 阶段1
     "ingest.v2",          # POST /api/agent/v2/events/batch 幂等批量上报
     "auth.agent_secret",  # 每 Agent 独立凭据
@@ -93,7 +112,22 @@ SERVER_CAPABILITIES = (
     # 阶段3
     "inventory.delta",    # snapshot_delta：按 generation 链应用增量清单
     "policy.lkg",         # Agent 心跳回报策略生效/试用/拒绝/回滚状态
-    "sync.v1",            # POST /api/agent/sync 统一配置/规则增量
+    "sync.v1",
+    "fleet.checkin.v1",
+    "diagnostics.v2",
+    "composable.host.v1",
+    "event.schema.v1",
+    # Platform-recognized build capabilities (kept explicit for negotiation).
+    "memory.integrity.v1", "file.meta.v1", "http.etw.v1", "beacon.watch.v1",
+    "response.persist.v1", "policy.sign.v1", "self.protect.watch.v1",
+    "fim.polling.v1", "inventory.kernel_module.v1",
+    "inventory.process.procfs.v1", "inventory.network.procfs.v1",
+    "inventory.services.systemd_units.linux.v1",
+    "inventory.tasks.cron_systemd.linux.v1", "inventory.startup.linux.v1",
+    "rules.linux.process_snapshot.v1",
+    "inventory.software.linux.v1", "inventory.package_updates.linux.v1",
+    "rootcheck.linux.v1", "sca.linux.v1", "response.kill_process.linux.v1",
+    "response.quarantine_file.linux.v1", "sensor.linux.journal.v1",
 )
 
 
@@ -336,15 +370,6 @@ def db_path() -> Path:
     return d / DB_NAME
 
 
-def _col_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
-    return any(r[1] == col for r in conn.execute(f"PRAGMA table_info({table})").fetchall())
-
-
-def _add_col(conn: sqlite3.Connection, table: str, col: str, ddl: str) -> None:
-    if not _col_exists(conn, table, col):
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
-
-
 def _mig_001_agent_build_protocol(conn: sqlite3.Connection) -> None:
     """agents 增加构建号/源码指纹/协议协商/能力列。"""
     _add_col(conn, "agents", "build_id", "TEXT DEFAULT ''")
@@ -494,6 +519,33 @@ def _mig_011_event_hit_count(conn: sqlite3.Connection) -> None:
     _add_col(conn, "agent_events", "hit_count", "INTEGER DEFAULT 1")
     conn.execute("UPDATE agent_events SET hit_count=1 WHERE hit_count IS NULL OR hit_count < 1")
 
+def _mig_012_heartbeat_period_and_index_outbox(conn: sqlite3.Connection) -> None:
+    _add_col(conn, "agents", "heartbeat_period_sec", "INTEGER DEFAULT 3")
+    _add_col(conn, "agents", "last_heartbeat_at", "TEXT DEFAULT ''")
+    _add_col(conn, "agents", "last_telemetry_at", "TEXT DEFAULT ''")
+    conn.execute("INSERT OR IGNORE INTO agent_meta(key,value) VALUES('sync_revision',?)",
+                 (str(int(time.time() // 60)),))
+    from .es_event_queue import ensure_transactional_schema
+    ensure_transactional_schema(conn)
+
+def _mig_013_snapshot_parts(conn: sqlite3.Connection) -> None:
+    from .agent_snapshot_parts import ensure_schema
+    ensure_schema(conn)
+
+
+def _mig_014_approval_command_guard(conn: sqlite3.Connection) -> None:
+    # Prevent new duplicate approval commands without deleting historical rows.
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS approval_command_once
+        BEFORE INSERT ON agent_commands
+        WHEN substr(NEW.idempotency_key,1,9)='approval:' AND EXISTS (
+            SELECT 1 FROM agent_commands WHERE idempotency_key=NEW.idempotency_key)
+        BEGIN SELECT RAISE(ABORT,'approval command already exists'); END""")
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS approval_command_key_immutable
+        BEFORE UPDATE OF idempotency_key ON agent_commands
+        WHEN NEW.idempotency_key IS NOT OLD.idempotency_key AND
+             (substr(OLD.idempotency_key,1,9)='approval:' OR substr(NEW.idempotency_key,1,9)='approval:')
+        BEGIN SELECT RAISE(ABORT,'approval command key is immutable'); END""")
+
 
 _MIGRATIONS = (
     (1, "agent build/protocol columns", _mig_001_agent_build_protocol),
@@ -507,6 +559,9 @@ _MIGRATIONS = (
     (9, "event deletion marks", _mig_009_event_deletions),
     (10, "event triage notes", _mig_010_event_notes),
     (11, "event hit_count", _mig_011_event_hit_count),
+    (12, "heartbeat period and transactional ES outbox", _mig_012_heartbeat_period_and_index_outbox),
+    (13, "bounded snapshot staging", _mig_013_snapshot_parts),
+    (14, "approval command identity guard", _mig_014_approval_command_guard),
 )
 SCHEMA_VERSION = _MIGRATIONS[-1][0]
 _migrated_paths: set = set()
@@ -879,118 +934,14 @@ def credential_summary() -> Dict[str, Any]:
     }
 
 
-def agent_binary_path() -> Optional[Path]:
-    """优先仓库编译产物，其次 tools 目录投放。"""
-    candidates = [
-        Path(config.ROOT) / "agent" / "forensic-agent.exe",
-        Path(config.ROOT) / "tools" / "agent" / "forensic-agent.exe",
-        Path(getattr(config, "REPORTS_DIR", config.ROOT / "reports")) / "agent" / "forensic-agent.exe",
-    ]
-    for p in candidates:
-        if p.is_file() and p.stat().st_size > 100_000:
-            return p
-    return None
 
 
-def _package_cache_dir() -> Path:
-    d = Path(config.REPORTS_DIR) / "agent_packages"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
 
 
-def clear_install_package_cache() -> int:
-    """删除已缓存的安装 zip（Agent/驱动更新后需重新打包容）。"""
-    n = 0
-    for p in _package_cache_dir().glob("pkg_*.zip"):
-        try:
-            p.unlink()
-            n += 1
-        except OSError:
-            pass
-    return n
 
 
-def build_install_package(*, server_url: str) -> Tuple[Union[bytes, Path], str]:
-    """生成开箱即用安装包：exe + agent.json + install 脚本。
 
-    优化：
-    - exe 用 ZIP_STORED（已压缩 PE，再 DEFLATE 又慢又几乎不缩小）
-    - 按 exe mtime + 接入密钥 + 平台地址 磁盘缓存，二次下载近乎秒开
-    返回 (Path 缓存文件 | bytes, 下载文件名)。
-    """
-    exe = agent_binary_path()
-    if not exe:
-        raise FileNotFoundError(
-            "缺少 forensic-agent.exe，请先在服务器编译 agent/ 或放到 tools/agent/"
-        )
-    base = str(server_url or "").strip().rstrip("/")
-    if not base:
-        raise ValueError("server_url 为空")
-    # 去掉前端 path（/app、/a）
-    for suf in ("/app", "/a"):
-        if base.lower().endswith(suf):
-            base = base[: -len(suf)].rstrip("/")
-    key = get_or_create_enroll_key()
-    from . import agent_release
-    rel = agent_release.release_status(exe)
-    manifest = agent_release.load_manifest(exe)
-    from .agent_install_scripts import install_bat, install_vbs, readme_text, uninstall_bat
 
-    cache_key = hashlib.sha1(
-        f"{rel['exe_sha256']}|{base}|{key}|{rel.get('build_id','')}|v6-agent-only".encode("utf-8")
-    ).hexdigest()[:20]
-    tag = str(rel.get("build_id") or rel.get("source_version") or "unverified").replace("+", "-")
-    name = f"ForensicAgent_{tag}_{time.strftime('%Y%m%d')}.zip"
-    cache_path = _package_cache_dir() / f"pkg_{cache_key}.zip"
-
-    with _pkg_lock:
-        if cache_path.is_file() and cache_path.stat().st_size > 100_000:
-            return cache_path, name
-
-        cfg = {
-            "server_url": base,
-            "token": key,
-            "modules": list(AGENT_MODULES),
-            "intervals_sec": dict(MODULE_INTERVAL_SEC),
-        }
-        bat_main = install_bat()
-        bat_vbs = install_vbs()
-        bat_un = uninstall_bat()
-        readme = readme_text(base=base, rel=rel)
-
-        tmp = cache_path.with_suffix(".tmp")
-        try:
-            with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-                zf.writestr("ForensicAgent/agent.json", json.dumps(cfg, ensure_ascii=False, indent=2))
-                zf.writestr("ForensicAgent/install.bat", bat_main)
-                zf.writestr("ForensicAgent/install.vbs", bat_vbs)
-                zf.writestr("ForensicAgent/uninstall.bat", bat_un)
-                zf.writestr("ForensicAgent/README.txt", readme)
-                if manifest:
-                    zf.writestr("ForensicAgent/build-manifest.json",
-                                json.dumps(manifest, ensure_ascii=False, indent=2))
-                # PE 再压缩收益极低，STORE 可把打包从数百毫秒～数秒降到接近拷贝
-                zf.write(exe, arcname="ForensicAgent/forensic-agent.exe", compress_type=zipfile.ZIP_STORED)
-            tmp.replace(cache_path)
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-            raise
-
-        # 只保留最近几个缓存，避免占盘
-        try:
-            pkgs = sorted(_package_cache_dir().glob("pkg_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for old in pkgs[8:]:
-                try:
-                    old.unlink()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        return cache_path, name
 
 
 def protocol_info() -> Dict[str, Any]:
@@ -1038,29 +989,26 @@ def register_agent(payload: Dict[str, Any], *, cred: str = "user") -> Dict[str, 
     with _lock:
         conn = _connect()
         try:
-            # 无 agent_id 时按主机名复用，避免重装/升级产生僵尸离线记录
-            if not agent_id and hostname:
-                row = conn.execute(
-                    "SELECT agent_id FROM agents WHERE LOWER(hostname)=LOWER(?) ORDER BY last_seen DESC LIMIT 1",
-                    (hostname,),
-                ).fetchone()
-                if row:
-                    agent_id = str(row["agent_id"])
+            # 主机名仅作展示，不作身份依据：无 agent_id 时签发全新身份，
+            # 避免同名机器串档；同一台覆盖安装须携带原 agent_id 与凭据。
             if not agent_id:
                 agent_id = uuid.uuid4().hex
-            prev = conn.execute("SELECT revoked FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
+            prev = conn.execute("SELECT revoked, secret_hash FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
+            if prev and prev["secret_hash"] and cred == "enroll":
+                return {"ok": False, "error": "Existing agent requires its enrolled credential"}
             if prev and prev["revoked"]:
                 return {"ok": False, "error": "该 Agent 已被吊销，请管理员恢复或删除记录后重新安装"}
             conn.execute(
                 """INSERT INTO agents(agent_id, hostname, os_family, ip, version, last_seen, status, meta_json)
-                   VALUES(?,?,?,?,?,?, 'online', ?)
+                   VALUES(?,?,?,?,?,?, 'offline', ?)
                    ON CONFLICT(agent_id) DO UPDATE SET
                      hostname=excluded.hostname,
                      os_family=excluded.os_family,
                      ip=excluded.ip,
                      version=excluded.version,
                      last_seen=excluded.last_seen,
-                     status='online'""",
+                     status='offline',
+                     last_heartbeat_at=''""",
                 (agent_id, hostname, os_family, ip, version, now, json.dumps({"registered": now}, ensure_ascii=False)),
             )
             conn.execute(
@@ -1077,6 +1025,21 @@ def register_agent(payload: Dict[str, Any], *, cred: str = "user") -> Dict[str, 
         finally:
             conn.close()
     bump_live("register", agent_id=agent_id)
+    try:
+        from . import agent_store
+        agent_store.write_agent({
+            "agent_id": agent_id,
+            "hostname": hostname,
+            "os_family": os_family,
+            "ip": ip,
+            "version": version,
+            "status": "offline",
+            "last_seen": now,
+            "capabilities_json": neg.get("enabled_caps") or [],
+            "updated_at": now,
+        })
+    except Exception:
+        pass
     return {
         "ok": True,
         "agent_id": agent_id,
@@ -1104,6 +1067,29 @@ def _host_meta_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def bounded_health_json(health: Dict[str, Any], limit: int = 60000) -> str:
+    """Keep a valid object; drop whole optional sections rather than slicing JSON."""
+    data = dict(health)
+    def encode():
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    raw = encode()
+    if len(raw.encode("utf-8")) <= limit:
+        return raw
+    required = {"capture_quality", "fim_root_health", "inventory_quality", "memory_scan_quality", "loop_quality",
+                "cpu_pct", "rss_mb", "outbox", "heartbeat_period_sec", "fleet_report"}
+    candidates = sorted(data, key=lambda key: (key in required, -len(json.dumps(data[key], ensure_ascii=False))))
+    omitted = []
+    for key in candidates:
+        data.pop(key, None)
+        omitted.append(key)
+        data["health_truncated"] = True
+        data["health_omitted_sections"] = omitted
+        raw = encode()
+        if len(raw.encode("utf-8")) <= limit:
+            return raw
+    return '{"health_truncated":true}'
+
+
 def _store_health(conn: sqlite3.Connection, agent_id: str, payload: Dict[str, Any], now: str) -> None:
     """保存 Agent 自报健康（CPU/内存/spool/传感器），并按 agent_ts 估算时钟偏差。"""
     health = payload.get("health")
@@ -1125,7 +1111,7 @@ def _store_health(conn: sqlite3.Connection, agent_id: str, payload: Dict[str, An
         skew = round(time.time() - float(ats), 1) if ats.replace(".", "", 1).isdigit() else 0.0
     except Exception:
         skew = 0.0
-    blob = json.dumps(health, ensure_ascii=False)[:12000]
+    blob = bounded_health_json(health)
     conn.execute(
         "UPDATE agents SET health_json=?, health_at=?, clock_skew_sec=? WHERE agent_id=?",
         (blob, now, skew, agent_id),
@@ -1156,20 +1142,43 @@ def heartbeat(payload: Dict[str, Any]) -> Dict[str, Any]:
                     acked_ids.append(cid)
         except Exception as e:
             print("[agent] heartbeat command_acks:", e)
+    hb_row = None
     with _lock:
         conn = _connect()
         try:
             cur = conn.execute(
-                "UPDATE agents SET last_seen=?, status='online', ip=COALESCE(NULLIF(?, ''), ip) WHERE agent_id=?",
-                (now, str(payload.get("ip") or "").strip()[:64], agent_id),
+                "UPDATE agents SET last_seen=?, last_heartbeat_at=?, status='online', ip=COALESCE(NULLIF(?, ''), ip) WHERE agent_id=?",
+                (now, now, str(payload.get("ip") or "").strip()[:64], agent_id),
             )
             if cur.rowcount > 0:
                 _store_health(conn, agent_id, payload, now)
             conn.commit()
             if cur.rowcount <= 0:
                 return {"ok": False, "error": "未知 agent，请先 register"}
+            hb_row = conn.execute(
+                "SELECT hostname, os_family, ip, version, health_json, capabilities_json FROM agents WHERE agent_id=?",
+                (agent_id,),
+            ).fetchone()
         finally:
             conn.close()
+    try:
+        from . import agent_store
+        payload_health = payload.get("health") if isinstance(payload.get("health"), dict) else None
+        agent_store.write_agent({
+            "agent_id": agent_id,
+            "hostname": (hb_row["hostname"] if hb_row else "") or "",
+            "os_family": (hb_row["os_family"] if hb_row else "") or "",
+            "ip": str(payload.get("ip") or (hb_row["ip"] if hb_row else "") or "")[:64],
+            "version": (hb_row["version"] if hb_row else "") or "",
+            "status": "online",
+            "last_seen": now,
+            "health_json": payload_health if payload_health is not None else ((hb_row["health_json"] if hb_row else "") or ""),
+            "health_at": now if payload_health is not None else "",
+            "capabilities_json": (hb_row["capabilities_json"] if hb_row else "") or "",
+            "updated_at": now,
+        })
+    except Exception:
+        pass
     out: Dict[str, Any] = {
         "ok": True,
         "server_time": now,
@@ -1200,6 +1209,11 @@ def heartbeat(payload: Dict[str, Any]) -> Dict[str, Any]:
             out["intervals_sec"] = {**MODULE_INTERVAL_SEC, **pol["intervals_sec"]}
         if isinstance(pol.get("heartbeat_sec"), int) and 3 <= pol["heartbeat_sec"] <= 120:
             out["heartbeat_sec"] = int(pol["heartbeat_sec"])
+        # bundle 在有待执行命令时会覆盖为 3 秒
+        if isinstance(bundle.get("heartbeat_sec"), int) and 3 <= bundle["heartbeat_sec"] <= 120:
+            out["heartbeat_sec"] = int(bundle["heartbeat_sec"])
+        if bundle.get("commands"):
+            out["heartbeat_sec"] = 3
     except Exception as e:
         print("[agent_edr] heartbeat bundle:", e)
     srv_sync = int(out.get("sync_rev") or 0)
@@ -1208,15 +1222,75 @@ def heartbeat(payload: Dict[str, Any]) -> Dict[str, Any]:
     out["policy_applied"] = agent_pa and (srv_sync <= 0 or local_sync >= srv_sync)
     out["server_policy_rev"] = int(out.get("policy_rev") or 0)
     out["server_sync_rev"] = srv_sync
+    # 策略对账：消费 Agent 自报的 applied-rev/status，检测漂移并记录。
+    # 仅做检测+审计+状态暴露；策略下发仍走心跳拉取式，不主动推送。
+    try:
+        from . import policy_reconcile as recon
+        rec = recon.evaluate(
+            payload,
+            server_policy_rev=int(out.get("policy_rev") or 0),
+            server_sync_rev=srv_sync,
+            policy_applied=bool(out.get("policy_applied")),
+        )
+        out["policy_reconcile"] = rec
+        if rec.get("state") in ("rejected", "rolled_back", "behind"):
+            with _lock:
+                rc = _connect()
+                try:
+                    recon.maybe_audit(rc, agent_id, rec)
+                    rc.commit()
+                finally:
+                    rc.close()
+    except Exception as e:
+        print("[policy_reconcile] heartbeat:", e)
+    # The effective period is a server policy value, bounded to the supported range.
+    # Preserve the previous longer period when the agent reports it still in use.
+    reported = payload.get("health") or {}
+    actual = reported.get("heartbeat_period_sec") if isinstance(reported, dict) else None
+    period = max(normalize_heartbeat_period(actual), normalize_heartbeat_period(out.get("heartbeat_sec")))
+    with _lock:
+        conn = _connect()
+        try:
+            conn.execute("UPDATE agents SET heartbeat_period_sec=? WHERE agent_id=?", (period, agent_id))
+            conn.commit()
+        finally:
+            conn.close()
     bump_live_heartbeat(agent_id)
     return out
 
 
-def list_agents(*, online_within_sec: int = 45) -> Dict[str, Any]:
+def normalize_heartbeat_period(value: Any) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and 3 <= value <= 120:
+        return value
+    return 3
+
+
+def heartbeat_online_window(value: Any) -> int:
+    return max(45, 2 * normalize_heartbeat_period(value) + 15)
+
+
+def is_agent_online(last_seen: Any, period: Any, *, now: Optional[float] = None, revoked: bool = False) -> bool:
+    if revoked:
+        return False
+    try:
+        ts = time.mktime(time.strptime(str(last_seen), "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError, OverflowError):
+        return False
+    age = (time.time() if now is None else now) - ts
+    return 0 <= age <= heartbeat_online_window(period)
+
+
+def mark_telemetry_received(conn: Any, agent_id: str, now: str) -> None:
+    conn.execute("UPDATE agents SET last_telemetry_at=? WHERE agent_id=?", (now, agent_id))
+
+
+def list_agents(*, online_within_sec: int = 45, offset: Optional[int] = None,
+                limit: Optional[int] = None, online: Optional[bool] = None,
+                include_health: bool = True) -> Dict[str, Any]:
     ensure_db()
     # 默认心跳 3s，超过约 15s 无上报视为离线（调用方可传更大窗口）
     online_within_sec = max(12, min(int(online_within_sec or 15), 3600))
-    cutoff = time.time() - online_within_sec
+    now_ts = time.time()
     try:
         from . import agent_release
         rel = agent_release.release_status()
@@ -1225,7 +1299,21 @@ def list_agents(*, online_within_sec: int = 45) -> Dict[str, Any]:
     with _lock:
         conn = _connect()
         try:
-            rows = conn.execute("SELECT * FROM agents ORDER BY last_seen DESC").fetchall()
+            paged = offset is not None or limit is not None or online is not None or not include_health
+            total = None
+            if paged:
+                start, size = 0 if offset is None else offset, 100 if limit is None else limit
+                if type(start) is not int or type(size) is not int or start < 0 or not 1 <= size <= 500:
+                    return {"ok": False, "error": "agent_page_invalid"}
+                # Use the same heartbeat predicate as the legacy list, including local time parsing.
+                conn.create_function("agent_is_online", 3, lambda stamp, period, revoked:
+                    int(is_agent_online(stamp, period, now=now_ts, revoked=bool(revoked))))
+                where, args = (" WHERE agent_is_online(last_heartbeat_at,heartbeat_period_sec,revoked)=?", (int(online),)) if online is not None else ("", ())
+                total = conn.execute("SELECT COUNT(*) FROM agents" + where, args).fetchone()[0]
+                columns = "*" if include_health else ",".join('"' + row[1].replace('"', '""') + '"' for row in conn.execute("PRAGMA table_info(agents)") if row[1] != "health_json")
+                rows = conn.execute("SELECT " + columns + " FROM agents" + where + " ORDER BY last_seen DESC, agent_id ASC LIMIT ? OFFSET ?", (*args, size, start)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM agents ORDER BY last_seen DESC, agent_id ASC").fetchall()
             items = []
             for r in rows:
                 d = dict(r)
@@ -1240,24 +1328,32 @@ def list_agents(*, online_within_sec: int = 45) -> Dict[str, Any]:
                 d["has_secret"] = bool(d.pop("secret_hash", ""))  # 绝不外泄哈希
                 d["revoked"] = bool(d.get("revoked"))
                 d["outdated"] = bool(agent_release and rel.get("build_id") and agent_release.agent_outdated(d, rel))
-                last = str(d.get("last_seen") or "")
-                try:
-                    ts = time.mktime(time.strptime(last, "%Y-%m-%dT%H:%M:%S"))
-                except Exception:
-                    ts = 0
-                online = ts >= cutoff
+                period = normalize_heartbeat_period(d.get("heartbeat_period_sec"))
+                online = is_agent_online(d.get("last_heartbeat_at"), period, now=now_ts, revoked=d["revoked"])
+                d["heartbeat_period_sec"] = period
+                d["online_window_sec"] = heartbeat_online_window(period)
+                d["telemetry_received"] = bool(d.get("last_telemetry_at"))
                 d["online"] = online
                 d["status"] = "online" if online else "offline"
                 items.append(d)
             release = {k: rel.get(k) for k in (
                 "status", "is_latest", "version", "build_id", "build_time", "exe_sha256",
             )} if rel else {}
-            return {"ok": True, "items": items, "online_within_sec": online_within_sec, "release": release}
+            if not include_health:
+                for item in items:
+                    item.pop("health", None)
+            result = {"ok": True, "items": items, "online_within_sec": online_within_sec,
+                      "online_policy": "per_agent_heartbeat_period", "release": release}
+            if paged:
+                result["page"] = {"total": total, "offset": start, "limit": size,
+                                  "next_offset": start + size if start + size < total else None}
+            return result
         finally:
             conn.close()
 
 
-def get_snapshot(agent_id: str, module: str) -> Dict[str, Any]:
+def get_snapshot(agent_id: str, module: str, *, offset: Optional[int] = None,
+                 limit: Optional[int] = None, snapshot_version: Optional[str] = None) -> Dict[str, Any]:
     ensure_db()
     with _lock:
         conn = _connect()
@@ -1269,10 +1365,29 @@ def get_snapshot(agent_id: str, module: str) -> Dict[str, Any]:
             if not row:
                 return {"ok": False, "error": "无快照"}
             d = dict(row)
+            paged = offset is not None or limit is not None or snapshot_version is not None
+            raw = d.pop("payload_json") or "[]"
             try:
-                d["items"] = json.loads(d.pop("payload_json") or "[]")
+                d["items"] = json.loads(raw)
             except Exception:
+                if paged:
+                    return {"ok": False, "error": "snapshot_data_invalid"}
                 d["items"] = []
+            if paged:
+                import hashlib
+                if not isinstance(d["items"], list) or len(d["items"]) != d["item_count"]:
+                    return {"ok": False, "error": "snapshot_data_invalid"}
+                start, size = 0 if offset is None else offset, 100 if limit is None else limit
+                if type(start) is not int or type(size) is not int or start < 0 or not 1 <= size <= 500:
+                    return {"ok": False, "error": "snapshot_page_invalid"}
+                version = hashlib.sha256(f'{d.get("generation", 0)}\n{d.get("collected_at", "")}\n{raw}'.encode('utf-8')).hexdigest()
+                if snapshot_version is not None and snapshot_version != version:
+                    return {"ok": False, "error": "snapshot_version_changed"}
+                total = len(d["items"])
+                d["items"] = d["items"][start:start + size]
+                d.pop("keys_json", None)
+                return {"ok": True, "item": d, "page": {"offset": start, "limit": size, "total": total,
+                    "next_offset": start + size if start + size < total else None, "snapshot_version": version}}
             return {"ok": True, "item": d}
         finally:
             conn.close()
@@ -1328,71 +1443,14 @@ def _host_of(agent_id: str) -> str:
             conn.close()
 
 
-_DETAIL_MAX = 4000
 
 
-def _shrink(obj: Any, cap: int) -> Any:
-    if isinstance(obj, str):
-        return obj if len(obj) <= cap else obj[:cap] + "…"
-    if isinstance(obj, dict):
-        return {k: _shrink(v, cap) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_shrink(v, cap) for v in obj[:50]]
-    return obj
 
 
-def fit_detail(raw: Any) -> str:
-    """告警详情统一存 JSON：dict/list 正常序列化，超长时逐级收缩字符串字段而不是硬截断（硬截断会破坏 JSON）。"""
-    if raw is None or raw == "":
-        return ""
-    obj = raw
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s.startswith(("{", "[")):
-            return json.dumps({"message": s[:_DETAIL_MAX - 40]}, ensure_ascii=False)
-        try:
-            obj = json.loads(s)
-        except ValueError:
-            return json.dumps({"message": s[:_DETAIL_MAX - 40], "truncated": True}, ensure_ascii=False)
-    try:
-        out = json.dumps(obj, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        return json.dumps({"message": str(raw)[:_DETAIL_MAX - 40]}, ensure_ascii=False)
-    for cap in (1500, 800, 300, 120):
-        if len(out) <= _DETAIL_MAX:
-            return out
-        out = json.dumps(_shrink(obj, cap), ensure_ascii=False, default=str)
-    if len(out) <= _DETAIL_MAX:
-        return out
-    return json.dumps({"truncated": True, "preview": out[:_DETAIL_MAX - 60]}, ensure_ascii=False)
 
 
-def _detail_score(s: str) -> int:
-    if not s:
-        return 0
-    try:
-        o = json.loads(s) if s.lstrip().startswith(("{", "[")) else None
-    except ValueError:
-        return max(1, len(s) // 10)
-    if not isinstance(o, dict):
-        return max(1, len(s) // 10)
-    # 只有 raw/etype 的截断残骸视为几乎无信息
-    if "raw" in o and len(o) <= 2:
-        return 1
-    n = 0
-    for k, v in o.items():
-        if v in (None, "", [], {}):
-            continue
-        n += 2
-        if isinstance(v, dict):
-            n += sum(1 for x in v.values() if x not in (None, "", [], {}))
-        elif isinstance(v, str) and len(v) > 20:
-            n += 1
-    return n
 
 
-def _detail_richer(new: str, old: str) -> bool:
-    return _detail_score(new) >= _detail_score(old) and bool(new)
 
 
 _REMOTE_OPS_ACTIONS = frozenset({
@@ -1451,146 +1509,6 @@ def _event_payload_key(detail: Any) -> str:
     return ""
 
 
-def report_event(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """终端或平台写入威胁/采集异常事件。"""
-    ensure_db()
-    agent_id = str(payload.get("agent_id") or "").strip()
-    title = str(payload.get("title") or "").strip()[:200]
-    if not agent_id or not title:
-        return {"ok": False, "error": "缺少 agent_id 或 title"}
-    if _is_remote_ops_noise(title):
-        return {"ok": True, "suppressed": True, "reason": "remote_ops_noise"}
-    module = str(payload.get("module") or "").strip().lower()[:32]
-    if _suppress_response_ops_event(module, title):
-        return {"ok": True, "suppressed": True, "ops_audit": True}
-    severity = str(payload.get("severity") or "medium").strip().lower()[:16]
-    if severity not in ("info", "low", "medium", "high", "critical"):
-        severity = "medium"
-    detail = fit_detail(payload.get("detail"))
-    building_block = bool(payload.get("building_block")) or (
-        isinstance(detail, dict) and detail.get("building_block") is True
-    )
-    if building_block:
-        module = module or "building_block"
-        if module not in ("building_block", "correlation"):
-            module = "building_block"
-        if severity in ("high", "critical"):
-            severity = "medium"
-    hostname = str(payload.get("hostname") or "").strip()[:128] or _host_of(agent_id)
-    now = _now()
-    from . import alert_allow
-    with _lock:
-        conn = _connect()
-        try:
-            # 已删除 / 未注册的终端不再产生告警，避免「主机删了告警还在」
-            if not conn.execute("SELECT 1 FROM agents WHERE agent_id=?", (agent_id,)).fetchone():
-                return {"ok": False, "error": "终端未注册或已删除", "orphan": True}
-            allow = alert_allow.find_match(conn, agent_id, title, detail)
-            if allow is not None:
-                alert_allow.record_hit(conn, allow["id"])
-                return {"ok": True, "suppressed": True, "allow_id": allow["id"]}
-            # 同主机同载荷路径（task_execute/payload_path）2 小时内合并 FIM+EVM 等双告警
-            payload_key = _event_payload_key(detail)
-            row = None
-            if payload_key:
-                since2h = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 7200))
-                cand = conn.execute(
-                    """SELECT id, title, detail, severity FROM agent_events
-                       WHERE agent_id=? AND status='open' AND created_at>=?
-                       ORDER BY id DESC LIMIT 40""",
-                    (agent_id, since2h),
-                ).fetchall()
-                for c in cand or []:
-                    if _event_payload_key(c["detail"]) == payload_key:
-                        row = c
-                        break
-            # 同主机同标题 10 分钟内不重复刷屏
-            if row is None:
-                row = conn.execute(
-                    """SELECT id FROM agent_events
-                       WHERE agent_id=? AND title=? AND status='open'
-                         AND created_at>=?
-                       ORDER BY id DESC LIMIT 1""",
-                    (agent_id, title, time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 600))),
-                ).fetchone()
-            if row:
-                # 只在新详情信息量不少于旧值时覆盖，避免补晋升/字段更少的重复源把完整证据盖空
-                old = conn.execute(
-                    "SELECT detail, severity, hit_count FROM agent_events WHERE id=?",
-                    (row["id"],),
-                ).fetchone()
-                old_detail = str((old["detail"] if old else "") or "")
-                old_sev = str((old["severity"] if old else "") or severity)
-                richer = _detail_richer(detail, old_detail)
-                sev_rank = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
-                bump_sev = sev_rank.get(severity, 0) > sev_rank.get(old_sev, 0)
-                prev_hits = int((old["hit_count"] if old else 1) or 1)
-                new_hits = max(1, prev_hits) + 1
-                conn.execute(
-                    """UPDATE agent_events SET detail=?, severity=?, module=?, hit_count=?, updated_at=?
-                       WHERE id=?""",
-                    (
-                        detail if richer else old_detail,
-                        severity if bump_sev else old_sev,
-                        module or "",
-                        new_hits,
-                        now,
-                        row["id"],
-                    ),
-                )
-                conn.commit()
-                eid = row["id"]
-                deduped = True
-            else:
-                cur = conn.execute(
-                    """INSERT INTO agent_events(agent_id, hostname, severity, title, detail, module, status,
-                                                hit_count, created_at, updated_at)
-                       VALUES(?,?,?,?,?,?, 'open', 1, ?, ?)""",
-                    (agent_id, hostname, severity, title, detail, module, now, now),
-                )
-                conn.commit()
-                eid = cur.lastrowid
-                deduped = False
-        finally:
-            conn.close()
-    bump_live("event", agent_id=agent_id, event_id=eid)
-    if not deduped:
-        row = {
-            "id": eid, "agent_id": agent_id, "hostname": hostname, "severity": severity,
-            "title": title, "detail": detail, "module": module, "status": "open",
-            "created_at": now, "updated_at": now, "deduped": False,
-        }
-        if not building_block:
-            try:
-                from . import agent_notify
-                agent_notify.notify_event(row)
-            except Exception:
-                pass
-        try:
-            from . import agent_store
-            threading.Thread(target=agent_store.write_event, args=(row,), daemon=True).start()
-        except Exception:
-            pass
-        try:
-            from . import elastic_detection_es as _edes
-            import json as _json
-            det = {}
-            if detail:
-                try:
-                    det = _json.loads(detail) if isinstance(detail, str) else (detail if isinstance(detail, dict) else {})
-                except Exception:
-                    det = {}
-            _edes.index_event_async(
-                agent_id=agent_id,
-                hostname=hostname,
-                etype=str(det.get("etype") or module or "event"),
-                summary=title,
-                detail=det if isinstance(det, dict) else {},
-                ts=now,
-            )
-        except Exception:
-            pass
-    return {"ok": True, "id": eid, "deduped": deduped}
 
 
 _QUIET_AT = 0.0
@@ -1624,71 +1542,6 @@ def _quiet_open_alerts(conn: sqlite3.Connection) -> int:
     return n
 
 
-def related_events_by_payload(
-    event_id: int,
-    *,
-    limit: int = 20,
-) -> Dict[str, Any]:
-    """按 task_execute/payload_path 等载荷键关联同主机告警（FIM↔EVM↔进程产品化边）。"""
-    ensure_db()
-    limit = max(1, min(int(limit or 20), 50))
-    with _lock:
-        conn = _connect()
-        try:
-            row = conn.execute("SELECT * FROM agent_events WHERE id=?", (int(event_id),)).fetchone()
-            if not row:
-                return {"ok": False, "error": "事件不存在"}
-            detail = row["detail"]
-            key = _event_payload_key(detail)
-            edges = []
-            dobj = None
-            try:
-                import json as _json
-                dobj = _json.loads(detail) if isinstance(detail, str) else detail
-            except Exception:
-                dobj = detail if isinstance(detail, dict) else {}
-            if isinstance(dobj, dict):
-                for label, field in (
-                    ("task_def", "task_def_path"),
-                    ("payload", "task_execute"),
-                    ("payload", "payload_path"),
-                    ("shortcut", "shortcut_target"),
-                    ("service", "service_exe"),
-                    ("process", "image"),
-                    ("process", "path"),
-                    ("network", "remote_ip"),
-                ):
-                    v = str(dobj.get(field) or "").strip()
-                    if v:
-                        edges.append({"kind": label, "field": field, "value": v})
-            items = []
-            if key:
-                aid = row["agent_id"]
-                cand = conn.execute(
-                    """SELECT id, title, module, severity, status, created_at, detail
-                       FROM agent_events WHERE agent_id=? AND id<>?
-                       ORDER BY id DESC LIMIT 80""",
-                    (aid, int(event_id)),
-                ).fetchall()
-                for c in cand or []:
-                    if _event_payload_key(c["detail"]) != key:
-                        continue
-                    items.append({
-                        "id": c["id"], "title": c["title"], "module": c["module"],
-                        "severity": c["severity"], "status": c["status"],
-                        "created_at": c["created_at"], "payload_key": key,
-                    })
-                    if len(items) >= limit:
-                        break
-            return {
-                "ok": True,
-                "event_id": int(event_id),
-                "payload_key": key,
-                "edges": edges,
-                "items": items,
-            }
-        finally:
-            conn.close()
 
 
 def _event_detail_obj_light(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1708,12 +1561,20 @@ def list_events(
     status: str = "",
     agent_id: str = "",
     limit: int = 100,
+    severity: str = "",
+    module: str = "",
+    start_at: str = "",
+    end_at: str = "",
+    before_id: Optional[int] = None,
+    anchor_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     ensure_db()
     limit = max(1, min(int(limit or 100), 500))
     clauses = []
     args: List[Any] = []
     st = str(status or "").strip().lower()
+    if st and st not in ("open", "closed", "ignored"):
+        return {"ok": False, "error": "invalid_event_status"}
     if st in ("open", "closed", "ignored"):
         clauses.append("status=?")
         args.append(st)
@@ -1721,26 +1582,55 @@ def list_events(
     if aid:
         clauses.append("agent_id=?")
         args.append(aid)
-    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    for column, value in (("severity", severity), ("module", module)):
+        if value:
+            clauses.append(column + "=?")
+            args.append(str(value).strip().lower())
+    for stamp in (start_at, end_at):
+        if stamp:
+            try:
+                parsed = time.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
+                if time.strftime("%Y-%m-%dT%H:%M:%S", parsed) != stamp:
+                    raise ValueError
+            except (ValueError, TypeError):
+                return {"ok": False, "error": "invalid_event_time_range"}
+    if start_at and end_at and start_at >= end_at:
+        return {"ok": False, "error": "invalid_event_time_range"}
+    if start_at:
+        clauses.append("created_at>=?")
+        args.append(start_at)
+    if end_at:
+        clauses.append("created_at<?")
+        args.append(end_at)
     with _lock:
         conn = _connect()
         try:
             _quiet_open_alerts(conn)
+            if anchor_id is None:
+                anchor_id = int(conn.execute("SELECT COALESCE(MAX(id),0) FROM agent_events").fetchone()[0])
+            clauses.append("id<=?")
+            args.append(anchor_id)
+            where = " WHERE " + " AND ".join(clauses)
+            total = conn.execute("SELECT COUNT(*) FROM agent_events" + where, args).fetchone()[0]
+            if before_id is not None:
+                where += " AND id<?"
+                args.append(before_id)
             rows = conn.execute(
                 f"""SELECT id, agent_id, hostname, severity, title, detail, module, status,
                            hit_count, created_at, updated_at
                     FROM agent_events{where} ORDER BY id DESC LIMIT ?""",
-                (*args, limit),
+                (*args, limit + 1),
             ).fetchall()
             items = []
-            for r in rows:
+            for r in rows[:limit]:
                 it = dict(r)
                 obj = _event_detail_obj_light(it)
                 if obj is not None:
                     it["detail_obj"] = obj
                 items.append(it)
             open_n = conn.execute("SELECT COUNT(*) AS c FROM agent_events WHERE status='open'").fetchone()["c"]
-            return {"ok": True, "items": items, "open_count": int(open_n or 0)}
+            return {"ok": True, "items": items, "open_count": int(open_n or 0), "total": int(total),
+                    "anchor_id": anchor_id, "next_before_id": items[-1]["id"] if len(rows) > limit and items else None}
         finally:
             conn.close()
 
@@ -1990,192 +1880,10 @@ def _blob_has_mojibake(text: str) -> bool:
     return ("\ufffd" in text) or (text.count("?") >= 8 and "DisplayName" in text)
 
 
-def upsert_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """写入某模块最新快照（覆盖式）。payload.items 建议 ≤500 条精简对象。"""
-    ensure_db()
-    agent_id = str(payload.get("agent_id") or "").strip()
-    module = str(payload.get("module") or "").strip().lower()
-    if not agent_id or module not in AGENT_MODULES:
-        return {"ok": False, "error": "agent_id 或 module 无效"}
-    items = payload.get("items")
-    if not isinstance(items, list):
-        items = []
-    items = items[:500]
-    keys = payload.get("keys")
-    # 增量清单需要与条目一一对应的键；旧 Agent 不带 keys，代号记 0（之后的增量会被拒并触发全量）
-    if not (isinstance(keys, list) and len(keys) >= len(items)):
-        keys = []
-    keys = [str(k)[:300] for k in keys[:len(items)]]
-    try:
-        generation = int(payload.get("generation") or 0) if keys else 0
-    except (TypeError, ValueError):
-        generation = 0
-    digest = str(payload.get("digest") or "").strip()[:128]
-    collected_at = str(payload.get("collected_at") or _now())[:32]
-    blob = json.dumps(items, ensure_ascii=False)
-    if len(blob) > 1_500_000:
-        return {"ok": False, "error": "snapshot 过大，请精简字段"}
-    now = _now()
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                "UPDATE agents SET last_seen=?, status='online' WHERE agent_id=?",
-                (now, agent_id),
-            )
-            conn.execute(
-                """INSERT INTO agent_snapshots(agent_id, module, collected_at, item_count, digest, payload_json,
-                                               generation, keys_json)
-                   VALUES(?,?,?,?,?,?,?,?)
-                   ON CONFLICT(agent_id, module) DO UPDATE SET
-                     collected_at=excluded.collected_at,
-                     item_count=excluded.item_count,
-                     digest=excluded.digest,
-                     payload_json=excluded.payload_json,
-                     generation=excluded.generation,
-                     keys_json=excluded.keys_json""",
-                (agent_id, module, collected_at, len(items), digest, blob, generation,
-                 json.dumps(keys, ensure_ascii=False) if keys else ""),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    return _post_snapshot(agent_id, module, items, blob, total=len(items))
 
 
-def _post_snapshot(agent_id: str, module: str, items: List[Any], blob: str, *, total: int,
-                   extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """快照入库后的质量检查与规则匹配；增量时 items 只含新增/变化条目。"""
-    # 采集质量异常 → 威胁事件
-    if _blob_has_mojibake(blob):
-        report_event({
-            "agent_id": agent_id,
-            "module": module,
-            "severity": "medium",
-            "title": f"采集编码异常（{module}）",
-            "detail": "快照中出现乱码字符，请升级终端 Agent 后重新上报",
-        })
-    if module in ("service", "process", "network") and total == 0:
-        report_event({
-            "agent_id": agent_id,
-            "module": module,
-            "severity": "low",
-            "title": f"模块采集为空（{module}）",
-            "detail": "本次快照 0 条，可能权限不足或采集失败",
-        })
-    # 实时规则命中 → 威胁事件（增量只评估新增/变化条目）
-    rule_stats = {"hits": 0}
-    host = _host_of(agent_id)
-    if items:
-        try:
-            from . import agent_rules
-            rule_stats = agent_rules.apply_snapshot_rules(agent_id, module, items, hostname=host) or {}
-        except Exception as e:
-            print("[agent_rules]", e)
-    # 浏览器访问记录：域名走 IOC 匹配才告警
-    if module == "browser" and items:
-        try:
-            from . import agent_edr
-            parts = []
-            for it in items[:300]:
-                if not isinstance(it, dict):
-                    continue
-                parts.append(str(it.get("domain") or ""))
-                parts.append(str(it.get("url") or ""))
-            agent_edr.match_iocs(agent_id, host, blob="\n".join(parts), events=None, module="ioc")
-        except Exception as e:
-            print("[agent_ioc browser]", e)
-    bump_live("snapshot", agent_id=agent_id, module=module)
-    out = {
-        "ok": True,
-        "module": module,
-        "item_count": total,
-        "rule_hits": int(rule_stats.get("hits") or 0),
-        "live_rev": live_revision(),
-    }
-    if extra:
-        out.update(extra)
-    return out
 
 
 DELTA_MAX_ITEMS = 1000
 
-
-def apply_snapshot_delta(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """按 generation 链应用增量清单。服务端代号与 base_generation 不一致、或应用后条数与 Agent
-    声明不符时拒绝（generation_mismatch），Agent 收到拒绝后改发全量，不做"猜测式合并"。"""
-    ensure_db()
-    agent_id = str(payload.get("agent_id") or "").strip()
-    module = str(payload.get("module") or "").strip().lower()
-    if not agent_id or module not in AGENT_MODULES:
-        return {"ok": False, "error": "agent_id 或 module 无效"}
-    try:
-        base = int(payload.get("base_generation") or 0)
-        gen = int(payload.get("generation") or 0)
-        want_n = int(payload.get("item_count")) if payload.get("item_count") is not None else -1
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "generation 无效"}
-    ups = payload.get("upserts") if isinstance(payload.get("upserts"), list) else []
-    rms = payload.get("removes") if isinstance(payload.get("removes"), list) else []
-    if base <= 0 or gen <= base:
-        return {"ok": False, "error": "generation_mismatch"}
-    collected_at = str(payload.get("collected_at") or _now())[:32]
-    digest = str(payload.get("digest") or "").strip()[:128]
-    now = _now()
-    changed: List[Dict[str, Any]] = []
-    with _lock:
-        conn = _connect()
-        try:
-            row = conn.execute(
-                "SELECT generation, keys_json, payload_json FROM agent_snapshots WHERE agent_id=? AND module=?",
-                (agent_id, module),
-            ).fetchone()
-            if not row or int(row["generation"] or 0) != base or not row["keys_json"]:
-                return {"ok": False, "error": "generation_mismatch"}
-            try:
-                keys = json.loads(row["keys_json"] or "[]")
-                items = json.loads(row["payload_json"] or "[]")
-            except Exception:
-                return {"ok": False, "error": "generation_mismatch"}
-            if len(keys) != len(items):
-                return {"ok": False, "error": "generation_mismatch"}
-            rmset = {str(k) for k in rms}
-            new_keys: List[str] = []
-            new_items: List[Any] = []
-            for k, it in zip(keys, items):
-                if k not in rmset:
-                    new_keys.append(k)
-                    new_items.append(it)
-            pos = {k: i for i, k in enumerate(new_keys)}
-            for u in ups:
-                if not isinstance(u, dict) or not isinstance(u.get("item"), dict):
-                    continue
-                k = str(u.get("k") or "")[:300]
-                if not k:
-                    continue
-                if k in pos:
-                    new_items[pos[k]] = u["item"]
-                else:
-                    pos[k] = len(new_keys)
-                    new_keys.append(k)
-                    new_items.append(u["item"])
-                changed.append(u["item"])
-            if len(new_items) > DELTA_MAX_ITEMS or (want_n >= 0 and len(new_items) != want_n):
-                return {"ok": False, "error": "generation_mismatch"}
-            blob = json.dumps(new_items, ensure_ascii=False)
-            if len(blob) > 1_500_000:
-                return {"ok": False, "error": "snapshot 过大，请精简字段"}
-            conn.execute("UPDATE agents SET last_seen=?, status='online' WHERE agent_id=?", (now, agent_id))
-            conn.execute(
-                """UPDATE agent_snapshots SET collected_at=?, item_count=?, digest=?, payload_json=?,
-                       generation=?, keys_json=? WHERE agent_id=? AND module=?""",
-                (collected_at, len(new_items), digest, blob, gen, json.dumps(new_keys, ensure_ascii=False),
-                 agent_id, module),
-            )
-            conn.commit()
-            total = len(new_items)
-        finally:
-            conn.close()
-    changed_blob = json.dumps(changed, ensure_ascii=False) if changed else ""
-    return _post_snapshot(agent_id, module, changed, changed_blob, total=total,
-                          extra={"delta": True, "upserts": len(changed), "removes": len(rmset), "generation": gen})
+from .agent_protocol_telemetry import report_event, _post_snapshot, upsert_snapshot, apply_snapshot_delta, related_events_by_payload

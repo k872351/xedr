@@ -128,6 +128,9 @@ func regRead(params map[string]any) (map[string]any, error) {
 	hive := asString(params["hive"])
 	keyPath := strings.TrimSpace(asString(params["key"]))
 	if keyPath == "" {
+		keyPath = strings.TrimSpace(asString(params["path"])) // 兼容前端旧字段
+	}
+	if keyPath == "" {
 		return nil, fmt.Errorf("missing key")
 	}
 	valueName := asString(params["value"])
@@ -508,12 +511,23 @@ func shellPumpOutput(s *shellSession, r io.Reader) {
 	}
 }
 
+func shellSessionID(params map[string]any) string {
+	id := asString(params["session_id"])
+	if id == "" {
+		id = asString(params["shell_id"])
+	}
+	return id
+}
+
 func shellWrite(params map[string]any) (map[string]any, error) {
 	if err := remoteOpsGate("shell_write"); err != nil {
 		return nil, err
 	}
-	id := asString(params["session_id"])
+	id := shellSessionID(params)
 	line := asString(params["input"])
+	if line == "" {
+		line = asString(params["data"]) // 兼容前端旧字段
+	}
 	shellMu.Lock()
 	s, ok := shellSessions[id]
 	shellMu.Unlock()
@@ -539,7 +553,7 @@ func shellPoll(params map[string]any) (map[string]any, error) {
 	if err := remoteOpsGate("shell_poll"); err != nil {
 		return nil, err
 	}
-	id := asString(params["session_id"])
+	id := shellSessionID(params)
 	shellMu.Lock()
 	s, ok := shellSessions[id]
 	shellMu.Unlock()
@@ -559,7 +573,7 @@ func shellClose(params map[string]any) (map[string]any, error) {
 	if err := remoteOpsGate("shell_close"); err != nil {
 		return nil, err
 	}
-	id := asString(params["session_id"])
+	id := shellSessionID(params)
 	shellMu.Lock()
 	s, ok := shellSessions[id]
 	if ok {
@@ -567,7 +581,7 @@ func shellClose(params map[string]any) (map[string]any, error) {
 	}
 	shellMu.Unlock()
 	if !ok {
-	 return map[string]any{"session_id": id, "closed": false}, nil
+		return map[string]any{"session_id": id, "closed": false}, nil
 	}
 	_ = s.stdin.Close()
 	if s.cmd.Process != nil {

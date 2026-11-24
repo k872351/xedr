@@ -171,6 +171,21 @@ def queue_stats() -> Dict[str, Any]:
     """队列深度 / 运行中 / 上限，供上传回执与 UI。"""
     global _active, _heavy_active
     recover_jobs_on_startup()
+    coordination = {"backend": "sqlite", "mode": "single_instance", "shared": False}
+    try:
+        from .mysql_db import get_status
+        db_status = get_status() or {}
+        if db_status.get("ok"):
+            coordination = {"backend": "mysql", "mode": "shared", "shared": True}
+        elif db_status.get("enabled"):
+            coordination = {
+                "backend": "sqlite",
+                "mode": "degraded_local",
+                "shared": False,
+                "reason": str(db_status.get("error") or "MySQL unavailable")[:240],
+            }
+    except Exception:
+        pass
     with _lock:
         by: Dict[str, int] = {}
         for j in _jobs.values():
@@ -202,6 +217,7 @@ def queue_stats() -> Dict[str, Any]:
             "cancelled": by.get("cancelled", 0),
             "total": len(_jobs),
             "persisted": True,
+            "coordination": coordination,
         }
 
 
@@ -314,6 +330,15 @@ class _JobDb:
         else:
             self.conn.execute(q, tuple(params))
         return self
+
+    @property
+    def rowcount(self) -> int:
+        try:
+            if self.mysql and self.cur:
+                return int(self.cur.rowcount)
+            return int(self.conn.execute("SELECT changes()").fetchone()[0])
+        except Exception:
+            return 0
 
     def query_all(self, sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
         q = self._q(sql)
@@ -516,42 +541,172 @@ def _load_all_from_db() -> List[Dict[str, Any]]:
 
 
 def recover_jobs_on_startup() -> int:
-    """启动时从库恢复任务；中断的运行中任务重新入队。"""
+    """Load persisted jobs without overwriting concurrent claims from other workers."""
     global _recovered
     with _lock:
         if _recovered:
             return 0
         _recovered = True
-        rows = _load_all_from_db()
-        recovered = 0
+
+    # Recovery uses a DB compare-and-update outside _lock. Another process may
+    # claim a row during startup; local cache initialization must not persist an
+    # old snapshot over that claim.
+    recovered = _requeue_stale_jobs(900)
+    rows = _load_all_from_db()
+    active_seen = False
+    with _lock:
         _jobs.clear()
         _queue.clear()
-        for j in rows:
-            jid = j.get("id") or ""
+        for job in rows:
+            jid = str(job.get("id") or "")
             if not jid:
                 continue
-            st = j.get("status") or ""
-            # 进程被杀时卡在 load/fast/full：重新排队
-            if st in _ACTIVE:
-                j["status"] = "queued"
-                j["phase"] = "queued"
-                j["progress"] = 0
-                j["cancel"] = False
-                j["message"] = "服务重启，已重新排队…"
-                j["updated_at"] = _now()
-                j["finished_at"] = None
-                recovered += 1
-            _jobs[jid] = j
-            if j.get("status") == "queued":
+            _jobs[jid] = job
+            status = str(job.get("status") or "")
+            if status == "queued":
                 _queue.append(jid)
-                _persist(j)
-        # 按创建时间排队
-        _queue.sort(key=lambda x: (_jobs.get(x) or {}).get("created_at") or "")
-        if _queue:
+            elif status in _ACTIVE:
+                active_seen = True
+        _queue.sort(key=lambda jid: (_jobs.get(jid) or {}).get("created_at") or "")
+        if _queue or active_seen:
             _ensure_worker()
+    if rows:
+        print(f"[jobs] recovered {len(rows)} jobs from db (re-queued {recovered})")
+    return len(rows)
+
+
+def _job_is_stale(job: Dict[str, Any], stale_sec: int = 900) -> bool:
+    try:
+        updated = datetime.fromisoformat(str(job.get("updated_at") or ""))
+        if updated.tzinfo is not None:
+            updated = updated.replace(tzinfo=None)
+        return (datetime.now() - updated).total_seconds() >= max(60, int(stale_sec))
+    except (TypeError, ValueError):
+        return True
+
+
+def _shared_job_store_required() -> bool:
+    try:
+        from .mysql_db import load_db_config
+        return bool((load_db_config() or {}).get("enabled"))
+    except Exception:
+        return False
+
+
+def _claim_queued_job(job_id: str) -> bool:
+    """Atomically transition a shared persisted job from queued to active."""
+    db = _JobDb()
+    try:
+        if _shared_job_store_required() and not db.mysql:
+            return False
+        now = _now()
+        db.execute(
+            """UPDATE analyze_jobs SET status='load',phase='load',updated_at=?,
+                      message='claimed by analysis worker'
+               WHERE id=? AND status='queued'""",
+            (now, str(job_id)),
+        )
+        claimed = db.rowcount == 1
+        db.commit()
+        if claimed:
+            with _lock:
+                job = _jobs.get(str(job_id))
+                if job:
+                    job.update(status="load", phase="load", updated_at=now, message="claimed by analysis worker")
+            return True
+        rows = db.query_all("SELECT * FROM analyze_jobs WHERE id=? LIMIT 1", (str(job_id),))
         if rows:
-            print(f"[jobs] recovered {len(rows)} jobs from db (re-queued {recovered})")
-        return len(rows)
+            fresh = _row_from_db(rows[0])
+            with _lock:
+                current = _jobs.get(str(job_id))
+                if current:
+                    current.update(fresh)
+        return False
+    except Exception as e:
+        print(f"[jobs] claim {job_id}: {e}")
+        return False
+    finally:
+        db.close()
+
+
+def _requeue_stale_jobs(stale_sec: int = 900) -> int:
+    """Return abandoned work to the shared queue with a compare-and-update."""
+    db = _JobDb()
+    recovered = 0
+    try:
+        active = tuple(_ACTIVE)
+        marks = ",".join("?" for _ in active)
+        rows = db.query_all(
+            f"SELECT id,updated_at FROM analyze_jobs WHERE status IN ({marks})", active,
+        )
+        for row in rows:
+            if not _job_is_stale(row, stale_sec):
+                continue
+            updated = str(row.get("updated_at") or "")
+            db.execute(
+                f"""UPDATE analyze_jobs SET status='queued',phase='queued',progress=0,
+                          cancel_flag=0,message='stale worker recovered',updated_at=?,finished_at=''
+                   WHERE id=? AND status IN ({marks}) AND updated_at=?""",
+                (_now(), str(row.get("id") or ""), *active, updated),
+            )
+            recovered += db.rowcount
+        db.commit()
+        if recovered:
+            rows = _load_all_from_db()
+            with _lock:
+                queued = set(_queue)
+                for fresh in rows:
+                    jid = str(fresh.get("id") or "")
+                    if not jid:
+                        continue
+                    current = _jobs.get(jid)
+                    if fresh.get("status") == "queued":
+                        if jid not in queued:
+                            _queue.append(jid)
+                            queued.add(jid)
+                        if not current or current.get("status") not in _ACTIVE:
+                            _jobs[jid] = fresh
+                _queue.sort(key=lambda jid: (_jobs.get(jid) or {}).get("created_at") or "")
+        return recovered
+    except Exception as e:
+        print(f"[jobs] stale recovery: {e}")
+        return 0
+    finally:
+        db.close()
+
+
+def _heartbeat_job(job_id: str) -> bool:
+    """Refresh the lease timestamp while a worker is still executing."""
+    db = _JobDb()
+    try:
+        active = tuple(_ACTIVE)
+        marks = ",".join("?" for _ in active)
+        now = _now()
+        db.execute(
+            f"UPDATE analyze_jobs SET updated_at=? WHERE id=? AND status IN ({marks})",
+            (now, str(job_id), *active),
+        )
+        changed = db.rowcount == 1
+        db.commit()
+        if changed:
+            with _lock:
+                job = _jobs.get(str(job_id))
+                if job and job.get("status") in _ACTIVE:
+                    job["updated_at"] = now
+        return changed
+    except Exception as e:
+        print(f"[jobs] heartbeat {job_id}: {e}")
+        return False
+    finally:
+        db.close()
+
+
+def _job_heartbeat_loop(job_id: str, stop: threading.Event, interval: int = 60) -> None:
+    while not stop.wait(max(15, int(interval))):
+        # Keep retrying after transient database errors. The dispatcher's stop
+        # event owns this thread's lifecycle; a missed heartbeat must not turn
+        # a still-running job into a false abandoned-job recovery.
+        _heartbeat_job(job_id)
 
 
 def _job_public(j: Dict[str, Any]) -> Dict[str, Any]:
@@ -631,6 +786,16 @@ def enqueue_analyze(
     force=True（覆盖重分析）：取消同文件进行中/排队任务后新建。
     force=False：同文件已 busy 则返回已有任务。
     """
+    if _shared_job_store_required():
+        db = _JobDb()
+        try:
+            if not db.mysql:
+                raise QueueRejected(
+                    "Shared MySQL is configured but unavailable; analysis enqueue is paused to avoid per-instance SQLite divergence.",
+                    503,
+                )
+        finally:
+            db.close()
     recover_jobs_on_startup()
     rid = P.report_id(report_file)
     steps = [str(x).strip() for x in (only_matchers or []) if str(x).strip()]
@@ -989,8 +1154,16 @@ def _ensure_worker() -> None:
 
 
 def _dispatch_one(job_id: str, is_heavy: bool = False) -> None:
-    """单任务执行线程：真正并行跑到 max_workers。"""
+    """Run one job and maintain a persisted lease while it remains active."""
     global _active, _heavy_active
+    stop_heartbeat = threading.Event()
+    heartbeat = threading.Thread(
+        target=_job_heartbeat_loop,
+        args=(job_id, stop_heartbeat),
+        daemon=True,
+        name=f"analyze-heartbeat-{job_id[:8]}",
+    )
+    heartbeat.start()
     try:
         _run_job(job_id)
     except Exception as e:
@@ -1001,10 +1174,11 @@ def _dispatch_one(job_id: str, is_heavy: bool = False) -> None:
             phase="error",
             progress=0,
             error=str(e),
-            message=f"失败: {e}",
+            message=f"ʧ��: {e}",
             finished_at=_now(),
         )
     finally:
+        stop_heartbeat.set()
         with _lock:
             _active = max(0, _active - 1)
             if is_heavy:
@@ -1013,13 +1187,28 @@ def _dispatch_one(job_id: str, is_heavy: bool = False) -> None:
 
 def _dispatcher_loop() -> None:
     """调度器：按 max_workers 为每个任务开独立线程；大报告占用单独的重任务槽。"""
+    global _active, _heavy_active
+    next_recovery = time.monotonic() + 60
     while True:
+        if time.monotonic() >= next_recovery:
+            _requeue_stale_jobs()
+            next_recovery = time.monotonic() + 60
         job_id = None
         is_heavy = False
         with _lock:
             job_id, is_heavy = _pick_next_job_locked()
         if not job_id:
             time.sleep(0.15)
+            continue
+        if not _claim_queued_job(job_id):
+            with _lock:
+                _active = max(0, _active - 1)
+                if is_heavy:
+                    _heavy_active = max(0, _heavy_active - 1)
+                job = _jobs.get(job_id)
+                if job and job.get("status") == "queued" and job_id not in _queue:
+                    _queue.insert(0, job_id)
+            time.sleep(0.5)
             continue
         t = threading.Thread(
             target=_dispatch_one,

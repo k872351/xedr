@@ -50,6 +50,9 @@ _BENIGN_APEX = frozenset({
     "cdn.cloudflare.net", "fastly.net", "edgekey.net", "akamai.net", "akamaized.net",
     "oracle.com", "oraclecloud.com", "salesforce.com", "snowflake.com", "zoom.us",
     "slack.com", "atlassian.com", "jira.com", "notion.so", "dropbox.com", "box.com",
+    # 常见开发/文档域名（DNS 应答 IP 常与 CDN 共享，易误撞 IP IOC）
+    "python.org", "pypi.org", "pythonhosted.org", "npmjs.com", "nodejs.org",
+    "rust-lang.org", "golang.org", "githubusercontent.com",
 })
 _MULTI_TLD = frozenset({
     "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "co.uk", "com.au", "com.hk",
@@ -588,34 +591,61 @@ def hash_kind(hex_str: str) -> Optional[str]:
     return None
 
 
-def sample_preview(limit: int = 10) -> Dict[str, Any]:
-    """仅返回情报库前 N 条样例（默认 10），禁止用于整库浏览。"""
-    lim = max(1, min(int(limit or 10), 10))
-    out: Dict[str, Any] = {"ok": True, "limit": lim, "items": [], "path": str(_db_path or "")}
+def sample_preview(limit: int = 10, *, ioc_type: str = "", offset: int = 0) -> Dict[str, Any]:
+    """管理台样例浏览：只允许读库内前 100 条（可分页，但窗口不超出 100）。"""
+    max_window = 100
+    lim = max(1, min(int(limit or 10), max_window))
+    off = max(0, min(int(offset or 0), max_window - 1))
+    if off + lim > max_window:
+        lim = max(1, max_window - off)
+    kind = str(ioc_type or "").strip().lower()
+    if kind in ("hash", "sha256", "md5", "sha1"):
+        kind = "file_hash"
+    out: Dict[str, Any] = {
+        "ok": True, "limit": lim, "offset": off, "ioc_type": kind,
+        "items": [], "path": str(_db_path or ""),
+        "max_rows": max_window, "cap_hint": f"仅可读前 {max_window} 条样例，非整库导出",
+    }
     conn = _connect()
     if not conn:
         out["ok"] = False
         out["error"] = "ioc db unavailable"
         return out
     try:
-        rows = conn.execute(
-            "SELECT id, type, value, source, malware FROM ioc_records ORDER BY id ASC LIMIT ?",
-            (lim,),
-        ).fetchall()
+        # 先取该过滤条件下最多 100 条，再在窗口内切片，避免深翻页扫库。
+        if kind:
+            rows = conn.execute(
+                """SELECT id, type, value, source, malware FROM ioc_records
+                   WHERE type=? ORDER BY id ASC LIMIT ?""",
+                (kind, max_window),
+            ).fetchall()
+            total_type = conn.execute(
+                "SELECT COUNT(*) FROM ioc_records WHERE type=?", (kind,)
+            ).fetchone()[0]
+        else:
+            rows = conn.execute(
+                "SELECT id, type, value, source, malware FROM ioc_records ORDER BY id ASC LIMIT ?",
+                (max_window,),
+            ).fetchall()
+            total_type = conn.execute("SELECT COUNT(*) FROM ioc_records").fetchone()[0]
+        window = rows[off: off + lim]
         items = []
-        for r in rows:
+        for r in window:
             val = str(r["value"] or "")
-            if len(val) > 80:
-                val = val[:80] + "…"
+            if len(val) > 120:
+                val = val[:120] + "…"
             items.append({
                 "id": r["id"],
                 "type": r["type"] or "",
                 "value": val,
-                "source": (r["source"] or "")[:80],
-                "malware": (r["malware"] or "")[:80],
+                "source": (r["source"] or "")[:120],
+                "malware": (r["malware"] or "")[:120],
             })
         out["items"] = items
         out["shown"] = len(items)
+        # 可读窗口上限 100；total_in_db 仅作提示，不开放翻越。
+        out["total_for_filter"] = min(int(total_type or 0), max_window)
+        out["total_in_db"] = int(total_type or 0)
     except sqlite3.Error as e:
         out["ok"] = False
         out["error"] = sqlite_error_hint(e)

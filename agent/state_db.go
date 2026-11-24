@@ -12,7 +12,7 @@ import (
 )
 
 // stateDB 是 Agent 本地持久状态：可靠 outbox、命令回执、KV。
-// 使用 WAL + synchronous=NORMAL：进程崩溃不丢已提交数据，断电最多丢最后几毫秒。
+// 使用 WAL + synchronous=FULL：提交时同步 WAL，降低突然断电导致已确认数据丢失的风险。
 type stateDB struct {
 	db   *sql.DB
 	path string
@@ -76,8 +76,10 @@ func openStateDB(stateDir string) (*stateDB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
+	// A committed event can authorize a durable log bookmark; NORMAL is not
+	// sufficient for that guarantee after sudden power loss.
 	dsn := "file:" + filepath.ToSlash(path) +
-		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)"
+		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

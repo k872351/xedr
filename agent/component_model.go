@@ -3,8 +3,64 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
+	"sync"
+	"time"
 )
+
+type componentObservation struct {
+	state   int
+	message string
+	at      time.Time
+}
+
+var componentObservations = struct {
+	sync.RWMutex
+	items map[string]componentObservation
+}{items: make(map[string]componentObservation)}
+
+// recordComponentObservation stores the latest sensor lifecycle transition.
+func recordComponentObservation(id string, state int, message string) {
+	id = strings.TrimSpace(strings.ToLower(id))
+	if id == "" || (state != cStateStarting && state != cStateConfiguring && state != cStateHealthy && state != cStateDegraded && state != cStateFailed && state != cStateStopped) {
+		return
+	}
+	componentObservations.Lock()
+	componentObservations.items[id] = componentObservation{state: state, message: message, at: time.Now()}
+	componentObservations.Unlock()
+}
+
+func recordComponentObservationIfChanged(id string, state int, message string) {
+	id = strings.TrimSpace(strings.ToLower(id))
+	if id == "" || (state != cStateStarting && state != cStateConfiguring && state != cStateHealthy && state != cStateDegraded && state != cStateFailed && state != cStateStopped) {
+		return
+	}
+	componentObservations.Lock()
+	previous, ok := componentObservations.items[id]
+	now := time.Now()
+	if !ok || previous.state != state || previous.message != message || now.Sub(previous.at) >= 30*time.Second {
+		componentObservations.items[id] = componentObservation{state: state, message: message, at: now}
+	}
+	componentObservations.Unlock()
+}
+
+func latestComponentObservation(id string, now time.Time) (int, string, bool) {
+	componentObservations.RLock()
+	observation, ok := componentObservations.items[strings.ToLower(strings.TrimSpace(id))]
+	componentObservations.RUnlock()
+	maxAge := 2 * time.Minute
+	switch strings.ToLower(strings.TrimSpace(id)) {
+	case "rootcheck":
+		maxAge = 13 * time.Hour
+	case "sca":
+		maxAge = 25 * time.Hour
+	}
+	if !ok || now.Sub(observation.at) > maxAge || now.Before(observation.at) {
+		return cStateUnknown, "runtime status unavailable or stale", false
+	}
+	return observation.state, observation.message, true
+}
 
 // cproto.State 对齐 Elastic diagnostics state.yaml
 const (
@@ -13,19 +69,24 @@ const (
 	cStateHealthy     = 2
 	cStateDegraded    = 3
 	cStateFailed      = 4
+	cStateUnknown     = 5
 )
 
 func integrationComponentIDs() []string {
-	return []string{
+	ids := []string{
 		"etw", "winevent", "wmi_process", "fim", "registry", "evm", "ptm",
 		"amsi", "api_etw", "memory_scan", "rootcheck", "sca", "persist", "device",
 	}
+	if runtime.GOOS == "linux" {
+		ids = append(ids, "linux_journal")
+	}
+	return ids
 }
 
 func buildComponentsExpected() []map[string]any {
 	var out []map[string]any
 	for _, id := range integrationComponentIDs() {
-		if !integrationEnabled(id) {
+		if !componentSupportedOn(runtime.GOOS, id) || !integrationEnabled(id) {
 			continue
 		}
 		out = append(out, map[string]any{
@@ -38,10 +99,26 @@ func buildComponentsExpected() []map[string]any {
 	return out
 }
 
+func componentObservedAt(id string) string {
+	componentObservations.RLock()
+	observation, ok := componentObservations.items[strings.ToLower(strings.TrimSpace(id))]
+	componentObservations.RUnlock()
+	if !ok || observation.at.IsZero() {
+		return ""
+	}
+	return observation.at.UTC().Format(time.RFC3339)
+}
+
 func componentRuntimeState(id string) (state int, msg string) {
+	if !componentSupportedOn(runtime.GOOS, id) {
+		return cStateStopped, "unsupported on this platform"
+	}
 	on := integrationEnabled(id)
 	if !on {
 		return cStateStopped, "disabled by policy"
+	}
+	if observedState, observedMessage, ok := latestComponentObservation(id, time.Now()); ok {
+		return observedState, observedMessage
 	}
 	switch id {
 	case "etw":
@@ -53,36 +130,94 @@ func componentRuntimeState(id string) (state int, msg string) {
 			if !ok {
 				return cStateFailed, mode
 			}
+		} else {
+			return cStateUnknown, "runtime status unavailable"
 		}
 		return cStateHealthy, ""
 	case "wmi_process":
 		if !integrationEnabled("wmi_process") {
 			return cStateStopped, ""
 		}
-		return cStateHealthy, ""
+		return cStateUnknown, "runtime status unavailable"
 	default:
-		if on {
-			return cStateHealthy, ""
-		}
-		return cStateStopped, ""
+		return cStateUnknown, "runtime status unavailable"
 	}
 }
 
 func buildComponentsActual() []map[string]any {
 	var out []map[string]any
 	for _, id := range integrationComponentIDs() {
+		if !componentSupportedOn(runtime.GOOS, id) {
+			continue
+		}
 		st, msg := componentRuntimeState(id)
 		if st == cStateStopped && !integrationEnabled(id) {
 			continue
 		}
-		unit := map[string]any{"state": st, "message": msg}
+		observedAt := componentObservedAt(id)
+		resources := componentResourceSnapshot(id)
+		unit := map[string]any{"state": st, "message": msg, "observed_at": observedAt, "resource_usage": resources}
 		out = append(out, map[string]any{
 			"id": id,
 			"state": map[string]any{
 				"state": st, "message": msg,
-				"version_info": map[string]any{"name": "forensic-process-runtime"},
+				"version_info":   map[string]any{"name": "forensic-process-runtime"},
+				"observed_at":    observedAt,
+				"resource_usage": resources,
 			},
 			"units": map[string]any{"input-" + id: unit},
+		})
+	}
+	return out
+}
+
+func inventoryComponentHealthSnapshot(modules []string) []map[string]any {
+	out := make([]map[string]any, 0, len(modules))
+	seen := make(map[string]bool, len(modules))
+	for _, module := range modules {
+		id := strings.ToLower(strings.TrimSpace(module))
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		state, message := "UNKNOWN", "initial collection has not run"
+		componentID := "inventory_" + id
+		componentObservations.RLock()
+		observation, reported := componentObservations.items[componentID]
+		componentObservations.RUnlock()
+		maxAge := 10 * time.Minute
+		switch id {
+		case "network":
+			maxAge = 3 * time.Minute
+		case "process", "sysinfo", "startup":
+			maxAge = 15 * time.Minute
+		case "service", "task", "file", "groups", "shares", "usb":
+			maxAge = 45 * time.Minute
+		case "software", "driver", "netif", "firewall", "certs", "browser_ext":
+			maxAge = 90 * time.Minute
+		case "hotfix":
+			maxAge = 4 * time.Hour
+		}
+		if reported && time.Since(observation.at) <= maxAge && !time.Now().Before(observation.at) {
+			observed, detail := observation.state, observation.message
+			message = detail
+			switch observed {
+			case cStateHealthy:
+				state = "OK"
+			case cStateDegraded:
+				state = "DEGRADED"
+			case cStateFailed:
+				state = "FAILED"
+			case cStateStopped:
+				state = "DISABLED"
+			case cStateStarting, cStateConfiguring:
+				state = "STARTING"
+			}
+		}
+		out = append(out, map[string]any{
+			"name": componentID, "state": state, "message": message,
+			"observed_at":    componentObservedAt(componentID),
+			"resource_usage": componentResourceSnapshot(componentID),
 		})
 	}
 	return out

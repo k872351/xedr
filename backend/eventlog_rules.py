@@ -92,21 +92,35 @@ _CATEGORY_CHANNEL = {
 
 
 def log_rules_dir() -> Path:
-    """优先用精选包 log_rules/rules；若空则回退 logrules/rules（不全量加载 sigma，避免卡顿）。"""
+    """兼容旧调用：返回第一个可用规则目录。"""
+    try:
+        from . import logrules_pack
+        for row in logrules_pack.pack_roots():
+            p = Path(row["path"])
+            if row.get("enabled") and p.is_dir():
+                return p
+    except Exception:
+        pass
     root = Path(config.ROOT)
     primary = root / "log_rules" / "rules"
-    fallback = root / "logrules" / "rules"
+    if primary.is_dir():
+        return primary
+    return root / "logrules" / "hayabusa"
+
+
+def _iter_rule_files(root: Path, *, recursive: bool) -> List[Path]:
+    if not root.is_dir():
+        return []
     try:
-        if primary.is_dir() and any(primary.glob("*.yml")):
-            return primary
+        if recursive:
+            return sorted(list(root.rglob("*.yml")) + list(root.rglob("*.yaml")))
+        return sorted(list(root.glob("*.yml")) + list(root.glob("*.yaml")))
     except OSError:
-        pass
-    try:
-        if fallback.is_dir() and any(fallback.glob("*.yml")):
-            return fallback
-    except OSError:
-        pass
-    return primary
+        return []
+
+
+def _level_rank_name(level: str) -> int:
+    return _LEVEL_RANK.get((level or "medium").lower(), 2)
 
 
 def _min_level() -> str:
@@ -284,13 +298,41 @@ def load_eventlog_rules(force: bool = False) -> Dict[str, Any]:
     with _LOCK:
         if _CACHE is not None and not force:
             return _CACHE
-        root = log_rules_dir()
+        try:
+            from . import logrules_pack
+            controls = logrules_pack.load_controls()
+            root_rows = [r for r in logrules_pack.pack_roots(controls) if r.get("enabled") and r.get("present")]
+        except Exception:
+            controls = {}
+            root_rows = [{
+                "id": "log_rules_curated",
+                "path": str(log_rules_dir()),
+                "recursive": False,
+                "min_level": "low",
+            }]
+        max_no_eid = 240
+        try:
+            max_no_eid = int((controls or {}).get("max_no_eid") or 240)
+        except Exception:
+            max_no_eid = 240
+
         rules: List[Dict[str, Any]] = []
         by_eid: Dict[int, List[Dict[str, Any]]] = {}
         no_eid: List[Dict[str, Any]] = []
         errors = 0
-        if root.is_dir():
-            for p in sorted(root.glob("*.yml")) + sorted(root.glob("*.yaml")):
+        dirs: List[str] = []
+        seen_ids: Set[str] = set()
+
+        for row in root_rows:
+            root = Path(row["path"])
+            if not root.is_dir():
+                continue
+            dirs.append(str(root))
+            disabled = _disabled_titles(root)
+            min_lv = str(row.get("min_level") or "low")
+            recursive = bool(row.get("recursive"))
+            group_id = str(row.get("id") or "")
+            for p in _iter_rule_files(root, recursive=recursive):
                 try:
                     doc = yaml.safe_load(p.read_text(encoding="utf-8", errors="ignore"))
                 except Exception:
@@ -299,17 +341,30 @@ def load_eventlog_rules(force: bool = False) -> Dict[str, Any]:
                 rule = _compile_rule(doc or {}, p)
                 if not rule:
                     continue
-                if rule["title"] in _disabled_titles(root):
+                if rule["title"] in disabled:
                     continue
+                if not _level_ok(rule.get("level") or "medium", min_lv):
+                    continue
+                rid = f"{group_id}:{rule['id']}"
+                if rid in seen_ids:
+                    continue
+                seen_ids.add(rid)
+                rule["source_group"] = group_id
+                rule["id"] = rid
                 rules.append(rule)
                 if rule["event_ids"]:
                     for eid in rule["event_ids"]:
                         by_eid.setdefault(eid, []).append(rule)
                 else:
                     no_eid.append(rule)
-        # 加载时按危急度排好，匹配时合并两路有序列表，避免对每条事件再 sort
+
+        # no_eid 全事件扫描代价高：按危急度截断
         _rk = lambda r: -_level_rank(r.get("level") or "medium")
         no_eid.sort(key=_rk)
+        if max_no_eid >= 0 and len(no_eid) > max_no_eid:
+            keep_no = {id(x) for x in no_eid[:max_no_eid]}
+            no_eid = no_eid[:max_no_eid]
+            rules = [r for r in rules if (r.get("event_ids") or id(r) in keep_no)]
         for lst in by_eid.values():
             lst.sort(key=_rk)
         _CACHE = {
@@ -318,8 +373,10 @@ def load_eventlog_rules(force: bool = False) -> Dict[str, Any]:
             "no_eid": no_eid,
             "count": len(rules),
             "errors": errors,
-            "dir": str(root),
+            "dir": dirs[0] if dirs else str(log_rules_dir()),
+            "dirs": dirs,
             "min_level": _min_level(),
+            "controls": controls,
         }
         return _CACHE
 

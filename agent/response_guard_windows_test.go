@@ -46,13 +46,17 @@ func TestVerifyProcessIdentity(t *testing.T) {
 func TestFileIdentityStableAcrossRename(t *testing.T) {
 	dir := t.TempDir()
 	a := dir + `\a.txt`
-	_ = os.WriteFile(a, []byte("x"), 0600)
+	if err := os.WriteFile(a, []byte("x"), 0600); err != nil {
+		t.Skipf("测试文件系统不允许写入临时文件: %v", err)
+	}
 	id1 := fileIdentity(a)
 	if id1 == "" {
 		t.Skip("文件系统不支持文件 ID")
 	}
 	b := dir + `\b.txt`
-	_ = os.Rename(a, b)
+	if err := os.Rename(a, b); err != nil {
+		t.Skipf("测试文件系统不允许重命名临时文件: %v", err)
+	}
 	if id2 := fileIdentity(b); id2 != id1 {
 		t.Fatalf("rename 后文件 ID 应不变: %s vs %s", id1, id2)
 	}

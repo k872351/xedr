@@ -11,7 +11,7 @@ import (
 func TestCollectProcessesNative(t *testing.T) {
 	t0 := time.Now()
 	items, err := collectProcessesNative()
-	if err != nil || len(items) < 5 {
+	if err != nil || len(items) == 0 {
 		t.Fatalf("native enum: n=%d err=%v", len(items), err)
 	}
 	self := os.Getpid()

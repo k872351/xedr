@@ -201,6 +201,10 @@ func sortByRisk(items []any) {
 }
 
 func applyRiskAndSort(items []any, kind string) []any {
+	return applyRiskAndSortLimited(items, kind, maxItems)
+}
+
+func applyRiskAndSortLimited(items []any, kind string, limit int) []any {
 	for _, it := range items {
 		m, ok := it.(map[string]any)
 		if !ok {
@@ -216,7 +220,7 @@ func applyRiskAndSort(items []any, kind string) []any {
 		}
 	}
 	sortByRisk(items)
-	return truncateItems(items)
+	return truncateItemsAt(items, limit)
 }
 
 // enrichProcessModules 为高价值进程补充已加载 DLL（排除 System32 噪声，保留可疑/第三方模块）。

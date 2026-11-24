@@ -1,0 +1,10 @@
+{
+  "version": "0.13.6",
+  "stage": "stable",
+  "components": {
+    "agent": "0.13.6",
+    "backend": "1.0.0",
+    "web": "1.0.0"
+  },
+  "note": "version 与 stage 分离，便于 CI/发布脚本按版本或阶段做分支决策。"
+}

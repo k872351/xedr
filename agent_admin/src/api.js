@@ -26,7 +26,9 @@ async function apiJson(url, opts = {}) {
       const j = await resp.json()
       msg = j.detail || j.error || msg
     } catch { /* ignore */ }
-    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg))
+    const error = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg))
+    error.status = resp.status
+    throw error
   }
   if (resp.status === 204) return null
   return resp.json()
@@ -34,8 +36,8 @@ async function apiJson(url, opts = {}) {
 
 // ---------- EDR 登录 / 账号 / 配置 ----------
 
-export function edrSession() {
-  return apiJson('/api/edr/auth/session', { noAuthEvent: true })
+export function edrSession(signal) {
+  return apiJson('/api/edr/auth/session', { noAuthEvent: true, signal })
 }
 
 export function edrLogin(username, password) {
@@ -118,19 +120,21 @@ export function listProcessEntities(agentId, { q = '', alive = '' } = {}) {
   return apiJson(`/api/agent/${encodeURIComponent(agentId)}/processes?${p}`)
 }
 
-export function huntDns({ q = '', agentId = '', nxOnly = false, matchIoc = true, limit = 300 } = {}) {
+export function huntDns({ q = '', agentId = '', nxOnly = false, matchIoc = true, range = '24h', onlineOnly = true, limit = 300 } = {}) {
   const p = new URLSearchParams({
     q,
     agent_id: agentId,
     nx_only: nxOnly ? '1' : '0',
     match_ioc: matchIoc ? '1' : '0',
+    range: range || '24h',
+    online_only: onlineOnly ? '1' : '0',
     limit: String(limit),
   })
   return apiJson(`/api/agent/dns?${p}`)
 }
 
-export function getAgentRelease() {
-  return apiJson('/api/agent/release')
+export function getAgentRelease(arch = 'amd64') {
+  return apiJson(`/api/agent/release?arch=${encodeURIComponent(arch)}`)
 }
 
 /** 内存 YARA 规则包（只读，Agent 自动拉取） */
@@ -163,8 +167,18 @@ export function saveMemoryYaraControls(payload) {
   return apiJson('/api/edr/memory-yara/controls', { method: 'PUT', json: payload || {} })
 }
 
-export function buildAgentRelease() {
-  return apiJson('/api/agent/release/build', { method: 'POST', json: {} })
+/** 日志检测规则（log_rules + logrules），服务端匹配立即生效 */
+export function getLogRulesPack(reload = false) {
+  const q = reload ? '?reload=1' : ''
+  return apiJson(`/api/edr/logrules${q}`)
+}
+
+export function saveLogRulesControls(payload) {
+  return apiJson('/api/edr/logrules/controls', { method: 'PUT', json: payload || {} })
+}
+
+export function buildAgentRelease(arch = 'amd64') {
+  return apiJson(`/api/agent/release/build?arch=${encodeURIComponent(arch)}`, { method: 'POST', json: {} })
 }
 
 export function listAgents(onlineWithinSec = 45) {
@@ -179,6 +193,24 @@ export function aiStatus() {
 
 export function aiSetupLocal(payload = {}) {
   return apiJson('/api/edr/ai/setup-local', { method: 'POST', json: payload || {} })
+}
+
+/** 平台模型配置（本地 / 在线，可多套） */
+export function aiSaveConfig(payload = {}) {
+  return apiJson('/api/edr/ai/config', { method: 'PUT', json: payload || {} })
+}
+
+export function aiActivateProfile(profileId) {
+  return apiJson(`/api/edr/ai/profiles/${encodeURIComponent(profileId)}/activate`, { method: 'POST', json: {} })
+}
+
+export function aiDeleteProfile(profileId) {
+  return apiJson(`/api/edr/ai/profiles/${encodeURIComponent(profileId)}`, { method: 'DELETE' })
+}
+
+/** 测试模型连通性（可测未保存表单，或已有 profile_id） */
+export function aiTestConfig(payload = {}) {
+  return apiJson('/api/edr/ai/test', { method: 'POST', json: payload || {} })
 }
 
 export function aiListSkills({ q = '', limit = 200, edrOnly = true } = {}) {
@@ -199,29 +231,59 @@ export function aiListHosts(onlineWithinSec = 90) {
   return apiJson(`/api/edr/ai/hosts?online_within_sec=${sec}`)
 }
 
-export function aiAnalyzeHost(agentId, { skillIds = null, useLlm = true } = {}) {
+export function aiAnalyzeHost(agentId, { skillIds = null, useLlm = true, eventId = null } = {}) {
   return apiJson('/api/edr/ai/analyze-host', {
     method: 'POST',
     json: {
       agent_id: agentId,
       skill_ids: skillIds,
       use_llm: !!useLlm,
+      event_id: eventId || undefined,
+      focus_event_id: eventId || undefined,
     },
   })
 }
 
-export function getSnapshot(agentId, module) {
-  return apiJson(`/api/agent/${encodeURIComponent(agentId)}/snapshot/${encodeURIComponent(module)}`)
+export async function getSnapshot(agentId, module) {
+  const url = `/api/agent/${encodeURIComponent(agentId)}/snapshot/${encodeURIComponent(module)}`
+  // Keep existing consumers' full-list contract while bounding individual responses.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const first = await apiJson(`${url}?offset=0&limit=500`)
+      if (!first?.page) return first // older servers ignore pagination parameters
+      const { total, snapshot_version: version } = first.page
+      if (!Number.isSafeInteger(total) || total < 0 || total > 4000 || !version) throw new Error('Invalid snapshot page metadata')
+      const items = [...first.item.items]
+      let next = first.page.next_offset
+      while (next !== null) {
+        if (next !== items.length || next >= total) throw new Error('Invalid snapshot page offset')
+        const result = await apiJson(`${url}?offset=${next}&limit=500&snapshot_version=${encodeURIComponent(version)}`)
+        if (result?.page?.snapshot_version !== version || result.page.total !== total || !Array.isArray(result.item?.items) || !result.item.items.length) throw new Error('Inconsistent snapshot page')
+        items.push(...result.item.items)
+        next = result.page.next_offset
+      }
+      if (items.length !== total) throw new Error('Incomplete snapshot')
+      return { ...first, item: { ...first.item, items } }
+    } catch (error) {
+      if (error.status !== 409 || attempt === 1) throw error
+    }
+  }
 }
 
 export function agentProtocol() {
   return apiJson('/api/agent/protocol')
 }
 
-export function listEvents({ status = '', agentId = '', limit = 100, sync = false } = {}) {
+export function listEvents({ status = '', agentId = '', limit = 100, sync = false, severity = '', module = '', startAt = '', endAt = '', beforeId = null, anchorId = null } = {}) {
   const q = new URLSearchParams()
   if (status) q.set('status', status)
   if (agentId) q.set('agent_id', agentId)
+  if (severity) q.set('severity', severity)
+  if (module) q.set('module', module)
+  if (startAt) q.set('start_at', startAt)
+  if (endAt) q.set('end_at', endAt)
+  if (beforeId != null) q.set('before_id', String(beforeId))
+  if (anchorId != null) q.set('anchor_id', String(anchorId))
   q.set('limit', String(limit))
   if (sync) q.set('sync', '1')
   return apiJson(`/api/agent/events?${q}`)
@@ -267,6 +329,11 @@ export function agentRuleStats() {
   return apiJson('/api/agent/rules')
 }
 
+export function agentRuleCoverage(includeItems = false) {
+  const qs = includeItems ? '?include_items=true' : ''
+  return apiJson(`/api/agent/rules/coverage${qs}`)
+}
+
 export function listAgentRules() {
   return apiJson('/api/agent/rules')
 }
@@ -307,10 +374,13 @@ export function deleteAgent(agentId) {
   return apiJson(`/api/agent/${encodeURIComponent(agentId)}`, { method: 'DELETE' })
 }
 
-export function createAgentCommand(agentId, action, params = {}) {
+export function createAgentCommand(agentId, action, params = {}, opts = {}) {
+  const body = { action, params }
+  if (opts && opts.reason) body.reason = String(opts.reason)
+  if (opts && opts.skip_approval) body.skip_approval = true
   return apiJson(`/api/agent/${encodeURIComponent(agentId)}/commands`, {
     method: 'POST',
-    json: { action, params },
+    json: body,
   })
 }
 
@@ -360,12 +430,38 @@ export async function downloadAgentDiagnostics(agentId, commandId) {
   URL.revokeObjectURL(a.href)
 }
 
-export function listTimeline({ agentId = '', etype = '', q = '', kind = '', limit = 100 } = {}) {
+export async function downloadAgentSample(agentId, commandId) {
+  const url = `/api/agent/${encodeURIComponent(agentId)}/samples/${encodeURIComponent(commandId)}/download`
+  const resp = await fetch(url, { credentials: 'include' })
+  onUnauthorized(resp)
+  if (!resp.ok) {
+    let msg = `HTTP ${resp.status}`
+    try {
+      const j = await resp.json()
+      msg = j.detail || j.error || msg
+    } catch { /* ignore */ }
+    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg))
+  }
+  const blob = await resp.blob()
+  const cd = resp.headers.get('Content-Disposition') || ''
+  let filename = 'sample.bin'
+  const m = cd.match(/filename="?([^";]+)"?/)
+  if (m) filename = m[1]
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+export function listTimeline({ agentId = '', etype = '', q = '', kind = '', source = '', eventId = '', limit = 100 } = {}) {
   const qs = new URLSearchParams()
   if (agentId) qs.set('agent_id', agentId)
   if (etype) qs.set('etype', etype)
   if (q) qs.set('q', q)
   if (kind) qs.set('kind', kind)
+  if (source) qs.set('source', source)
+  if (eventId) qs.set('event_id', eventId)
   qs.set('limit', String(limit))
   return apiJson(`/api/agent/timeline?${qs}`)
 }
@@ -376,7 +472,7 @@ export function huntAgents(q, limit = 100) {
 
 export function investigateLogs(params = {}) {
   const qs = new URLSearchParams()
-  const keys = ['q', 'agent_id', 'hostname', 'etype', 'nature', 'path', 'hash_q', 'range', 'limit', 'offset', 'hide_proc_noise']
+  const keys = ['q', 'agent_id', 'hostname', 'etype', 'nature', 'path', 'hash_q', 'source', 'event_id', 'topic', 'range', 'limit', 'offset', 'hide_proc_noise']
   for (const k of keys) {
     const v = params[k]
     if (v !== undefined && v !== null && v !== '') qs.set(k, String(v))
@@ -415,6 +511,10 @@ export function setWhitelistEnabled(id, enabled) {
   return apiJson(`/api/agent/whitelist/${encodeURIComponent(id)}`, { method: 'PATCH', json: { enabled } })
 }
 
+export function updateWhitelist(id, patch = {}) {
+  return apiJson(`/api/agent/whitelist/${encodeURIComponent(id)}`, { method: 'PATCH', json: patch })
+}
+
 export function eventAllowCandidates(id) {
   return apiJson(`/api/agent/events/${id}/allow-candidates`)
 }
@@ -427,6 +527,18 @@ export function upsertAgentGroup(payload) {
   return apiJson('/api/agent/groups', { method: 'PUT', json: payload })
 }
 
+/** 将主机移入指定分组（互斥）；groupId 空字符串表示未分组 */
+export function assignAgentGroup(agentId, groupId = '') {
+  return apiJson('/api/agent/groups/assign', {
+    method: 'POST',
+    json: { agent_id: agentId, group_id: groupId || '' },
+  })
+}
+
+export function deleteAgentGroup(gid) {
+  return apiJson(`/api/agent/groups/${encodeURIComponent(gid)}`, { method: 'DELETE' })
+}
+
 export function listAgentAudit(limit = 100) {
   return apiJson(`/api/agent/audit?limit=${limit}`)
 }
@@ -435,12 +547,16 @@ export function listIoc() {
   return apiJson('/api/agent/ioc')
 }
 
-export function addIoc(ioc_type, value, severity = 'high', note = '') {
-  return apiJson('/api/agent/ioc', { method: 'POST', json: { ioc_type, value, severity, note } })
+export function addIoc(ioc_type, value, severity = 'high', note = '', name = '') {
+  return apiJson('/api/agent/ioc', { method: 'POST', json: { ioc_type, value, severity, note, name } })
 }
 
-export function importIoc(text, ioc_type = 'hash', severity = 'high') {
+export function importIoc(text, ioc_type = 'auto', severity = 'high') {
   return apiJson('/api/agent/ioc/import', { method: 'POST', json: { text, ioc_type, severity } })
+}
+
+export function detectIoc(value) {
+  return apiJson('/api/agent/ioc/detect', { method: 'POST', json: { value } })
 }
 
 export function deleteIoc(id) {
@@ -470,6 +586,28 @@ export function deleteSeqRule(id) {
 
 export function iocLibStatus() {
   return apiJson('/api/agent/ioc/lib-status')
+}
+
+export function lookupIocLib(value, ioc_type = '') {
+  const qs = new URLSearchParams()
+  qs.set('value', String(value || ''))
+  if (ioc_type) qs.set('ioc_type', String(ioc_type))
+  return apiJson(`/api/agent/ioc/lookup?${qs}`)
+}
+
+export function iocLibPreview({ limit = 40, offset = 0, ioc_type = '' } = {}) {
+  const qs = new URLSearchParams()
+  qs.set('limit', String(limit))
+  qs.set('offset', String(offset))
+  if (ioc_type) qs.set('ioc_type', String(ioc_type))
+  return apiJson(`/api/agent/ioc/lib-preview?${qs}`)
+}
+
+export function diagnoseLogRules({ agentId = '', limit = 300 } = {}) {
+  const qs = new URLSearchParams()
+  if (agentId) qs.set('agent_id', String(agentId))
+  if (limit) qs.set('limit', String(limit))
+  return apiJson(`/api/edr/logrules/diagnose?${qs}`)
 }
 
 export function attckBoard({ agentId = '', days = 0 } = {}) {
@@ -600,8 +738,162 @@ export function subscribeAgentStream(onEvent) {
   }
 }
 
-export async function downloadInstallPackage(onProgress) {
-  const resp = await fetch('/api/agent/install-package', { credentials: 'include' })
+// ---------- 平台新能力（审批 / 案件 / 狩猎任务 / 基线 / AI 调查等） ----------
+
+export function listResponseApprovals({ status = 'pending', agent_id = '', limit = 50 } = {}) {
+  const qs = new URLSearchParams({ status, limit: String(limit) })
+  if (agent_id) qs.set('agent_id', agent_id)
+  return apiJson(`/api/agent/response/approvals?${qs}`)
+}
+
+export function decideResponseApproval(id, payload) {
+  return apiJson(`/api/agent/response/approvals/${encodeURIComponent(id)}/decide`, {
+    method: 'POST', json: payload || {},
+  })
+}
+
+export function listAlertCases({ status = 'open', agent_id = '', limit = 50 } = {}) {
+  const qs = new URLSearchParams({ status, limit: String(limit) })
+  if (agent_id) qs.set('agent_id', agent_id)
+  return apiJson(`/api/cases?${qs}`)
+}
+
+export function mergeAlertCases(payload = {}) {
+  return apiJson('/api/cases/merge', { method: 'POST', json: payload })
+}
+
+export function setAlertCaseStatus(id, payload) {
+  return apiJson(`/api/cases/${encodeURIComponent(id)}/status`, { method: 'POST', json: payload || {} })
+}
+
+export function listHuntJobs() {
+  return apiJson('/api/hunt/jobs')
+}
+
+export function upsertHuntJob(payload) {
+  return apiJson('/api/hunt/jobs', { method: 'POST', json: payload || {} })
+}
+
+export function runHuntJob(id) {
+  return apiJson(`/api/hunt/jobs/${encodeURIComponent(id)}/run`, { method: 'POST', json: {} })
+}
+
+export function tickHuntJobs() {
+  return apiJson('/api/hunt/jobs/tick', { method: 'POST', json: {} })
+}
+
+export function buildInvestigationPack(agentId, payload = {}) {
+  return apiJson(`/api/agent/${encodeURIComponent(agentId)}/investigation-pack`, {
+    method: 'POST', json: payload,
+  })
+}
+
+export function getHostBaseline(agentId, { days = 7 } = {}) {
+  return apiJson(`/api/agent/${encodeURIComponent(agentId)}/baseline?days=${days}`)
+}
+
+export function getFleetPrevalence(value) {
+  return apiJson(`/api/agent/prevalence?value=${encodeURIComponent(value)}`)
+}
+
+export function searchTelemetryArchive(params = {}) {
+  const qs = new URLSearchParams()
+  for (const [k, v] of Object.entries(params)) {
+    if (v != null && v !== '') qs.set(k, String(v))
+  }
+  return apiJson(`/api/telemetry/archive/search?${qs}`)
+}
+
+export function runPersistDaily(payload = {}) {
+  return apiJson('/api/persist/daily/run', { method: 'POST', json: payload })
+}
+
+export function explainPersistDiff(id) {
+  return apiJson(`/api/persist/daily/${encodeURIComponent(id)}/explain`, { method: 'POST', json: {} })
+}
+
+export function listAiRuleDrafts({ status = 'pending' } = {}) {
+  return apiJson(`/api/ai/rule-drafts?status=${encodeURIComponent(status)}`)
+}
+
+export function createAiRuleDraft(payload) {
+  return apiJson('/api/ai/rule-drafts', { method: 'POST', json: payload || {} })
+}
+
+export function reviewAiRuleDraft(id, payload) {
+  return apiJson(`/api/ai/rule-drafts/${encodeURIComponent(id)}/review`, {
+    method: 'POST', json: payload || {},
+  })
+}
+
+export function runAiInvestigate(agentId, payload = {}) {
+  return apiJson(`/api/ai/investigate/${encodeURIComponent(agentId)}`, {
+    method: 'POST', json: payload,
+  })
+}
+
+export function listLineageRisk({ agent_id = '', hours = 24, limit = 50, min_score = 20 } = {}) {
+  const q = new URLSearchParams({
+    agent_id, hours: String(hours), limit: String(limit), min_score: String(min_score),
+  })
+  return apiJson(`/api/edr/lineage-risk?${q}`)
+}
+
+export function getLineageDetail(agentId, rootEntityId, { hours = 24 } = {}) {
+  return apiJson(
+    `/api/edr/lineage-risk/${encodeURIComponent(agentId)}/${encodeURIComponent(rootEntityId)}?hours=${hours}`,
+  )
+}
+
+export function listAbnormalFiles({
+  agent_id = '',
+  hours = 0,
+  q = '',
+  only_rule_hit = false,
+  unsigned_only = false,
+  ext = '',
+  limit = 300,
+} = {}) {
+  const p = new URLSearchParams({
+    agent_id,
+    hours: String(hours),
+    q,
+    only_rule_hit: only_rule_hit ? '1' : '0',
+    unsigned_only: unsigned_only ? '1' : '0',
+    ext,
+    limit: String(limit),
+  })
+  return apiJson(`/api/edr/abnormal-files?${p}`)
+}
+
+export function getNetworkAwareness({
+  agent_id = '', hours = 24, baseline_hours = 168, only_new = true, only_external = true,
+  only_http = false, proto = '', geo = '', cloud_only = false, risk = '', q = '', limit = 100,
+} = {}) {
+  const p = new URLSearchParams({
+    agent_id, hours: String(hours), baseline_hours: String(baseline_hours),
+    only_new: only_new ? 'true' : 'false', only_external: only_external ? 'true' : 'false',
+    only_http: only_http ? 'true' : 'false', proto: proto || '',
+    geo: geo || '', cloud_only: cloud_only ? 'true' : 'false', risk: risk || '',
+    q, limit: String(limit),
+  })
+  return apiJson(`/api/edr/network-awareness?${p}`)
+}
+
+export async function downloadInstallPackage(arch = 'amd64', onProgress, { allowStale = false } = {}) {
+  const target = String(arch || 'amd64').toLowerCase()
+  if (!['amd64', '386', 'arm64'].includes(target)) throw new Error('Windows architecture supports amd64, 386 and arm64')
+  return downloadAgentPackage(`/api/agent/install-package?arch=${encodeURIComponent(target)}${allowStale ? '&require_latest=false' : ''}`, `ForensicAgent_windows_${target}.zip`, 'application/zip', onProgress)
+}
+
+export async function downloadLinuxInstallPackage(arch = 'amd64', onProgress) {
+  const target = String(arch || 'amd64').toLowerCase()
+  if (!['amd64', 'arm64', 'loong64', 'riscv64'].includes(target)) throw new Error('Linux architecture supports amd64, arm64, loong64 and riscv64')
+  return downloadAgentPackage(`/api/agent/linux-package?arch=${encodeURIComponent(target)}`, `ForensicAgent_linux_${target}.tar.gz`, 'application/gzip', onProgress)
+}
+
+async function downloadAgentPackage(url, fallbackName, contentType, onProgress) {
+  const resp = await fetch(url, { credentials: 'include' })
   onUnauthorized(resp)
   if (!resp.ok) {
     let msg = `下载失败 HTTP ${resp.status}`
@@ -611,7 +903,7 @@ export async function downloadInstallPackage(onProgress) {
     } catch { /* ignore */ }
     throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg))
   }
-  let name = 'ForensicAgent_install.zip'
+  let name = fallbackName
   const cd = resp.headers.get('content-disposition') || ''
   const m = cd.match(/filename="?([^";]+)"?/i)
   if (m?.[1]) name = m[1]
@@ -630,7 +922,7 @@ export async function downloadInstallPackage(onProgress) {
       received += value.byteLength
       onProgress({ phase: 'download', received, total })
     }
-    blob = new Blob(chunks, { type: 'application/zip' })
+    blob = new Blob(chunks, { type: contentType })
   } else {
     blob = await resp.blob()
   }

@@ -7,28 +7,29 @@ import (
 )
 
 type syncBundleResp struct {
-	OK        bool           `json:"ok"`
-	Unchanged bool           `json:"unchanged"`
-	SyncRev   int            `json:"sync_rev"`
-	Policy    map[string]any `json:"policy"`
-	PolicyRev int            `json:"policy_rev"`
-	EVM       map[string]any `json:"evm"`
-	MemoryYara map[string]any `json:"memory_yara"`
-	Whitelist []map[string]any `json:"whitelist"`
-	IOC       []map[string]any `json:"ioc"`
-	PTM       map[string]any `json:"ptm"`
-	AmsiRules map[string]any `json:"amsi_rules"`
-	APIRules  map[string]any `json:"api_rules"`
-	ActiveResponse map[string]any `json:"active_response"`
-	Integrations   map[string]any `json:"integrations"`
-	RuleFIMPaths   []string       `json:"rule_fim_paths"`
-	FimRegistry    []string       `json:"fim_registry_paths"`
-	SCA            map[string]any `json:"sca"`
-	Error     string         `json:"error"`
+	OK             bool             `json:"ok"`
+	Unchanged      bool             `json:"unchanged"`
+	SyncRev        int              `json:"sync_rev"`
+	Policy         map[string]any   `json:"policy"`
+	PolicyRev      int              `json:"policy_rev"`
+	EVM            map[string]any   `json:"evm"`
+	MemoryYara     map[string]any   `json:"memory_yara"`
+	Whitelist      []map[string]any `json:"whitelist"`
+	IOC            []map[string]any `json:"ioc"`
+	PTM            map[string]any   `json:"ptm"`
+	AmsiRules      map[string]any   `json:"amsi_rules"`
+	APIRules       map[string]any   `json:"api_rules"`
+	ActiveResponse map[string]any   `json:"active_response"`
+	Integrations   map[string]any   `json:"integrations"`
+	RuleFIMPaths   []string         `json:"rule_fim_paths"`
+	FimRegistry    []string         `json:"fim_registry_paths"`
+	SCA            map[string]any   `json:"sca"`
+	DPCrypto       map[string]any   `json:"dp_crypto"`
+	Error          string           `json:"error"`
 }
 
 var (
-	syncMu     sync.Mutex
+	syncMu      sync.Mutex
 	lastSyncRev int
 )
 
@@ -44,15 +45,27 @@ func (c *APIClient) FetchSync(agentID string, sinceRev int) (*syncBundleResp, er
 }
 
 func applySyncBundle(b *syncBundleResp, pm *policyManager, syncFIM func()) {
-	if b == nil || !b.OK || b.Unchanged {
+	if b == nil || !b.OK {
+		recordSyncPart("fetch", false, "invalid or unsuccessful sync response")
+		return
+	}
+	if b.Unchanged {
 		return
 	}
 	if b.Policy != nil && b.PolicyRev > 0 {
-		pm.offer(b.PolicyRev, b.Policy)
-		applyHeartbeatPolicyPatch(b.Policy)
-		applyIntegrationsPolicy(b.Policy)
-		recordSyncPart("policy", true, "")
+		if pm != nil && pm.offer(b.PolicyRev, b.Policy) {
+			applyHeartbeatPolicyPatch(b.Policy)
+			applyIntegrationsPolicy(b.Policy)
+			dpDrv.applyPolicy(b.Policy)
+			recordSyncPart("policy", true, "")
+		} else {
+			recordSyncPart("policy", false, "rejected_or_invalid")
+			// A rejected policy must not authorize associated bundle side effects
+			// or advance the acknowledged sync revision.
+			return
+		}
 	}
+	dpDrv.applyCrypto(b.DPCrypto)
 	if b.EVM != nil {
 		loadEVMDocument(b.EVM)
 		recordSyncPart("evm", true, "")

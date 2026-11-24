@@ -11,9 +11,15 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import agent_protocol, config, timeline_filter
+from .timeline_value_format import _parse_detail, _timeline_int, _parse_ts_any
+from .attack_story_format import _ATTCK_TACTICS, _story_process_name, _build_story_lanes
+from .ioc_candidate_parser import _extract_ioc_candidates
+from .agent_alert_detail import _timeline_rule_hit_detail, _timeline_rule_hit_module
+
+from .agent_alert_promotion import _promote_sensor_alerts
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_commands (
@@ -126,95 +132,16 @@ CREATE INDEX IF NOT EXISTS idx_upgrade_created ON agent_upgrade_packages(created
 
 _lock = threading.RLock()
 
-# 命令租约：Agent 取走后在 lease 内必须 ack，否则重投；超过 max_attempts 或 deadline 终止。
-COMMAND_LEASE_DEFAULT_SEC = 60
-COMMAND_LEASE_SEC = {
-    "scan_memory": 180, "upgrade": 300, "rollback_upgrade": 300, "refresh_modules": 90,
-    "run_cmd": 120, "reg_read": 90, "fs_list": 90, "fs_stat": 60, "fs_read": 120, "fs_volumes": 60,
-    "shell_open": 60, "shell_write": 45, "shell_poll": 45, "shell_close": 30,
-}
-COMMAND_MAX_ATTEMPTS = 3
-COMMAND_TTL_DEFAULT_SEC = 1800
-COMMAND_TTL_SEC = {"upgrade": 86400, "rollback_upgrade": 86400, "uninstall_agent": 86400,
-                   "unisolate_network": 86400, "isolate_network": 3600}
-ACTIONS = (
-    "kill_process",
-    "quarantine_file",
-    "isolate_network",
-    "unisolate_network",
-    "refresh_modules",
-    "upgrade",
-    "scan_memory",
-    "restore_file",
-    "rollback_upgrade",
-    "cancel_upgrade",
-    "uninstall_agent",
-    "collect_diagnostics",
-    "reg_read",
-    "fs_list",
-    "fs_stat",
-    "fs_read",
-    "fs_volumes",
-    "live_query",
-    "run_cmd",
-    "shell_open",
-    "shell_write",
-    "shell_poll",
-    "shell_close",
-)
-
-_REMOTE_OPS_READ = frozenset({"reg_read", "fs_list", "fs_stat", "fs_read", "fs_volumes", "live_query", "shell_poll"})
-_REMOTE_OPS_SHELL = frozenset({"shell_open", "shell_write", "shell_poll", "shell_close"})
-_REMOTE_OPS_ALL = _REMOTE_OPS_READ | frozenset({"run_cmd"}) | _REMOTE_OPS_SHELL
-
-
-def _remote_ops_policy_cfg() -> Dict[str, Any]:
-    try:
-        pol = (get_policy("global").get("policy") or {})
-    except Exception:
-        pol = dict(_DEFAULT_POLICY)
-    ro = pol.get("remote_ops") if isinstance(pol.get("remote_ops"), dict) else {}
-    return {
-        "enabled": bool(pol.get("remote_ops_enabled", ro.get("enabled", True))),
-        "read_only": bool(ro.get("read_only", False)),
-        "run_cmd_enabled": bool(ro.get("run_cmd_enabled", True)),
-        "shell_enabled": bool(ro.get("shell_enabled", True)),
-    }
-
-
-def _validate_remote_ops_command(action: str, params: Dict[str, Any]) -> str:
-    act = str(action or "").strip().lower()
-    if act not in _REMOTE_OPS_ALL:
-        return ""
-    cfg = _remote_ops_policy_cfg()
-    if not cfg["enabled"]:
-        return "远程运维未启用（策略 remote_ops）"
-    if act == "run_cmd":
-        if cfg["read_only"] or not cfg["run_cmd_enabled"]:
-            return "远程命令执行未启用或处于只读模式"
-    if act in ("shell_open", "shell_write", "shell_poll", "shell_close") and not cfg["shell_enabled"]:
-        return "交互式 Shell 未启用"
-    _ = params
-    return ""
+# 命令常量与 create/poll/ack/list 已拆至 agent_commands（文末 re-export）
 
 # ATT&CK 战术顺序（看板列）
-_ATTCK_TACTICS = [
-    ("initial_access", "初始访问"),
-    ("execution", "执行"),
-    ("persistence", "持久化"),
-    ("privilege_escalation", "权限提升"),
-    ("defense_evasion", "防御绕过"),
-    ("credential_access", "凭证访问"),
-    ("discovery", "发现"),
-    ("lateral_movement", "横向移动"),
-    ("collection", "收集"),
-    ("command_and_control", "命令与控制"),
-    ("exfiltration", "数据渗出"),
-    ("impact", "影响"),
-]
 
 # 粗粒度：模块 / 标题关键字 → 技术
 _ATTCK_HINTS = [
+    (["落地文件扫描", "file_scan"], "T1204.002", "execution"),
+    (["smb共享", "smb高危", "win_smb", "admin$", "ipc$"], "T1021.002", "lateral_movement"),
+    (["横向移动工具", "lateral_tool", "psexec", "winrm", "schtasks"], "T1021.002", "lateral_movement"),
+    (["凭据访问", "credential_access", "lsass"], "T1003.001", "credential_access"),
     (["日志被清空", "win_audit_clear"], "T1070.001", "defense_evasion"),
     (["账号创建", "win_account_create"], "T1136.001", "persistence"),
     (["加入本地组", "加入组", "加入通用组", "win_group_add"], "T1098", "persistence"),
@@ -284,7 +211,19 @@ def ensure() -> None:
             )
             conn.commit()
         conn.close()
+        first = not _ensured
         _ensured = True
+    if first:
+        try:
+            from . import response_approval
+            response_approval.recover_stuck_approvals()
+        except Exception:
+            pass
+        try:
+            from . import policy_sign
+            policy_sign.ensure_policy_keypair()
+        except Exception:
+            pass
 
 
 def _audit(action: str, *, agent_id: str = "", detail: str = "", actor: str = "") -> None:
@@ -301,7 +240,7 @@ def _audit(action: str, *, agent_id: str = "", detail: str = "", actor: str = ""
 
 
 def purge_agent_data(agent_id: str) -> Dict[str, Any]:
-    """删除终端后清理时间线、指令、标签等残留。"""
+    """删除终端后清理告警、时间线、指令、标签等残留。"""
     ensure()
     aid = str(agent_id or "").strip()
     if not aid:
@@ -309,6 +248,11 @@ def purge_agent_data(agent_id: str) -> Dict[str, Any]:
     with _lock:
         conn = _connect()
         try:
+            n_ev = 0
+            try:
+                n_ev = conn.execute("DELETE FROM agent_events WHERE agent_id=?", (aid,)).rowcount
+            except Exception:
+                pass
             n_tl = conn.execute("DELETE FROM agent_timeline WHERE agent_id=?", (aid,)).rowcount
             n_cmd = conn.execute("DELETE FROM agent_commands WHERE agent_id=?", (aid,)).rowcount
             n_tag = 0
@@ -319,7 +263,13 @@ def purge_agent_data(agent_id: str) -> Dict[str, Any]:
             conn.commit()
         finally:
             conn.close()
-    return {"ok": True, "timeline": n_tl, "commands": n_cmd, "tags": n_tag}
+    if n_ev:
+        try:
+            from . import agent_protocol
+            agent_protocol.bump_live("event")
+        except Exception:
+            pass
+    return {"ok": True, "events": n_ev, "timeline": n_tl, "commands": n_cmd, "tags": n_tag}
 
 
 _ORPHAN_TABLES = (
@@ -352,261 +302,7 @@ def purge_orphan_agent_data() -> Dict[str, int]:
     return out
 
 
-def create_command(
-    agent_id: str,
-    action: str,
-    params: Optional[Dict[str, Any]] = None,
-    *,
-    actor: str = "",
-    idempotency_key: str = "",
-    ttl_sec: int = 0,
-) -> Dict[str, Any]:
-    ensure()
-    aid = str(agent_id or "").strip()
-    act = str(action or "").strip().lower()
-    if not aid or act not in ACTIONS:
-        return {"ok": False, "error": "agent_id 或 action 无效"}
-    pol_err = _validate_remote_ops_command(act, params or {})
-    if pol_err:
-        return {"ok": False, "error": pol_err}
-    cid = uuid.uuid4().hex
-    now = _now()
-    blob = json.dumps(params or {}, ensure_ascii=False)
-    idem = str(idempotency_key or "").strip()[:96]
-    ttl = int(ttl_sec or 0) or COMMAND_TTL_SEC.get(act, COMMAND_TTL_DEFAULT_SEC)
-    deadline = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + ttl))
-    with _lock:
-        conn = _connect()
-        try:
-            row = conn.execute("SELECT agent_id FROM agents WHERE agent_id=?", (aid,)).fetchone()
-            if not row:
-                return {"ok": False, "error": "终端不存在"}
-            if idem:
-                # 同一幂等键且未失败/过期的命令直接复用，避免前端重复点击重复下发
-                dup = conn.execute(
-                    """SELECT id, status FROM agent_commands
-                       WHERE agent_id=? AND idempotency_key=? AND status NOT IN ('failed','expired')
-                       ORDER BY created_at DESC LIMIT 1""",
-                    (aid, idem),
-                ).fetchone()
-                if dup:
-                    return {"ok": True, "id": dup["id"], "action": act, "status": dup["status"], "deduped": True}
-            conn.execute(
-                """INSERT INTO agent_commands(id, agent_id, action, params_json, status, created_by, created_at, updated_at,
-                                              deadline, idempotency_key, max_attempts, attempts, lease_until)
-                   VALUES(?,?,?,?, 'pending', ?, ?, ?, ?, ?, ?, 0, '')""",
-                (cid, aid, act, blob, actor[:64], now, now, deadline, idem, COMMAND_MAX_ATTEMPTS),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    _audit(f"command:{act}", agent_id=aid, detail=blob, actor=actor)
-    agent_protocol.bump_live("command", agent_id=aid, command_id=cid)
-    return {"ok": True, "id": cid, "action": act, "status": "pending"}
-
-
-def poll_commands(agent_id: str, *, limit: int = 10) -> Dict[str, Any]:
-    ensure()
-    aid = str(agent_id or "").strip()
-    if not aid:
-        return {"ok": False, "error": "缺少 agent_id"}
-    now = _now()
-    with _lock:
-        conn = _connect()
-        try:
-            # 只有声明 command.lease 的新 Agent 才会重投（它有本地回执去重）；旧 Agent 保持至多一次
-            crow = conn.execute("SELECT capabilities_json FROM agents WHERE agent_id=?", (aid,)).fetchone()
-            try:
-                lease_ok = "command.lease" in json.loads((crow["capabilities_json"] if crow else "") or "[]")
-            except Exception:
-                lease_ok = False
-            # 1) 过期：超过 deadline 仍未完成 → expired；租约耗尽且重试用完 → failed
-            conn.execute(
-                """UPDATE agent_commands SET status='expired', updated_at=?,
-                          result_json=COALESCE(NULLIF(result_json,''), '{"error":"deadline exceeded"}')
-                   WHERE agent_id=? AND status IN ('pending','sent') AND deadline<>'' AND deadline<?""",
-                (now, aid, now),
-            )
-            conn.execute(
-                """UPDATE agent_commands SET status='failed', updated_at=?,
-                          result_json='{"error":"lease exhausted: agent never acked"}'
-                   WHERE agent_id=? AND status='sent' AND lease_until<>'' AND lease_until<? AND attempts>=max_attempts
-                     AND ?=1""",
-                (now, aid, now, 1 if lease_ok else 0),
-            )
-            # 2) 取 pending，或租约已过期且仍有重试额度的 sent（Agent 崩溃/ack 丢失时重投）
-            rows = conn.execute(
-                """SELECT id, action, params_json, created_at, attempts, deadline FROM agent_commands
-                   WHERE agent_id=? AND (status='pending'
-                      OR (status='sent' AND lease_until<>'' AND lease_until<? AND attempts<max_attempts AND ?=1))
-                   ORDER BY created_at ASC LIMIT ?""",
-                (aid, now, 1 if lease_ok else 0, max(1, min(int(limit or 10), 50))),
-            ).fetchall()
-            items = []
-            for r in rows:
-                try:
-                    params = json.loads(r["params_json"] or "{}")
-                except Exception:
-                    params = {}
-                lease_sec = COMMAND_LEASE_SEC.get(r["action"], COMMAND_LEASE_DEFAULT_SEC)
-                lease_until = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + lease_sec))
-                conn.execute(
-                    """UPDATE agent_commands SET status='sent', updated_at=?, lease_until=?, attempts=attempts+1
-                       WHERE id=?""",
-                    (now, lease_until, r["id"]),
-                )
-                items.append({
-                    "id": r["id"],
-                    "action": r["action"],
-                    "params": params,
-                    "created_at": r["created_at"],
-                    "attempt": int(r["attempts"] or 0) + 1,
-                    "lease_sec": lease_sec,
-                    "deadline": r["deadline"] or "",
-                })
-            conn.commit()
-            return {"ok": True, "items": items}
-        finally:
-            conn.close()
-
-
-def command_owner(command_id: str) -> str:
-    ensure()
-    with _lock:
-        conn = _connect()
-        try:
-            r = conn.execute("SELECT agent_id FROM agent_commands WHERE id=?", (str(command_id or ""),)).fetchone()
-            return str(r["agent_id"]) if r else ""
-        finally:
-            conn.close()
-
-
-def ack_command(
-    command_id: str,
-    *,
-    ok: bool,
-    result: Optional[Dict[str, Any]] = None,
-    caller_agent_id: str = "",
-) -> Dict[str, Any]:
-    """回执。caller_agent_id 非空时必须与命令所属 Agent 一致（凭据隔离）；重复回执幂等。"""
-    ensure()
-    cid = str(command_id or "").strip()
-    if not cid:
-        return {"ok": False, "error": "缺少 command_id"}
-    st = "done" if ok else "failed"
-    now = _now()
-    store_result = dict(result or {})
-    with _lock:
-        conn_peek = _connect()
-        try:
-            peek = conn_peek.execute(
-                "SELECT agent_id, action FROM agent_commands WHERE id=?", (cid,)
-            ).fetchone()
-        finally:
-            conn_peek.close()
-    if peek and peek["action"] == "collect_diagnostics" and ok:
-        try:
-            from . import agent_diagnostics as adiag
-
-            slim = adiag.persist_from_command_result(str(peek["agent_id"]), cid, store_result)
-            if isinstance(slim, dict):
-                store_result = slim
-        except Exception as e:
-            print("[diagnostics] persist:", e)
-            if "content_base64" in store_result:
-                store_result = {k: v for k, v in store_result.items() if k != "content_base64"}
-                store_result["stored"] = False
-                store_result["error"] = str(e)[:200]
-    blob = json.dumps(store_result, ensure_ascii=False)[:8000]
-    with _lock:
-        conn = _connect()
-        try:
-            cur_row = conn.execute(
-                "SELECT agent_id, status, acked_at FROM agent_commands WHERE id=?", (cid,)
-            ).fetchone()
-            if not cur_row:
-                return {"ok": False, "error": "指令不存在"}
-            if caller_agent_id and cur_row["agent_id"] != caller_agent_id:
-                return {"ok": False, "error": "指令不属于该 Agent", "forbidden": True}
-            if cur_row["status"] in ("done", "failed") and cur_row["acked_at"]:
-                # 重复回执（断网重传 / v2 重放）：保持首个结果，直接确认
-                return {"ok": True, "id": cid, "status": cur_row["status"], "duplicate": True}
-            conn.execute(
-                """UPDATE agent_commands SET status=?, result_json=?, updated_at=?, acked_at=?
-                   WHERE id=?""",
-                (st, blob, now, now, cid),
-            )
-            conn.commit()
-            row = conn.execute("SELECT agent_id, action FROM agent_commands WHERE id=?", (cid,)).fetchone()
-        finally:
-            conn.close()
-    if row:
-        _audit(f"ack:{row['action']}:{st}", agent_id=row["agent_id"], detail=blob)
-        agent_protocol.bump_live("command_ack", agent_id=row["agent_id"], command_id=cid, status=st)
-        if row["action"] == "scan_memory" and ok:
-            _memscan_to_events(row["agent_id"], result or {})
-    return {"ok": True, "id": cid, "status": st}
-
-
-def _memscan_to_events(agent_id: str, result: Dict[str, Any]) -> int:
-    findings = result.get("findings") if isinstance(result.get("findings"), list) else []
-    n = 0
-    for f in findings[:20]:
-        if not isinstance(f, dict):
-            continue
-        mod = "memory"
-        if f.get("building_block"):
-            mod = "building_block"
-        detail = {
-            "scan_mode": result.get("mode"),
-            "yara_engine": result.get("yara_engine"),
-            "rules_rev": result.get("rules_rev"),
-            "engine": f.get("engine"),
-            "rule_id": f.get("rule_id"),
-            "rule_name": f.get("rule_name"),
-            "type": f.get("type"),
-            "pid": f.get("pid"),
-            "name": f.get("name"),
-            "address": f.get("address"),
-            "matched_string": f.get("matched_string"),
-            "matched_strings": f.get("matched_strings"),
-            "mitre": f.get("mitre"),
-            "building_block": bool(f.get("building_block")),
-            "investigation": "打开进程树核对签名与路径；YARA 命中建议对该 PID 做隔离或内存转储复核。",
-        }
-        ev = agent_protocol.report_event({
-            "agent_id": agent_id,
-            "module": mod,
-            "severity": str(f.get("severity") or "high"),
-            "title": str(f.get("summary") or f.get("title") or f"内存可疑：{f.get('type')}")[:200],
-            "detail": detail,
-            "building_block": bool(f.get("building_block")),
-        })
-        if ev.get("ok") and not ev.get("deduped") and not ev.get("suppressed"):
-            n += 1
-    return n
-
-
-def list_commands(agent_id: str = "", *, limit: int = 50) -> Dict[str, Any]:
-    ensure()
-    with _lock:
-        conn = _connect()
-        try:
-            if agent_id:
-                rows = conn.execute(
-                    "SELECT * FROM agent_commands WHERE agent_id=? ORDER BY created_at DESC LIMIT ?",
-                    (agent_id, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM agent_commands ORDER BY created_at DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
-            items = [dict(r) for r in rows]
-            return {"ok": True, "items": items}
-        finally:
-            conn.close()
-
+# create_command / poll_commands / ack_command / list_commands → agent_commands
 
 def _is_agent_self_noise(etype: str, summary: str, detail: Dict[str, Any]) -> bool:
     """过滤端侧噪声：Agent 自写临时脚本 + Windows PowerShell 策略探针。"""
@@ -715,233 +411,8 @@ def _apply_process_cmd_patch(
         )
 
 
-def ingest_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Agent 批量写入时间线条目。"""
-    ensure()
-    agent_id = str(payload.get("agent_id") or "").strip()
-    if not agent_id:
-        return {"ok": False, "error": "缺少 agent_id"}
-    events = payload.get("events")
-    if not isinstance(events, list):
-        events = []
-    # 单包上限放宽；超出的分批仍由 Agent 侧 drain 保留到下一轮，这里不再静默丢掉大半
-    events = events[:800]
-    host = str(payload.get("hostname") or "").strip()[:128] or agent_protocol._host_of(agent_id)
-    now = _now()
-    n = 0
-    rows: List[Dict[str, Any]] = []
-    tele: List[Any] = []
-    detect_events: List[Dict[str, Any]] = []
-    with _lock:
-        conn = _connect()
-        try:
-            for ev in events:
-                if not isinstance(ev, dict):
-                    continue
-                etype = str(ev.get("etype") or ev.get("type") or "event")[:64]
-                summary = str(ev.get("summary") or ev.get("title") or "")[:300]
-                if not summary:
-                    continue
-                detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {"raw": ev.get("detail")}
-                # Agent 自用临时脚本（fa-ps-*.ps1 等）不当作文件告警入库
-                if _is_agent_self_noise(etype, summary, detail if isinstance(detail, dict) else {}):
-                    continue
-                if timeline_filter.is_collector_noise(agent_id, etype, detail) or \
-                        timeline_filter.is_generated_script(etype, detail):
-                    continue
-                if etype == "process_cmd_patch" and isinstance(detail, dict):
-                    try:
-                        _apply_process_cmd_patch(conn, agent_id, detail, str(ev.get("ts") or now)[:32])
-                    except Exception:
-                        pass
-                    tele.append((etype, detail, str(ev.get("ts") or now)[:32]))
-                    continue
-                # 重复源仍交给规则匹配：不同来源字段不全（如仅部分带命令行）
-                detect_events.append(ev)
-                # 进程实体 / DNS 聚合不受展示开关影响（关掉"进程退出"展示也要记录退出时间）
-                tele.append((etype, detail, str(ev.get("ts") or now)[:32]))
-                # 规则管理中关闭的内置传感器检出不再入库
-                try:
-                    from . import agent_rules as _ar
-                    if not _ar.sensor_event_allowed(etype, summary, detail):
-                        # 进程退出传感器默认关闭，但仍需入库供「进程退出」时间线分类展示
-                        if timeline_filter.etype_kind(etype) != "exit":
-                            continue
-                except Exception:
-                    pass
-                if timeline_filter.is_duplicate(agent_id, etype, detail):
-                    continue
-                sev = str(ev.get("severity") or "info")[:16]
-                ts = timeline_filter.fix_etw_ts(etype, str(ev.get("ts") or now)[:32], now)
-                # 与告警详情同源：按字段收缩，绝不切坏 JSON（硬截断会导致详情页全空）
-                detail_s = agent_protocol.fit_detail(detail or {})
-                ent = str((detail or {}).get("entity_id") or "")[:64] if isinstance(detail, dict) else ""
-                conn.execute(
-                    """INSERT INTO agent_timeline(agent_id, hostname, etype, summary, detail_json, severity, ts, created_at, entity_id)
-                       VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (agent_id, host, etype, summary, detail_s, sev, ts, now, ent),
-                )
-                rows.append({
-                    "agent_id": agent_id, "hostname": host, "etype": etype, "summary": summary,
-                    "detail_json": detail_s, "severity": sev, "ts": ts, "created_at": now,
-                })
-                try:
-                    from . import elastic_detection_es as _edes
-                    det = detail if isinstance(detail, dict) else {}
-                    _edes.index_event_async(
-                        agent_id=agent_id, hostname=host, etype=etype, summary=summary, detail=det, ts=ts,
-                    )
-                except Exception:
-                    pass
-                n += 1
-            if tele:
-                from . import agent_telemetry
-                agent_telemetry.apply(conn, agent_id, tele)
-            conn.commit()
-        finally:
-            conn.close()
-    elastic_reported = 0
-    if detect_events:
-        try:
-            from . import agent_rules as _ar
-            from . import agent_sync as _asy
-            from . import elastic_detection_import as _edi
-
-            do_elastic = _asy.server_detection_enabled("elastic_evm_ingest")
-            do_custom_evm = _asy.server_detection_enabled("evm_ingest")
-
-            for ev in detect_events[:400]:
-                if elastic_reported >= 12:
-                    break
-                if not isinstance(ev, dict):
-                    continue
-                det0 = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
-                if str(ev.get("etype") or "").startswith("process_create"):
-                    det0 = _ar.enrich_process_event_detail(
-                        agent_id, det0, str(ev.get("summary") or ""),
-                    )
-                    ev = {**ev, "detail": det0}
-                matched = False
-                if do_elastic:
-                    for r in _edi.match_timeline_event(ev):
-                        title = str(r.get("title") or "Elastic 时间线命中")[:200]
-                        src = str(r.get("source") or "elastic")
-                        if src != "protections-artifacts" and str(r.get("id") or "").endswith(".prot.evm"):
-                            src = "protections"
-                        prefix = "Protections EVM" if src.startswith("protections") else "Elastic EVM"
-                        detail = _timeline_rule_hit_detail(
-                            ev,
-                            rule_id=r.get("id"),
-                            rule_title=title,
-                            rule_source=src,
-                            building_block=True,
-                            extra={
-                                "elastic_rule_id": r.get("elastic_rule_id") or r.get("protections_rule_id"),
-                            },
-                        )
-                        agent_protocol.report_event({
-                            "agent_id": agent_id,
-                            "hostname": host,
-                            "module": _timeline_rule_hit_module(ev, detail),
-                            "severity": str(r.get("severity") or "medium"),
-                            "title": f"{prefix}：{title}"[:200],
-                            "detail": detail,
-                        })
-                        elastic_reported += 1
-                        matched = True
-                        break
-                if not matched and do_custom_evm:
-                    for r in _ar.match_live_evm_events(ev):
-                        title = str(r.get("title") or "EVM 命中")[:200]
-                        rid = str(r.get("id") or "")
-                        src = "custom"
-                        if rid.startswith("elastic-"):
-                            src = "elastic"
-                        elif ".prot.evm" in rid:
-                            src = "protections"
-                        detail = _timeline_rule_hit_detail(
-                            ev,
-                            rule_id=rid,
-                            rule_title=title,
-                            rule_source=src,
-                            building_block=bool(r.get("building_block")),
-                        )
-                        agent_protocol.report_event({
-                            "agent_id": agent_id,
-                            "hostname": host,
-                            "module": _timeline_rule_hit_module(ev, detail),
-                            "severity": str(r.get("severity") or "high"),
-                            "title": f"EVM：{title}"[:200],
-                            "detail": detail,
-                        })
-                        elastic_reported += 1
-                        break
-        except Exception:
-            pass
-    if n:
-        agent_protocol.bump_live("timeline", agent_id=agent_id, count=n)
-        try:
-            from . import agent_store
-            threading.Thread(target=agent_store.write_timeline_batch, args=(rows,), daemon=True).start()
-            agent_store.maybe_purge()
-        except Exception:
-            pass
-    return {"ok": True, "inserted": n, "elastic_hits": elastic_reported, "_detect_events": detect_events}
 
 
-def list_timeline(
-    agent_id: str = "", *, etype: str = "", q: str = "", kind: str = "", limit: int = 100,
-) -> Dict[str, Any]:
-    ensure()
-    limit = max(1, min(int(limit or 100), 500))
-    clauses = []
-    args: List[Any] = []
-    if agent_id:
-        clauses.append("agent_id=?")
-        args.append(agent_id)
-    if etype:
-        clauses.append("etype=?")
-        args.append(etype)
-    if q:
-        clauses.append("(summary LIKE ? OR detail_json LIKE ? OR hostname LIKE ?)")
-        like = f"%{q}%"
-        args.extend([like, like, like])
-    kind = str(kind or "").strip().lower()
-    with _lock:
-        conn = _connect()
-        try:
-            base = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-            kinds: Dict[str, int] = {k: 0 for k in timeline_filter.KIND_ORDER}
-            etypes_by_kind: Dict[str, List[str]] = {}
-            total = 0
-            for et, cnt in conn.execute(f"SELECT etype, COUNT(*) FROM agent_timeline{base} GROUP BY etype", args):
-                k = timeline_filter.etype_kind(et)
-                kinds[k] = kinds.get(k, 0) + int(cnt)
-                etypes_by_kind.setdefault(k, []).append(et)
-                total += int(cnt)
-            where_clauses, where_args = list(clauses), list(args)
-            if kind:
-                ets = etypes_by_kind.get(kind) or []
-                if not ets:
-                    return {"ok": True, "items": [], "kinds": kinds, "total": total}
-                where_clauses.append(f"etype IN ({','.join('?' * len(ets))})")
-                where_args.extend(ets)
-            where = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-            rows = conn.execute(
-                f"SELECT * FROM agent_timeline{where} ORDER BY ts DESC, id DESC LIMIT ?",
-                (*where_args, limit),
-            ).fetchall()
-            items = []
-            for r in rows:
-                d = dict(r)
-                try:
-                    d["detail"] = json.loads(d.pop("detail_json") or "{}")
-                except Exception:
-                    d["detail"] = {}
-                items.append(d)
-            return {"ok": True, "items": items, "kinds": kinds, "total": total}
-        finally:
-            conn.close()
 
 
 def clean_timeline_history() -> Dict[str, Any]:
@@ -961,7 +432,7 @@ _THREAT_ETYPES = {
 _RISK_ETYPES = {
     "file_create", "file_write", "file_write_etw",
     "image_load_etw", "image_load_kernel",
-    "network_connect", "network_connect_etw",
+    "network_connect", "network_connect_etw", "http_request_etw", "beacon_like",
     "driver_load_kernel",
 }
 _SURFACE_ETYPES = {"protect_block_kernel", "sensor_status", "etw_status"}
@@ -984,35 +455,160 @@ def _log_nature(sev: str, etype: str, summary: str = "") -> str:
     return "minor"
 
 
-def _parse_detail(raw: Any) -> Dict[str, Any]:
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str) and raw.strip():
-        try:
-            o = json.loads(raw)
-            return o if isinstance(o, dict) else {}
-        except Exception:
-            return {}
-    return {}
+def _inv_chain_nodes(det: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """PTM/EVM 等聚合事件：从 trigger/chain 抽出节点证据。"""
+    out: List[Dict[str, Any]] = []
+    if not isinstance(det, dict):
+        return out
+    trig = det.get("trigger")
+    if isinstance(trig, dict):
+        out.append(trig)
+    chain = det.get("chain")
+    if isinstance(chain, list):
+        for c in reversed(chain):
+            if isinstance(c, dict):
+                out.append(c)
+    return out
 
 
-def _timeline_int(v: Any) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return 0
+# 本产品中几乎只由 Sysmon 产出的 etype（无 source 字段时也可认）
+_SYSMON_MARKER_ETYPES = frozenset({
+    "process_create_sysmon", "process_exit_sysmon", "image_load_sysmon",
+    "driver_load_sysmon",
+    "file_create", "file_delete", "file_delete_detected", "file_stream_create",
+    "pipe_created", "process_tampering",
+    "registry_create", "registry_rename",
+})
+
+_INV_TOPIC_LABELS = {
+    "file_create": "文件创建",
+    "service": "服务",
+    "task": "计划任务",
+    "startup": "启动项",
+}
 
 
-def _parse_ts_any(s: str) -> Optional[datetime]:
-    raw = str(s or "").strip().replace("T", " ").replace("Z", "")
-    if not raw:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-        try:
-            return datetime.strptime(raw[:19], fmt)
-        except ValueError:
-            continue
-    return None
+def _inv_topics(etype: str, det: Dict[str, Any], summary: str = "", *, _depth: int = 0) -> List[str]:
+    """调查页固定主题：文件创建 / 服务 / 计划任务 / 启动项。"""
+    et = str(etype or "").lower()
+    det = det if isinstance(det, dict) else {}
+    path = str(
+        det.get("path")
+        or det.get("reg_key")
+        or det.get("image")
+        or det.get("target_path")
+        or det.get("task")
+        or ""
+    ).lower()
+    topic_hint = str(det.get("topic") or "").lower()
+    out: List[str] = []
+
+    def add(t: str) -> None:
+        if t and t not in out:
+            out.append(t)
+
+    if topic_hint in _INV_TOPIC_LABELS:
+        add(topic_hint)
+
+    if et in ("file_create", "file_write", "file_write_etw", "file_stream_create") or et.startswith("fim_"):
+        add("file_create")
+    if et.startswith("win_service") or (
+        "\\services\\" in path
+        and any(x in path for x in ("\\imagepath", "\\servicedll", "\\start", "\\servicemanifest"))
+    ):
+        add("service")
+    if et.startswith("win_task") or "\\tasks\\" in path or "\\windows\\tasks" in path:
+        add("task")
+    if (
+        et.startswith("persist_")
+        or et.startswith("wmi_persist")
+        or "currentversion\\run" in path
+        or "\\runonce" in path
+        or "\\startup\\" in path
+        or "\\start menu\\" in path
+        or "shell folders\\startup" in path
+        or "\\winlogon" in path
+        or "\\appinit_dlls" in path
+        or "image file execution options" in path
+    ):
+        add("startup")
+
+    if _depth < 1:
+        for n in _inv_chain_nodes(det):
+            for t in _inv_topics(str(n.get("etype") or ""), n, str(n.get("summary") or ""), _depth=_depth + 1):
+                add(t)
+    return out
+
+
+def _inv_match_topic(topic: str, etype: str, det: Dict[str, Any], summary: str = "") -> bool:
+    t = str(topic or "").strip().lower()
+    if not t:
+        return True
+    return t in _inv_topics(etype, det, summary)
+
+
+def _inv_involves_sysmon(etype: str, det: Dict[str, Any], summary: str = "") -> bool:
+    et = str(etype or "").lower()
+    if "sysmon" in et or et in _SYSMON_MARKER_ETYPES:
+        return True
+    if str((det or {}).get("source") or "").lower() == "sysmon":
+        return True
+    ch = str((det or {}).get("channel") or "").lower()
+    if "sysmon" in ch:
+        return True
+    if "sysmon" in str(summary or "").lower():
+        return True
+    for n in _inv_chain_nodes(det or {}):
+        net = str(n.get("etype") or "").lower()
+        if "sysmon" in net or net in _SYSMON_MARKER_ETYPES:
+            return True
+        if str(n.get("source") or "").lower() == "sysmon":
+            return True
+        if "sysmon" in str(n.get("channel") or "").lower():
+            return True
+    return False
+
+
+def _inv_list_fields(etype: str, det: Dict[str, Any], summary: str = "") -> Dict[str, Any]:
+    """日志调查列表瘦身字段：补进程路径，并标出 Sysmon / 源 etype。"""
+    det = det if isinstance(det, dict) else {}
+    name = det.get("name") or det.get("process_name")
+    path = det.get("path") or det.get("image") or det.get("target_path")
+    cmd = det.get("command_line")
+    pid = det.get("pid")
+    source_etype = str(det.get("source_etype") or "") or None
+    for n in _inv_chain_nodes(det):
+        if not source_etype:
+            se = str(n.get("etype") or "").strip()
+            if se:
+                source_etype = se
+        if not name:
+            name = n.get("name") or n.get("process_name")
+            if not name:
+                img = str(n.get("image") or n.get("path") or "").strip()
+                if img and "\\" in img:
+                    name = img.rsplit("\\", 1)[-1]
+        if not path:
+            path = n.get("path") or n.get("image") or n.get("reg_key") or n.get("key") or n.get("target_path")
+        if not cmd:
+            cmd = n.get("command_line")
+        if pid is None and n.get("pid") not in (None, ""):
+            pid = n.get("pid")
+    src = str(det.get("source") or "")
+    is_sys = _inv_involves_sysmon(etype, det, summary)
+    if is_sys and not src:
+        src = "sysmon"
+    return {
+        "pid": pid,
+        "name": name,
+        "path": path,
+        "command_line": (str(cmd)[:180] if cmd else None),
+        "source": src,
+        "source_etype": source_etype,
+        "event_id": det.get("event_id"),
+        "channel": det.get("channel") or "",
+        "is_sysmon": is_sys,
+    }
 
 
 _DROP_FILE_ETYPES = frozenset({
@@ -1091,136 +687,6 @@ def _file_step_from_timeline(row: Dict[str, Any], d: Dict[str, Any]) -> Dict[str
     }
 
 
-def _build_threat_drop_chain(
-    agent_id: str,
-    ev: Optional[Dict[str, Any]],
-    seed: Optional[Dict[str, Any]],
-    chain: List[Dict[str, Any]],
-    seed_pid: Any,
-) -> Dict[str, Any]:
-    """父进程 → 写文件 → 子进程：基于时间线窗口的释放/投递链。"""
-    aid = str(agent_id or "").strip()
-    if not aid:
-        return {"steps": [], "edges": []}
-
-    hit_pid = _timeline_int(seed.get("pid")) if seed else 0
-    if not hit_pid and seed_pid not in (None, ""):
-        hit_pid = _timeline_int(seed_pid)
-
-    center_ts = ""
-    if ev:
-        center_ts = str(ev.get("created_at") or ev.get("ts") or "")
-        raw = ev.get("detail_obj") or ev.get("detail") or {}
-        if isinstance(raw, str):
-            raw = _parse_detail(raw)
-        if isinstance(raw, dict):
-            evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else raw
-            inner = evidence.get("evidence") if isinstance(evidence.get("evidence"), dict) else evidence
-            if isinstance(inner, dict):
-                center_ts = center_ts or str(inner.get("event_ts") or inner.get("ts") or "")
-            center_ts = center_ts or str(raw.get("event_ts") or raw.get("ts") or "")
-
-    dt = _parse_ts_any(center_ts) or datetime.utcnow()
-    t0 = (dt - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
-    t1 = (dt + timedelta(minutes=45)).strftime("%Y-%m-%d %H:%M:%S")
-
-    tl_rows: List[Dict[str, Any]] = []
-    with _lock:
-        conn = _connect()
-        try:
-            rows = conn.execute(
-                """SELECT id, etype, summary, detail_json, ts, severity
-                   FROM agent_timeline WHERE agent_id=? AND ts >= ? AND ts <= ?
-                   ORDER BY ts ASC LIMIT 500""",
-                (aid, t0, t1),
-            ).fetchall()
-            tl_rows = [dict(r) for r in rows]
-        finally:
-            conn.close()
-
-    steps: List[Dict[str, Any]] = []
-    parent_p = chain[-2] if len(chain) >= 2 else None
-    if not parent_p and seed:
-        pp = _timeline_int(seed.get("ppid"))
-        if pp:
-            for row in reversed(tl_rows):
-                et = str(row.get("etype") or "")
-                if not et.startswith("process_create"):
-                    continue
-                d = _parse_detail(row.get("detail_json"))
-                if _timeline_int(d.get("pid")) == pp:
-                    steps.append(_proc_step_from_timeline(row, d, role="parent"))
-                    break
-    elif parent_p:
-        steps.append(_proc_step_from_entity(parent_p, role="parent"))
-
-    if seed:
-        steps.append(_proc_step_from_entity(seed, role="hit", is_hit=True))
-    elif hit_pid:
-        title = str((ev or {}).get("title") or "").strip()
-        steps.append({
-            "id": f"proc-hit-{hit_pid}",
-            "kind": "proc",
-            "role": "hit",
-            "is_hit": True,
-            "name": title or f"PID {hit_pid}",
-            "pid": hit_pid,
-            "path": "",
-            "ts": center_ts,
-            "timeline_id": None,
-        })
-
-    files: List[tuple] = []
-    children: List[tuple] = []
-    for row in tl_rows:
-        et = str(row.get("etype") or "")
-        d = _parse_detail(row.get("detail_json"))
-        if et in _DROP_FILE_ETYPES:
-            cpid = _timeline_int(d.get("pid") or d.get("process_id") or d.get("creator_pid"))
-            if hit_pid and cpid == hit_pid:
-                files.append((row, d))
-        if et in _DROP_PROC_ETYPES or et.startswith("process_create"):
-            if hit_pid and _timeline_int(d.get("ppid")) == hit_pid:
-                children.append((row, d))
-
-    files.sort(key=lambda x: str(x[0].get("ts") or ""))
-    children.sort(key=lambda x: str(x[0].get("ts") or ""))
-
-    used_children: set = set()
-    child_count = 0
-    for row, d in files[:12]:
-        fp = str(d.get("path") or "").strip()
-        base = os.path.basename(fp).lower() if fp else ""
-        steps.append(_file_step_from_timeline(row, d))
-        for j, (crow, cd) in enumerate(children):
-            if j in used_children:
-                continue
-            cp = str(cd.get("path") or cd.get("image") or "")
-            cmd = str(cd.get("command_line") or cd.get("cmdline") or "")
-            blob = f"{cp} {cmd}".lower()
-            if fp and (fp.lower() in blob or (base and base in blob)):
-                used_children.add(j)
-                child_count += 1
-                steps.append(_proc_step_from_timeline(crow, cd, role="child"))
-                break
-
-    for j, (crow, cd) in enumerate(children):
-        if j in used_children or child_count >= 8:
-            continue
-        used_children.add(j)
-        child_count += 1
-        steps.append(_proc_step_from_timeline(crow, cd, role="child"))
-
-    edges = [
-        {"from": i, "to": i + 1, "label": _drop_edge_label(steps[i], steps[i + 1])}
-        for i in range(len(steps) - 1)
-    ]
-    return {
-        "steps": steps,
-        "edges": edges,
-        "window": {"from": t0, "to": t1},
-        "hit_pid": hit_pid or None,
-    }
 
 
 def _hour_bucket(ts: str) -> str:
@@ -1230,423 +696,8 @@ def _hour_bucket(ts: str) -> str:
     return s[:10] + " 00:00" if len(s) >= 10 else "unknown"
 
 
-def investigate_logs(
-    *,
-    q: str = "",
-    agent_id: str = "",
-    hostname: str = "",
-    etype: str = "",
-    nature: str = "",
-    path: str = "",
-    hash_q: str = "",
-    range_key: str = "today",
-    limit: int = 200,
-    offset: int = 0,
-    hide_proc_noise: bool = True,
-) -> Dict[str, Any]:
-    """日志调查：Agent 实时时间线检索 + 直方分布 + 分桶计数。"""
-    ensure()
-    limit = max(1, min(int(limit or 200), 500))
-    offset = max(0, int(offset or 0))
-    now = time.time()
-    cut = ""
-    rk = str(range_key or "today").lower()
-    if rk in ("1h", "hour"):
-        cut = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - 3600))
-    elif rk in ("24h", "today", "day"):
-        cut = time.strftime("%Y-%m-%dT00:00:00", time.localtime(now))
-    elif rk in ("7d", "week"):
-        cut = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - 7 * 86400))
-    elif rk in ("30d", "month"):
-        cut = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - 30 * 86400))
-
-    clauses: List[str] = []
-    args: List[Any] = []
-    if cut:
-        clauses.append("ts >= ?")
-        args.append(cut)
-    if agent_id:
-        clauses.append("agent_id=?")
-        args.append(agent_id)
-    if hostname:
-        clauses.append("hostname LIKE ?")
-        args.append(f"%{hostname}%")
-    if etype:
-        clauses.append("etype LIKE ?")
-        args.append(f"%{etype}%")
-    _PROC_NOISE_PRED = (
-        "severity IN ('info','low') AND etype LIKE 'process_create%' "
-        "AND IFNULL(summary,'') NOT LIKE '%可疑%'"
-    )
-    # 默认压掉「普通进程创建」噪声（显式按 etype 查时不压）
-    if hide_proc_noise and not etype:
-        clauses.append(f"NOT ({_PROC_NOISE_PRED})")
-    if q:
-        clauses.append("(summary LIKE ? OR detail_json LIKE ? OR hostname LIKE ? OR etype LIKE ?)")
-        like = f"%{q}%"
-        args.extend([like, like, like, like])
-    if path:
-        clauses.append("detail_json LIKE ?")
-        args.append(f"%{path}%")
-    if hash_q:
-        clauses.append("detail_json LIKE ?")
-        args.append(f"%{hash_q}%")
-    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-
-    # 多取一些再按 nature 过滤；压噪时控制扫描量，避免「今天」全表扫卡死
-    fetch_n = min(2500 if not hide_proc_noise else 900, max(limit + offset + 50, 400))
-    _TL_COLS = (
-        "id, agent_id, hostname, etype, summary, severity, detail_json, ts, created_at, entity_id"
-    )
-    with _lock:
-        conn = _connect()
-        try:
-            if not hide_proc_noise and not etype:
-                # 不压噪时分两路取数，避免海量 process_create 挤掉文件/网络等事件
-                c_imp = [*clauses, f"NOT ({_PROC_NOISE_PRED})"]
-                c_noise = [*clauses, _PROC_NOISE_PRED]
-                w_imp = " WHERE " + " AND ".join(c_imp)
-                w_noise = " WHERE " + " AND ".join(c_noise)
-                imp_n = min(1800, fetch_n)
-                noise_n = min(900, max(300, fetch_n // 2))
-                rows_imp = conn.execute(
-                    f"SELECT {_TL_COLS} FROM agent_timeline{w_imp} ORDER BY ts DESC, id DESC LIMIT ?",
-                    (*args, imp_n),
-                ).fetchall()
-                rows_noise = conn.execute(
-                    f"SELECT {_TL_COLS} FROM agent_timeline{w_noise} ORDER BY ts DESC, id DESC LIMIT ?",
-                    (*args, noise_n),
-                ).fetchall()
-                by_id: Dict[int, Any] = {}
-                for r in rows_imp:
-                    by_id[int(r["id"])] = r
-                for r in rows_noise:
-                    by_id[int(r["id"])] = r
-                rows = sorted(
-                    by_id.values(),
-                    key=lambda x: (str(x["ts"] or ""), int(x["id"] or 0)),
-                    reverse=True,
-                )[:fetch_n]
-            else:
-                rows = conn.execute(
-                    f"SELECT {_TL_COLS} FROM agent_timeline{where} ORDER BY ts DESC, id DESC LIMIT ?",
-                    (*args, fetch_n),
-                ).fetchall()
-        finally:
-            conn.close()
-
-    etype_set: Dict[str, int] = {}
-    host_set: Dict[str, int] = {}
-    hist: Dict[str, Dict[str, int]] = {}
-    counts = {"all": 0, "threat": 0, "risk": 0, "minor": 0, "surface": 0}
-    items: List[Dict[str, Any]] = []
-
-    for r in rows:
-        d = dict(r)
-        detail = _parse_detail(d.pop("detail_json", None))
-        d["detail"] = detail
-        nat = _log_nature(d.get("severity") or "info", d.get("etype") or "", d.get("summary") or "")
-        d["nature"] = nat
-        counts["all"] += 1
-        counts[nat] = counts.get(nat, 0) + 1
-        et = str(d.get("etype") or "")
-        if et:
-            etype_set[et] = etype_set.get(et, 0) + 1
-        hn = str(d.get("hostname") or d.get("agent_id") or "")
-        if hn:
-            host_set[hn] = host_set.get(hn, 0) + 1
-        buck = _hour_bucket(d.get("ts") or "")
-        hist.setdefault(buck, {"threat": 0, "risk": 0, "minor": 0, "surface": 0, "total": 0})
-        hist[buck][nat] = hist[buck].get(nat, 0) + 1
-        hist[buck]["total"] += 1
-        if nature and nat != nature:
-            continue
-        items.append(d)
-
-    items_page = items[offset: offset + limit]
-    # 列表瘦身：摘要字段
-    out_items = []
-    for it in items_page:
-        det = it.get("detail") or {}
-        out_items.append({
-            "id": it.get("id"),
-            "agent_id": it.get("agent_id"),
-            "hostname": it.get("hostname"),
-            "etype": it.get("etype"),
-            "summary": it.get("summary"),
-            "severity": it.get("severity"),
-            "nature": it.get("nature"),
-            "ts": it.get("ts"),
-            "pid": det.get("pid"),
-            "ppid": det.get("ppid"),
-            "name": det.get("name") or det.get("process_name"),
-            "path": det.get("path") or det.get("image"),
-            "user": det.get("user"),
-            "command_line": (str(det.get("command_line") or "")[:180] or None),
-            "sha256": det.get("sha256"),
-            "source": det.get("source") or "",
-        })
-
-    hist_list = [{"ts": k, **v} for k, v in sorted(hist.items())]
-    facets = {
-        "etype": [{"id": k, "count": v} for k, v in sorted(etype_set.items(), key=lambda x: -x[1])[:40]],
-        "hostname": [{"id": k, "count": v} for k, v in sorted(host_set.items(), key=lambda x: -x[1])[:40]],
-    }
-    return {
-        "ok": True,
-        "counts": counts,
-        "histogram": hist_list,
-        "facets": facets,
-        "total": len(items),
-        "offset": offset,
-        "limit": limit,
-        "items": out_items,
-        "range": rk,
-        "cut": cut,
-    }
 
 
-def get_log_detail(log_id: int) -> Dict[str, Any]:
-    """单条日志详情：字段分组 + 进程链 + 原始 JSON。"""
-    ensure()
-    lid = int(log_id or 0)
-    if lid <= 0:
-        return {"ok": False, "error": "无效日志 ID"}
-    with _lock:
-        conn = _connect()
-        try:
-            row = conn.execute("SELECT * FROM agent_timeline WHERE id=?", (lid,)).fetchone()
-            if not row:
-                return {"ok": False, "error": "日志不存在"}
-            item = dict(row)
-            detail = _parse_detail(item.pop("detail_json", None))
-            item["detail"] = detail
-            item["nature"] = _log_nature(item.get("severity") or "info", item.get("etype") or "", item.get("summary") or "")
-            aid = str(item.get("agent_id") or "")
-            if aid and not str(item.get("hostname") or "").strip():
-                try:
-                    hr = conn.execute("SELECT hostname, ip FROM agents WHERE agent_id=?", (aid,)).fetchone()
-                    if hr:
-                        item["hostname"] = hr[0] or item.get("hostname")
-                        item["agent_ip"] = hr[1] if len(hr) > 1 else ""
-                except Exception:
-                    pass
-            if aid and not str(item.get("hostname") or "").strip():
-                try:
-                    hr = conn.execute("SELECT hostname, ip FROM agents WHERE agent_id=?", (aid,)).fetchone()
-                    if hr:
-                        item["hostname"] = hr[0] or item.get("hostname")
-                        item["agent_ip"] = hr[1] if len(hr) > 1 else ""
-                except Exception:
-                    pass
-            # 同主机近期时间线，用于拼进程链
-            related = []
-            if aid:
-                related = conn.execute(
-                    """SELECT id, etype, summary, detail_json, severity, ts, hostname
-                       FROM agent_timeline WHERE agent_id=? ORDER BY ts DESC, id DESC LIMIT 400""",
-                    (aid,),
-                ).fetchall()
-        finally:
-            conn.close()
-
-    # 字段分组
-    prefer_groups = [
-        ("进程", [
-            "name", "process_name", "host_process", "pid", "ppid", "process_guid", "parent_guid",
-            "parent_name", "parent_path", "user", "target_pid", "create_time",
-            "elevated", "integrity",
-        ]),
-        ("模块 / 路径", [
-            "module", "module_name", "path", "image", "command_line",
-            "directory", "script_block", "payload", "process_path",
-        ]),
-        ("签名 / 哈希", ["signed", "signer", "sha256", "company", "file_version", "ext", "size", "size_kb"]),
-        ("网络", ["remote", "local", "proto", "daddr", "dport", "saddr", "sport"]),
-        ("其它", []),
-    ]
-    used = set()
-    groups = []
-    for title, keys in prefer_groups[:-1]:
-        fields = []
-        for k in keys:
-            if k in detail and detail[k] not in (None, ""):
-                fields.append({"k": k, "v": detail[k]})
-                used.add(k)
-        if fields:
-            groups.append({"title": title, "fields": fields})
-    rest = [{"k": k, "v": v} for k, v in detail.items() if k not in used and v not in (None, "")]
-    if rest:
-        groups.append({"title": "其它", "fields": rest})
-
-    host_label = str(item.get("hostname") or "").strip() or agent_protocol._host_of(aid) or aid
-    info = [
-        {"k": "时间", "v": item.get("ts")},
-        {"k": "主机名", "v": host_label},
-        {"k": "Agent ID", "v": aid},
-        {"k": "终端 IP", "v": item.get("agent_ip") or ""},
-        {"k": "事件类型", "v": item.get("etype")},
-        {"k": "级别", "v": item.get("severity")},
-        {"k": "性质", "v": item.get("nature")},
-        {"k": "摘要", "v": item.get("summary")},
-    ]
-
-    # 进程链：优先 process_guid（pid+创建时间），回退 PID（防复用错链）
-    def _pid_of(dj: Dict[str, Any]) -> Any:
-        return dj.get("pid") if dj.get("pid") not in (None, "") else None
-
-    def _guid_of(dj: Dict[str, Any]) -> str:
-        g = str(dj.get("process_guid") or "").strip()
-        if g:
-            return g
-        pid = _pid_of(dj)
-        ct = str(dj.get("create_time") or "").strip()
-        if pid is not None and ct:
-            return f"{pid}_{ct}"
-        return ""
-
-    self_pid = _pid_of(detail)
-    self_ppid = detail.get("ppid")
-    self_guid = _guid_of(detail)
-    self_parent_guid = str(detail.get("parent_guid") or "").strip()
-    nodes_by_guid: Dict[str, Dict[str, Any]] = {}
-    nodes_by_pid: Dict[str, Dict[str, Any]] = {}
-    for r in related:
-        dj = _parse_detail(r["detail_json"])
-        pid = _pid_of(dj)
-        if pid is None and not _guid_of(dj):
-            continue
-        node = {
-            "pid": pid,
-            "ppid": dj.get("ppid"),
-            "process_guid": _guid_of(dj),
-            "parent_guid": str(dj.get("parent_guid") or "").strip(),
-            "name": dj.get("name") or dj.get("process_name") or "",
-            "path": dj.get("path") or dj.get("image") or "",
-            "command_line": dj.get("command_line") or "",
-            "user": dj.get("user") or "",
-            "elevated": dj.get("elevated") or "",
-            "integrity": dj.get("integrity") or "",
-            "ts": r["ts"],
-            "etype": r["etype"],
-            "summary": r["summary"],
-            "log_id": r["id"],
-            "current": False,
-        }
-        gk = node["process_guid"]
-        if gk:
-            prev = nodes_by_guid.get(gk)
-            if not prev or str(r["ts"] or "") >= str(prev.get("ts") or ""):
-                nodes_by_guid[gk] = node
-        if pid is not None:
-            key = str(pid)
-            prev = nodes_by_pid.get(key)
-            if not prev or str(r["ts"] or "") >= str(prev.get("ts") or ""):
-                nodes_by_pid[key] = node
-    if self_pid is not None or self_guid:
-        cur = {
-            "pid": self_pid,
-            "ppid": self_ppid,
-            "process_guid": self_guid,
-            "parent_guid": self_parent_guid,
-            "name": detail.get("name") or detail.get("process_name") or "",
-            "path": detail.get("path") or "",
-            "command_line": detail.get("command_line") or "",
-            "user": detail.get("user") or "",
-            "elevated": detail.get("elevated") or "",
-            "integrity": detail.get("integrity") or "",
-            "ts": item.get("ts"),
-            "etype": item.get("etype"),
-            "summary": item.get("summary"),
-            "log_id": item.get("id"),
-            "current": True,
-        }
-        if self_guid:
-            nodes_by_guid[self_guid] = {**(nodes_by_guid.get(self_guid) or {}), **cur, "current": True}
-        if self_pid is not None:
-            nodes_by_pid[str(self_pid)] = {**(nodes_by_pid.get(str(self_pid)) or {}), **cur, "current": True}
-
-    def _resolve_parent(node: Dict[str, Any]) -> Dict[str, Any] | None:
-        pg = str(node.get("parent_guid") or "").strip()
-        if pg and pg in nodes_by_guid:
-            return nodes_by_guid[pg]
-        ppid = node.get("ppid")
-        if ppid not in (None, "", 0, "0"):
-            return nodes_by_pid.get(str(ppid))
-        return None
-
-    chain: List[Dict[str, Any]] = []
-    self_node = (nodes_by_guid.get(self_guid) if self_guid else None) or (
-        nodes_by_pid.get(str(self_pid)) if self_pid is not None else None
-    )
-    if self_node is not None:
-        walk = []
-        seen = set()
-        cur_n = self_node
-        depth = 0
-        while depth < 8:
-            parent = _resolve_parent(cur_n)
-            if not parent:
-                ppid = cur_n.get("ppid")
-                if ppid not in (None, "", 0, "0"):
-                    walk.append({
-                        "pid": ppid,
-                        "process_guid": cur_n.get("parent_guid") or "",
-                        "name": detail.get("parent_name") or f"PID {ppid}",
-                        "ppid": None,
-                        "missing": True,
-                    })
-                break
-            pk = parent.get("process_guid") or str(parent.get("pid"))
-            if pk in seen:
-                break
-            seen.add(pk)
-            walk.append(parent)
-            cur_n = parent
-            depth += 1
-        chain.extend(reversed(walk))
-        chain.append(self_node)
-        # 子进程：优先 parent_guid，回退 ppid（按 guid/pid 去重）
-        seen_child: set[str] = set()
-        candidates = list(nodes_by_guid.values()) + [
-            n for n in nodes_by_pid.values() if not n.get("process_guid")
-        ]
-        for n in candidates:
-            if n.get("current"):
-                continue
-            hit = False
-            if self_guid and str(n.get("parent_guid") or "") == self_guid:
-                hit = True
-            elif self_pid is not None and str(n.get("ppid")) == str(self_pid) and not n.get("parent_guid"):
-                hit = True
-            if not hit:
-                continue
-            ck = str(n.get("process_guid") or n.get("log_id") or n.get("pid") or id(n))
-            if ck in seen_child:
-                continue
-            seen_child.add(ck)
-            chain.append({**n, "child": True})
-
-    raw = {
-        "id": item.get("id"),
-        "agent_id": item.get("agent_id"),
-        "hostname": item.get("hostname"),
-        "etype": item.get("etype"),
-        "summary": item.get("summary"),
-        "severity": item.get("severity"),
-        "nature": item.get("nature"),
-        "ts": item.get("ts"),
-        "created_at": item.get("created_at"),
-        "detail": detail,
-    }
-    return {
-        "ok": True,
-        "item": item,
-        "info": info,
-        "groups": groups,
-        "chain": chain,
-        "raw": raw,
-    }
 
 
 def hunt(q: str, *, limit: int = 100) -> Dict[str, Any]:
@@ -1732,6 +783,7 @@ _DEFAULT_POLICY = {
     "intervals_sec": dict(agent_protocol.MODULE_INTERVAL_SEC),
     "heartbeat_sec": 3,
     "response_enabled": True,
+    "response_approval_required": True,
     "timeline_process": True,
     "timeline_file": True,
     "timeline_network": True,
@@ -1749,6 +801,8 @@ _DEFAULT_POLICY = {
     # Winlog 通道：all | critical | custom；custom 时用 winevent_channels 列表（security/sysmon/…）
     "winevent_channel_mode": "all",
     "winevent_channels": [],
+    # 默认由 Agent 托管安装 Sysmon（需平台 Sysmon/Sysmon64.exe 或安装包内带上）
+    "sysmon_managed": True,
     "integrations": {
         "etw": True,
         "winevent": True,
@@ -1770,14 +824,13 @@ _DEFAULT_POLICY = {
     "remote_ops_enabled": True,
     "remote_ops": {
         "enabled": True,
-        "read_only": False,
-        "run_cmd_enabled": True,
-        "shell_enabled": True,
+        "read_only": True,
+        "run_cmd_enabled": False,
+        "shell_enabled": False,
         "shell_max_minutes": 15,
         "run_cmd_whitelist": [
             "dir", "type", "reg", "ipconfig", "netstat", "tasklist", "systeminfo",
             "whoami", "hostname", "net", "sc", "cd", "echo", "where", "findstr",
-            "powershell -noprofile -command",
         ],
     },
     "memory_scan": {
@@ -1786,10 +839,16 @@ _DEFAULT_POLICY = {
         "max_processes_per_run": 20,
         "max_region_read_kb": 512,
         "schedule_interval_sec": 1800,
+        # 内存完整性巡检：注入线程 / 反射 PE / ETW·AMSI 补丁 / ntdll 挂钩
+        "integrity_checks": True,
+        "integrity_interval_sec": 1800,
         "triggers": [
             "remote_thread_kernel",
             "process_access",
+            "credential_access",
+            "process_tampering",
             "image_load_etw",
+            "image_load_sysmon",
             "priv_escalation",
             "evm_hit",
             "api_amsi",
@@ -1799,385 +858,56 @@ _DEFAULT_POLICY = {
         ],
         "exclude_signed_vendor": ["Microsoft Corporation", "Google LLC"],
     },
+    # 落地文件扫描：可执行/脚本落地后在用户态做规则 + PE 启发式 + 签名研判
+    "drop_scan": {
+        "enabled": True,
+        "auto_quarantine": False,
+        "quarantine_min_score": 80,
+        "max_file_mb": 32,
+    },
+    # DataProtector 内核驱动（可选组件）：未安装驱动的终端忽略本段
+    "dp_driver": {
+        "enabled": True,
+        # 拦截：关闭时驱动只告警（凭据/横向/威胁引擎/静态扫描均审计模式）
+        "block": False,
+        # 透明加密：开启后平台向终端下发主密钥；加密规则需另行配置
+        "encryption_enabled": False,
+    },
 }
 
 
-def get_policy(scope: str = "global") -> Dict[str, Any]:
-    ensure()
-    scope = str(scope or "global")
-    with _lock:
-        conn = _connect()
-        try:
-            row = conn.execute("SELECT * FROM agent_policy WHERE scope=?", (scope,)).fetchone()
-            if not row:
-                now = _now()
-                conn.execute(
-                    "INSERT INTO agent_policy(scope, policy_json, rev, updated_at) VALUES(?,?,1,?)",
-                    (scope, json.dumps(_DEFAULT_POLICY, ensure_ascii=False), now),
-                )
-                conn.commit()
-                return {"ok": True, "scope": scope, "rev": 1, "policy": dict(_DEFAULT_POLICY), "updated_at": now}
-            try:
-                pol = json.loads(row["policy_json"] or "{}")
-            except Exception:
-                pol = dict(_DEFAULT_POLICY)
-            return {
-                "ok": True,
-                "scope": scope,
-                "rev": int(row["rev"] or 1),
-                "policy": pol,
-                "updated_at": row["updated_at"],
-            }
-        finally:
-            conn.close()
 
 
-_POLICY_BOOL_KEYS = (
-    "response_enabled", "timeline_process", "timeline_file", "timeline_network", "self_protect",
-    "fim_enabled", "isolate_allow_server", "whitelist_skip_rules", "mysql_dual_write",
-    "remote_ops_enabled",
-)
 
 
-def _num(v: Any) -> Optional[float]:
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    return None
 
 
-def validate_policy(p: Dict[str, Any]) -> List[str]:
-    """与 Agent 侧 validatePolicy 同口径：任一项非法整份拒绝，避免终端出现"半生效"。"""
-    errs: List[str] = []
-    for k in _POLICY_BOOL_KEYS:
-        if k in p and not isinstance(p[k], bool):
-            errs.append(f"{k} 必须是布尔值")
-    hb = _num(p.get("heartbeat_sec")) if "heartbeat_sec" in p else 5.0
-    if hb is None or not 3 <= hb <= 120:
-        errs.append("heartbeat_sec 必须在 3~120")
-    iv = p.get("intervals_sec")
-    if iv is not None:
-        if not isinstance(iv, dict):
-            errs.append("intervals_sec 必须是对象")
-        else:
-            for k in sorted(iv):
-                n = _num(iv[k])
-                if n is None or not 3 <= n <= 86400:
-                    errs.append(f"intervals_sec.{k} 必须在 3~86400 秒")
-    for k, lo, hi in (("timeline_retain_days", 1, 365), ("events_retain_days", 7, 730)):
-        if k in p:
-            n = _num(p[k])
-            if n is None or not lo <= n <= hi:
-                errs.append(f"{k} 必须在 {lo}~{hi}")
-    fp = p.get("fim_paths")
-    if fp is not None:
-        if not isinstance(fp, list):
-            errs.append("fim_paths 必须是数组")
-        elif len(fp) > 50:
-            errs.append("fim_paths 最多 50 项")
-        else:
-            for x in fp:
-                s = str(x).strip() if isinstance(x, str) else ""
-                path = s.rsplit("|", 1)[0].strip() if "|" in s else s
-                if not re.match(r"^[A-Za-z]:\\", path) or len(path.rstrip("\\")) <= 2:
-                    errs.append(f"fim_paths 非法路径（需绝对路径且不能是整个磁盘）: {x}")
-    ltp = p.get("log_tail_paths")
-    if ltp is not None:
-        if not isinstance(ltp, list):
-            errs.append("log_tail_paths 必须是数组")
-        elif len(ltp) > 20:
-            errs.append("log_tail_paths 最多 20 项")
-        else:
-            for x in ltp:
-                s = str(x).strip() if isinstance(x, str) else ""
-                if not re.match(r"^[A-Za-z]:\\", s) or len(s) <= 4 or s.endswith("\\"):
-                    errs.append(f"log_tail_paths 需绝对文件路径（非盘符根/目录）: {x}")
-    ms = p.get("memory_scan")
-    if ms is not None:
-        if not isinstance(ms, dict):
-            errs.append("memory_scan 必须是对象")
-        else:
-            mode = str(ms.get("mode") or "").strip().lower()
-            ok_modes = {
-                "off", "heuristic", "yara_on_demand", "yara_triggered", "yara_scheduled",
-            }
-            if mode and mode not in ok_modes:
-                errs.append(f"memory_scan.mode 非法: {mode}")
-            for nk, lo, hi in (
-                ("max_processes_per_run", 1, 80),
-                ("max_region_read_kb", 64, 4096),
-                ("schedule_interval_sec", 300, 86400),
-            ):
-                if nk in ms:
-                    n = _num(ms[nk])
-                    if n is None or not lo <= n <= hi:
-                        errs.append(f"memory_scan.{nk} 必须在 {lo}~{hi}")
-            tr = ms.get("triggers")
-            if tr is not None and not isinstance(tr, list):
-                errs.append("memory_scan.triggers 必须是数组")
-    return errs
 
 
-def set_policy(scope: str, policy: Dict[str, Any], *, actor: str = "", note: str = "") -> Dict[str, Any]:
-    ensure()
-    scope = str(scope or "global")
-    if not isinstance(policy, dict):
-        return {"ok": False, "error": "policy 必须是对象"}
-    merged = dict(_DEFAULT_POLICY)
-    merged.update(policy)
-    errs = validate_policy(merged)
-    if errs:
-        return {"ok": False, "error": "；".join(errs), "errors": errs}
-    now = _now()
-    with _lock:
-        conn = _connect()
-        try:
-            row = conn.execute("SELECT rev FROM agent_policy WHERE scope=?", (scope,)).fetchone()
-            rev = int(row["rev"] or 0) + 1 if row else 1
-            conn.execute(
-                """INSERT INTO agent_policy(scope, policy_json, rev, updated_at) VALUES(?,?,?,?)
-                   ON CONFLICT(scope) DO UPDATE SET
-                     policy_json=excluded.policy_json,
-                     rev=excluded.rev,
-                     updated_at=excluded.updated_at""",
-                (scope, json.dumps(merged, ensure_ascii=False), rev, now),
-            )
-            conn.execute(
-                """INSERT OR REPLACE INTO agent_policy_history(scope, rev, policy_json, actor, note, created_at)
-                   VALUES(?,?,?,?,?,?)""",
-                (scope, rev, json.dumps(merged, ensure_ascii=False), actor[:64], note[:200], now),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    _audit("policy_update", detail=json.dumps({"scope": scope, "rev": rev, "note": note}, ensure_ascii=False), actor=actor)
-    agent_protocol.bump_live("policy", scope=scope, rev=rev)
-    try:
-        from . import agent_sync
-        agent_sync.bump_sync("policy")
-    except Exception:
-        pass
-    return {"ok": True, "scope": scope, "rev": rev, "policy": merged}
 
 
-def list_policy_history(scope: str = "global", *, limit: int = 50) -> Dict[str, Any]:
-    ensure()
-    with _lock:
-        conn = _connect()
-        try:
-            rows = conn.execute(
-                "SELECT scope, rev, policy_json, actor, note, created_at FROM agent_policy_history "
-                "WHERE scope=? ORDER BY rev DESC LIMIT ?",
-                (str(scope or "global"), max(1, min(int(limit or 50), 200))),
-            ).fetchall()
-        finally:
-            conn.close()
-    items = []
-    for r in rows:
-        d = dict(r)
-        try:
-            d["policy"] = json.loads(d.pop("policy_json") or "{}")
-        except Exception:
-            d["policy"] = {}
-        items.append(d)
-    return {"ok": True, "items": items}
 
 
-def rollback_policy(scope: str, rev: int, *, actor: str = "") -> Dict[str, Any]:
-    """回滚 = 以历史版本内容发布一个新 rev（rev 单调递增，终端按新 rev 原子生效）。"""
-    ensure()
-    scope = str(scope or "global")
-    with _lock:
-        conn = _connect()
-        try:
-            row = conn.execute(
-                "SELECT policy_json FROM agent_policy_history WHERE scope=? AND rev=?", (scope, int(rev))
-            ).fetchone()
-        finally:
-            conn.close()
-    if not row:
-        return {"ok": False, "error": f"历史版本 rev {rev} 不存在"}
-    try:
-        pol = json.loads(row["policy_json"] or "{}")
-    except Exception:
-        return {"ok": False, "error": "历史版本内容损坏"}
-    return set_policy(scope, pol, actor=actor, note=f"回滚到 rev {int(rev)}")
 
 
-def policy_rollout(scope: str = "global") -> Dict[str, Any]:
-    """各终端对当前策略的生效情况（取自心跳 health.policy）。"""
-    cur = get_policy(scope)
-    rev = int(cur.get("rev") or 0)
-    agents = agent_protocol.list_agents(online_within_sec=120).get("items") or []
-    summary = {"total": 0, "applied": 0, "probation": 0, "rejected": 0, "rolled_back": 0, "pending": 0, "legacy": 0}
-    problems: List[Dict[str, Any]] = []
-    for a in agents:
-        summary["total"] += 1
-        st = (a.get("health") or {}).get("policy")
-        if not isinstance(st, dict):
-            summary["legacy"] += 1  # 旧 Agent 不回报策略状态
-            continue
-        status = str(st.get("status") or "")
-        applied = int(st.get("applied_rev") or 0)
-        if status in ("rejected", "rolled_back") and int(st.get("bad_rev") or 0) == rev:
-            summary[status] += 1
-            problems.append({
-                "agent_id": a.get("agent_id"), "hostname": a.get("hostname"), "online": a.get("online"),
-                "status": status, "applied_rev": applied, "lkg_rev": st.get("lkg_rev"), "error": st.get("error"),
-            })
-        elif applied == rev and status == "probation":
-            summary["probation"] += 1
-        elif applied == rev:
-            summary["applied"] += 1
-        else:
-            summary["pending"] += 1
-    return {"ok": True, "scope": scope, "rev": rev, "summary": summary, "problems": problems[:200]}
 
 
-def list_whitelist() -> Dict[str, Any]:
-    ensure()
-    with _lock:
-        conn = _connect()
-        try:
-            rows = conn.execute("SELECT * FROM agent_whitelist ORDER BY created_at DESC").fetchall()
-            return {"ok": True, "items": [dict(r) for r in rows]}
-        finally:
-            conn.close()
 
 
-def add_whitelist(
-    kind: str,
-    value: str,
-    *,
-    note: str = "",
-    agent_id: str = "",
-    rule: str = "",
-    created_by: str = "",
-    source_event_id: int = 0,
-    apply_existing: bool = False,
-) -> Dict[str, Any]:
-    from . import alert_allow
-
-    ensure()
-    kind = str(kind or "").strip().lower()[:32]
-    value = str(value or "").strip()[:500]
-    rule = str(rule or "").strip()[:300]
-    agent_id = str(agent_id or "").strip()[:64]
-    if kind not in alert_allow.KINDS or not value:
-        return {"ok": False, "error": "kind/value 无效"}
-    if kind == "title" and value.strip("*? ") == "":
-        return {"ok": False, "error": "标题通配过宽，会屏蔽全部告警"}
-    wid = uuid.uuid4().hex
-    entry = {"id": wid, "kind": kind, "value": value, "agent_id": agent_id, "rule": rule, "enabled": 1}
-    ignored = 0
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                """INSERT INTO agent_whitelist(id, kind, value, note, enabled, created_at,
-                                               agent_id, rule, hits, last_hit_at, created_by, source_event_id)
-                   VALUES(?,?,?,?,1,?,?,?,0,'',?,?)""",
-                (wid, kind, value, note[:200], _now(), agent_id, rule, created_by[:64], int(source_event_id or 0)),
-            )
-            conn.commit()
-            if apply_existing:
-                ignored = alert_allow.apply_to_open_events(conn, entry)
-        finally:
-            conn.close()
-    _audit("whitelist_add", agent_id=agent_id, actor=created_by,
-           detail=json.dumps({"kind": kind, "value": value, "rule": rule, "ignored": ignored}, ensure_ascii=False))
-    agent_protocol.bump_live("whitelist")
-    try:
-        from . import agent_sync
-        agent_sync.bump_sync("whitelist")
-    except Exception:
-        pass
-    if ignored:
-        agent_protocol.bump_live("event")
-    return {"ok": True, "id": wid, "ignored": ignored}
 
 
-def set_whitelist_enabled(wid: str, enabled: bool) -> Dict[str, Any]:
-    ensure()
-    with _lock:
-        conn = _connect()
-        try:
-            cur = conn.execute("UPDATE agent_whitelist SET enabled=? WHERE id=?", (1 if enabled else 0, str(wid)))
-            conn.commit()
-            if cur.rowcount <= 0:
-                return {"ok": False, "error": "不存在"}
-        finally:
-            conn.close()
-    agent_protocol.bump_live("whitelist")
-    try:
-        from . import agent_sync
-        agent_sync.bump_sync("whitelist")
-    except Exception:
-        pass
-    return {"ok": True}
 
 
-def delete_whitelist(wid: str) -> Dict[str, Any]:
-    ensure()
-    with _lock:
-        conn = _connect()
-        try:
-            cur = conn.execute("DELETE FROM agent_whitelist WHERE id=?", (str(wid),))
-            conn.commit()
-            if cur.rowcount <= 0:
-                return {"ok": False, "error": "不存在"}
-        finally:
-            conn.close()
-    agent_protocol.bump_live("whitelist")
-    try:
-        from . import agent_sync
-        agent_sync.bump_sync("whitelist")
-    except Exception:
-        pass
-    return {"ok": True}
 
 
-def list_groups() -> Dict[str, Any]:
-    ensure()
-    with _lock:
-        conn = _connect()
-        try:
-            rows = conn.execute("SELECT * FROM agent_groups ORDER BY name").fetchall()
-            items = []
-            for r in rows:
-                d = dict(r)
-                try:
-                    d["agent_ids"] = json.loads(d.pop("agent_ids_json") or "[]")
-                except Exception:
-                    d["agent_ids"] = []
-                items.append(d)
-            return {"ok": True, "items": items}
-        finally:
-            conn.close()
 
 
-def upsert_group(gid: str, name: str, agent_ids: List[str], *, note: str = "") -> Dict[str, Any]:
-    ensure()
-    gid = str(gid or "").strip() or uuid.uuid4().hex
-    name = str(name or "").strip()[:64] or gid
-    ids = [str(x) for x in (agent_ids or []) if x][:500]
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                """INSERT INTO agent_groups(id, name, agent_ids_json, note, updated_at) VALUES(?,?,?,?,?)
-                   ON CONFLICT(id) DO UPDATE SET
-                     name=excluded.name,
-                     agent_ids_json=excluded.agent_ids_json,
-                     note=excluded.note,
-                     updated_at=excluded.updated_at""",
-                (gid, name, json.dumps(ids, ensure_ascii=False), note[:200], _now()),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    return {"ok": True, "id": gid, "name": name, "agent_ids": ids}
+
+
+
+
+
+
 
 
 def list_audit(*, limit: int = 100) -> Dict[str, Any]:
@@ -2217,11 +947,24 @@ def agent_side_bundle(agent_id: str, *, host_meta: Optional[Dict[str, Any]] = No
         ms = dict(ms)
         ms["rules_rev"] = mem_rev
         policy_out["memory_scan"] = ms
-    return {
-        "commands": cmds.get("items") or [],
+    if not isinstance(policy_out.get("drop_scan"), dict):
+        policy_out["drop_scan"] = dict(_DEFAULT_POLICY.get("drop_scan") or {})
+    else:
+        ds = dict(_DEFAULT_POLICY.get("drop_scan") or {})
+        ds.update(policy_out["drop_scan"])
+        policy_out["drop_scan"] = ds
+    policy_rev = int(pol.get("rev") or 1)
+    try:
+        from . import policy_sign
+        policy_out = policy_sign.attach_policy_signature(policy_out, policy_rev)
+    except Exception:
+        pass
+    cmd_items = cmds.get("items") or []
+    out = {
+        "commands": cmd_items,
         "rule_fim_paths": rule_fim,
         "policy": policy_out,
-        "policy_rev": pol.get("rev") or 1,
+        "policy_rev": policy_rev,
         "memory_yara_rev": mem_rev,
         "whitelist": [
             {"kind": x.get("kind"), "value": x.get("value")}
@@ -2229,295 +972,60 @@ def agent_side_bundle(agent_id: str, *, host_meta: Optional[Dict[str, Any]] = No
             if x.get("enabled")
         ][:200],
         "self_protect": bool((pol.get("policy") or {}).get("self_protect")),
+        "dp_crypto": _dp_crypto_for(agent_id),
     }
+    # 有待执行指令时强制最短心跳，缩短结束进程/隔离的等待窗口
+    if cmd_items:
+        out["heartbeat_sec"] = 3
+        out["pending_commands"] = len(cmd_items)
+    return out
 
 
-# ---------- IOC ----------
-
-def list_ioc() -> Dict[str, Any]:
-    ensure()
-    with _lock:
-        conn = _connect()
-        try:
-            rows = conn.execute("SELECT * FROM agent_ioc ORDER BY created_at DESC").fetchall()
-            return {"ok": True, "items": [dict(r) for r in rows]}
-        finally:
-            conn.close()
-
-
-def add_ioc(ioc_type: str, value: str, *, severity: str = "high", note: str = "") -> Dict[str, Any]:
-    ensure()
-    ioc_type = str(ioc_type or "").strip().lower()[:32]
-    value = str(value or "").strip()[:800]
-    if ioc_type not in ("hash", "domain", "ip", "path", "process", "cmdline") or not value:
-        return {"ok": False, "error": "ioc_type/value 无效"}
-    iid = uuid.uuid4().hex
-    now = _now()
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                """INSERT INTO agent_ioc(id, ioc_type, value, severity, note, enabled, hits, created_at, updated_at)
-                   VALUES(?,?,?,?,?,1,0,?,?)""",
-                (iid, ioc_type, value, severity[:16], note[:200], now, now),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    agent_protocol.bump_live("ioc")
+def _dp_crypto_for(agent_id: str) -> Optional[Dict[str, Any]]:
     try:
-        from . import agent_sync
-        agent_sync.bump_sync("ioc")
+        from . import xedr_keys
+        return xedr_keys.crypto_bundle_for_agent(agent_id)
     except Exception:
-        pass
-    return {"ok": True, "id": iid}
+        return None
 
 
-def import_iocs(text: str, *, ioc_type: str = "hash", severity: str = "high") -> Dict[str, Any]:
-    """批量导入，每行一个 IOC。"""
-    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    n = 0
-    for ln in lines[:2000]:
-        # type:value 或纯值
-        if ":" in ln and ln.split(":", 1)[0].lower() in ("hash", "domain", "ip", "path", "process", "cmdline"):
-            t, v = ln.split(":", 1)
-            r = add_ioc(t.strip(), v.strip(), severity=severity)
-        else:
-            r = add_ioc(ioc_type, ln, severity=severity)
-        if r.get("ok"):
-            n += 1
-    return {"ok": True, "imported": n}
+# IOC CRUD / lib → agent_ioc_ops（文末 re-export）
 
-
-def delete_ioc(iid: str) -> Dict[str, Any]:
+def _list_timeline_with_event_id(agent_id: str = "", *, limit: int = 300) -> List[Dict[str, Any]]:
+    """专抽带 EventID 的时间线（不被 ETW 海量事件淹没）。"""
     ensure()
+    limit = max(1, min(int(limit or 300), 500))
+    clauses = ["detail_json LIKE ?"]
+    args: List[Any] = ['%"event_id"%']
+    if agent_id:
+        clauses.insert(0, "agent_id=?")
+        args.insert(0, agent_id)
+    where = " WHERE " + " AND ".join(clauses)
     with _lock:
         conn = _connect()
         try:
-            cur = conn.execute("DELETE FROM agent_ioc WHERE id=?", (str(iid),))
-            conn.commit()
-            if cur.rowcount <= 0:
-                return {"ok": False, "error": "不存在"}
+            rows = conn.execute(
+                f"SELECT * FROM agent_timeline{where} ORDER BY ts DESC, id DESC LIMIT ?",
+                (*args, limit * 3),
+            ).fetchall()
         finally:
             conn.close()
-    try:
-        from . import agent_sync
-        agent_sync.bump_sync("ioc")
-    except Exception:
-        pass
-    return {"ok": True}
-
-
-def _extract_ioc_candidates(events: List[Any], blob: str = "") -> List[Dict[str, str]]:
-    """从时间线事件 / 文本提取可查 IOC 候选（hash/ip/domain）。"""
-    import re
-
-    import ipaddress
-
     out: List[Dict[str, Any]] = []
-    seen = set()
-
-    def add(kind: str, value: str, src: str = "", ctx: Optional[Dict[str, Any]] = None) -> None:
-        v = str(value or "").strip().lower().rstrip(".")
-        if not v:
-            return
-        # ip 可能带端口
-        if kind == "ip" and ":" in v:
-            v = v.split(":", 1)[0]
-        if kind == "ip":
-            try:
-                ip = ipaddress.ip_address(v)
-                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
-                    return
-            except ValueError:
-                return
-        key = f"{kind}|{v}"
-        if key in seen or len(v) < 4:
-            return
-        seen.add(key)
-        out.append({"ioc_type": kind, "value": v, "src": src, "ctx": ctx or {}})
-
-    for ev in events or []:
-        if not isinstance(ev, dict):
-            continue
-        detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
-        ctx = {"etype": ev.get("etype"), "summary": str(ev.get("summary") or "")[:200]}
-        for ck in ("pid", "process_name", "name", "path", "command_line", "remote", "domain", "query", "sha256"):
-            if detail.get(ck) not in (None, ""):
-                ctx[ck] = detail.get(ck)
-        for hk in ("sha256", "sha1", "md5", "hash", "file_hash"):
-            hv = str(detail.get(hk) or "").strip()
-            if hv and re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", hv):
-                add("file_hash", hv, hk, ctx)
-        for ik in ("remote", "remote_ip", "ip", "dst", "dest"):
-            rv = str(detail.get(ik) or "").strip()
-            if not rv:
-                continue
-            # remote 常为 ip:port
-            m = re.match(r"^(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$", rv)
-            if m:
-                add("ip", m.group(1), ik, ctx)
-            elif "." in rv and not rv.replace(".", "").isdigit():
-                host = rv.split(":")[0].split("/")[0]
-                if host and not host.replace(".", "").isdigit():
-                    add("domain", host, ik, ctx)
-        for dk in ("query", "domain"):
-            dv = str(detail.get(dk) or "").strip()
-            if "." in dv and not dv.replace(".", "").isdigit():
-                add("domain", dv, dk, ctx)
-        path = str(detail.get("path") or "")
-        for m in re.finditer(r"\b([0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\b", path):
-            add("file_hash", m.group(1), "path", ctx)
-
-    text = blob or ""
-    for m in re.finditer(r"\b([0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\b", text):
-        add("file_hash", m.group(1), "blob")
-    for m in re.finditer(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", text):
-        add("ip", m.group(1), "blob")
-    return out[:80]
-
-
-_IOC_TYPE_CN = {"ip": "IP", "domain": "域名", "file_hash": "文件哈希", "url": "URL", "hash": "哈希"}
-
-
-def match_iocs_against_text(agent_id: str, hostname: str, blob: str, *, module: str = "ioc") -> int:
-    """本地 agent_ioc 子串 + ioc_data.db / MySQL 情报库精确匹配。"""
-    return match_iocs(agent_id, hostname, blob=blob, events=None, module=module)
-
-
-def match_iocs(
-    agent_id: str,
-    hostname: str,
-    *,
-    blob: str = "",
-    events: Optional[List[Any]] = None,
-    module: str = "ioc",
-) -> int:
-    """IOC 匹配：本地白名单式 agent_ioc + 情报库 ioc_data.db（经 ioc_db.lookup）。"""
-    ensure()
-    written = 0
-    low = (blob or "").lower()
-    local_hits: List[Dict[str, Any]] = []
-    if low:
-        with _lock:
-            conn = _connect()
-            try:
-                rows = conn.execute("SELECT * FROM agent_ioc WHERE enabled=1").fetchall()
-                for r in rows:
-                    val = str(r["value"] or "").lower()
-                    if val and val in low:
-                        local_hits.append(dict(r))
-                        conn.execute(
-                            "UPDATE agent_ioc SET hits=hits+1, updated_at=? WHERE id=?",
-                            (_now(), r["id"]),
-                        )
-                conn.commit()
-            finally:
-                conn.close()
-
-    for h in local_hits[:20]:
-        ev = agent_protocol.report_event({
-            "agent_id": agent_id,
-            "hostname": hostname,
-            "module": module,
-            "severity": h.get("severity") or "high",
-            "title": f"IOC 命中：{h.get('ioc_type')} {h.get('value')}",
-            "detail": json.dumps({
-                "ioc_id": h.get("id"),
-                "ioc_type": h.get("ioc_type"),
-                "value": h.get("value"),
-                "note": h.get("note"),
-                "source": "agent_ioc",
-            }, ensure_ascii=False)[:1500],
-        })
-        if ev.get("ok") and not ev.get("deduped") and not ev.get("suppressed"):
-            written += 1
-
-    # 情报库精确查（ioc/ioc_data.db → MySQL/Redis/SQLite）
-    candidates = _extract_ioc_candidates(events or [], blob)
-    if not candidates:
-        return written
-    try:
-        from . import ioc_db
-    except Exception:
-        return written
-
-    lib_hits = 0
-    for c in candidates:
+    for r in rows:
+        d = dict(r)
         try:
-            hits = ioc_db.lookup(c["value"], c["ioc_type"])
+            d["detail"] = json.loads(d.pop("detail_json") or "{}")
         except Exception:
-            hits = []
-        if not hits:
-            # 哈希兼容：file_hash 再试无类型
-            if c["ioc_type"] == "file_hash":
-                try:
-                    hits = ioc_db.lookup(c["value"], None)
-                except Exception:
-                    hits = []
-        for hit in (hits or [])[:2]:
-            malware = str(hit.get("malware") or hit.get("family") or "")[:80]
-            src = str(hit.get("source") or "")[:80]
-            val = str(hit.get("value") or c["value"])[:200]
-            itype = str(hit.get("type") or hit.get("match_type") or c["ioc_type"])[:32]
-            title = f"情报 IOC 命中：{val}（{_IOC_TYPE_CN.get(itype, itype)}）"
-            fams = [x.strip() for x in malware.split(",") if x.strip()]
-            if fams:
-                title += f" · {fams[0]}" + (f" 等 {len(fams)} 个家族" if len(fams) > 1 else "")
-            ctx = c.get("ctx") or {}
-            ev = agent_protocol.report_event({
-                "agent_id": agent_id,
-                "hostname": hostname,
-                "module": "ioc",
-                "severity": "high",
-                "title": title[:200],
-                "detail": {
-                    **{k: v for k, v in ctx.items() if k != "summary"},
-                    "ioc_type": itype,
-                    "ioc_value": val,
-                    "malware": malware,
-                    "intel_source": src,
-                    "matched_from": c.get("src"),
-                    "trigger": ctx.get("summary") or "",
-                    "ioc_id": hit.get("id"),
-                    "lib": "ioc_data",
-                },
-            })
-            if ev.get("ok") and not ev.get("deduped") and not ev.get("suppressed"):
-                written += 1
-                lib_hits += 1
-            if lib_hits >= 15:
-                return written
-    return written
+            d["detail"] = {}
+        det = d.get("detail") if isinstance(d.get("detail"), dict) else {}
+        if det.get("event_id") is None and det.get("EventID") is None:
+            continue
+        out.append(d)
+        if len(out) >= limit:
+            break
+    return out
 
 
-def ioc_lib_status() -> Dict[str, Any]:
-    """管理台展示：本地 agent_ioc + 情报库 ioc_data.db 状态。"""
-    ensure()
-    local_n = 0
-    with _lock:
-        conn = _connect()
-        try:
-            local_n = int(conn.execute("SELECT COUNT(*) AS c FROM agent_ioc WHERE enabled=1").fetchone()["c"])
-        finally:
-            conn.close()
-    lib: Dict[str, Any] = {"ok": False, "path": "", "count": 0, "hint": ""}
-    try:
-        from . import ioc_db
-        layout = ioc_db.source_layout() if hasattr(ioc_db, "source_layout") else {}
-        info = ioc_db.file_info() if hasattr(ioc_db, "file_info") else {}
-        st = ioc_db.stats(force=False) if hasattr(ioc_db, "stats") else {}
-        lib = {
-            "ok": True,
-            "path": str((layout or {}).get("expected") or (info or {}).get("path") or ""),
-            "count": int((st or {}).get("total") or (info or {}).get("count") or 0),
-            "exists": bool((layout or {}).get("exists") or (info or {}).get("exists")),
-            "mysql": (st or {}).get("mysql") if isinstance((st or {}).get("mysql"), dict) else {},
-            "hint": (layout or {}).get("hint") or "",
-        }
-    except Exception as e:
-        lib = {"ok": False, "path": str(Path(getattr(config, "IOC_DIR", "") or "") / "ioc_data.db"), "count": 0, "hint": str(e)}
-    return {"ok": True, "local_enabled": local_n, "lib": lib}
 
 
 # ---------- 标签 ----------
@@ -2717,8 +1225,12 @@ def _step_match(ev: Dict[str, Any], step: Dict[str, Any]) -> bool:
     et = str(ev.get("etype") or "")
     sm = str(ev.get("summary") or "")
     detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
-    name = str(detail.get("name") or "")
-    if step.get("etype_contains") and str(step["etype_contains"]).lower() not in et.lower():
+    name = str(detail.get("name") or detail.get("process_name") or "")
+    want_et = str(step.get("etype_contains") or "").lower().strip()
+    if want_et and want_et not in et.lower():
+        return False
+    # 「process」步骤不应命中退出事件，否则易变成「进程退出后碰巧有外联」误报
+    if want_et == "process" and "exit" in et.lower():
         return False
     if step.get("summary_contains") and str(step["summary_contains"]).lower() not in sm.lower():
         return False
@@ -2732,56 +1244,94 @@ def _step_match(ev: Dict[str, Any], step: Dict[str, Any]) -> bool:
     return True
 
 
-def match_sequences(agent_id: str, hostname: str = "") -> int:
-    """在最近时间线上匹配行为序列。"""
-    ensure_seq_rules()
-    rules = [r for r in (list_seq_rules().get("items") or []) if r.get("enabled")]
-    if not rules:
-        return 0
-    tl = list_timeline(agent_id, limit=80).get("items") or []
-    # 时间升序
-    tl = list(reversed(tl))
-    written = 0
-    for rule in rules:
-        steps = rule.get("steps") or []
-        if len(steps) < 2:
-            continue
-        win = int(rule.get("window_sec") or 120)
-        # 找第一条命中
-        for i, ev in enumerate(tl):
-            if not _step_match(ev, steps[0]):
-                continue
-            t0 = _parse_ts(ev.get("ts"))
-            idx = 1
-            chain = [ev]
-            for ev2 in tl[i + 1:]:
-                t1 = _parse_ts(ev2.get("ts"))
-                if t1 - t0 > win:
-                    break
-                if _step_match(ev2, steps[idx]):
-                    chain.append(ev2)
-                    idx += 1
-                    if idx >= len(steps):
-                        evr = agent_protocol.report_event({
-                            "agent_id": agent_id,
-                            "hostname": hostname or ev.get("hostname") or "",
-                            "module": "sequence",
-                            "severity": rule.get("severity") or "high",
-                            "title": f"行为序列：{rule.get('title')}",
-                            "detail": json.dumps({
-                                "rule_id": rule.get("id"),
-                                "steps": [
-                                    {"etype": c.get("etype"), "summary": c.get("summary"), "ts": c.get("ts")}
-                                    for c in chain
-                                ],
-                            }, ensure_ascii=False)[:1800],
-                        })
-                        if evr.get("ok") and not evr.get("deduped") and not evr.get("suppressed"):
-                            written += 1
-                        break
-            if idx >= len(steps):
-                break
-    return written
+def _seq_detail_of(ev: Dict[str, Any]) -> Dict[str, Any]:
+    d = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
+    return d if isinstance(d, dict) else {}
+
+
+def _seq_link_ok(prev: Dict[str, Any], cur: Dict[str, Any]) -> bool:
+    """进程→网络：要求同 PID 或同进程名，避免 PS 退出后无关 svchost 外联误报。"""
+    et_prev = str(prev.get("etype") or "").lower()
+    et_cur = str(cur.get("etype") or "").lower()
+    if "network" not in et_cur:
+        return True
+    if "process" not in et_prev:
+        return True
+    dp = _seq_detail_of(prev)
+    dc = _seq_detail_of(cur)
+    try:
+        pid_a = int(dp.get("pid")) if dp.get("pid") is not None and str(dp.get("pid")).strip() != "" else None
+        pid_b = int(dc.get("pid")) if dc.get("pid") is not None and str(dc.get("pid")).strip() != "" else None
+        if pid_a is not None and pid_b is not None and pid_a == pid_b and pid_a > 0:
+            return True
+    except Exception:
+        pass
+    prev_name = str(dp.get("name") or dp.get("process_name") or "").lower().strip()
+    cur_name = str(dc.get("process_name") or dc.get("name") or "").lower().strip()
+    if not prev_name:
+        # 从摘要兜底：进程创建: powershell.exe
+        sm = str(prev.get("summary") or "")
+        if ":" in sm:
+            prev_name = sm.split(":")[-1].strip().lower()
+    if prev_name and cur_name and (prev_name == cur_name or prev_name in cur_name or cur_name in prev_name):
+        return True
+    return False
+
+
+def _seq_step_brief(ev: Dict[str, Any]) -> Dict[str, Any]:
+    d = _seq_detail_of(ev)
+    brief: Dict[str, Any] = {
+        "etype": ev.get("etype"),
+        "summary": ev.get("summary"),
+        "ts": ev.get("ts"),
+    }
+    for k in (
+        "pid", "ppid", "name", "process_name", "path", "image", "command_line",
+        "remote", "remote_ip", "proto", "protocol", "local", "user",
+    ):
+        v = d.get(k)
+        if v is not None and v != "":
+            brief[k] = v
+    if not brief.get("remote"):
+        sm = str(ev.get("summary") or "")
+        # 新外联: 1.2.3.4:443 / ETW外联: … (1.2.3.4:443)
+        import re
+        m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d{1,5})", sm)
+        if m:
+            brief["remote"] = m.group(1)
+    return brief
+
+
+def _seq_event_detail(rule: Dict[str, Any], chain: List[Dict[str, Any]]) -> Dict[str, Any]:
+    briefs = [_seq_step_brief(c) for c in chain]
+    detail: Dict[str, Any] = {
+        "rule_id": rule.get("id"),
+        "etype": "sequence_hit",
+        "steps": briefs,
+        "chain_summary": " → ".join(
+            str(b.get("summary") or b.get("etype") or "") for b in briefs
+        ),
+    }
+    # 展平关键字段，便于告警详情直接展示外联地址 / 进程
+    for b in briefs:
+        et = str(b.get("etype") or "").lower()
+        if "process" in et and "exit" not in et:
+            for k in ("pid", "ppid", "name", "process_name", "path", "image", "command_line", "user"):
+                if b.get(k) not in (None, "") and detail.get(k) in (None, ""):
+                    detail[k] = b.get(k)
+            if not detail.get("process_name") and b.get("name"):
+                detail["process_name"] = b.get("name")
+        if "network" in et or b.get("remote") or b.get("remote_ip"):
+            for k in ("remote", "remote_ip", "proto", "protocol", "local", "pid", "process_name"):
+                if b.get(k) not in (None, "") and detail.get(k) in (None, ""):
+                    detail[k] = b.get(k)
+            if b.get("etype") and detail.get("etype") == "sequence_hit":
+                detail["network_etype"] = b.get("etype")
+    if detail.get("remote") and not detail.get("remote_ip"):
+        detail["remote_ip"] = str(detail["remote"]).split(":")[0]
+    return detail
+
+
 
 
 def _parse_ts(s: Any) -> float:
@@ -2806,68 +1356,11 @@ def _etype_to_rule_module(etype: str) -> str:
     return ""
 
 
-def apply_timeline_rules(agent_id: str, host: str, events: List[Any]) -> int:
-    """时间线实时事件也走 Agent 规则（保存规则后下一条即可命中，不必等快照）。"""
-    try:
-        from . import agent_rules
-    except Exception:
-        return 0
-    by_mod: Dict[str, List[Dict[str, Any]]] = {}
-    lol_items: List[Dict[str, Any]] = []
-    for ev in events or []:
-        if not isinstance(ev, dict):
-            continue
-        et = str(ev.get("etype") or "")
-        mod = _etype_to_rule_module(et)
-        if not mod:
-            continue
-        detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
-        if mod == "process" and "exit" not in et:
-            detail = agent_rules.enrich_process_event_detail(
-                agent_id, detail, str(ev.get("summary") or ""),
-            )
-        # 进程创建：所有进程都跑轻量 LOLBin 检测（只看进程名+命令行，量大也便宜）
-        try:
-            from . import agent_sync as _asy
-            lol_on = _asy.server_detection_enabled("lolbin_ingest")
-        except Exception:
-            lol_on = True
-        if lol_on and mod == "process" and "exit" not in et and (
-            detail.get("command_line") or detail.get("parent_name") or detail.get("name")
-        ):
-            lol_items.append(dict(detail))
-        # 普通 info 进程创建不跑全量规则，避免噪声刷威胁
-        sev = str(ev.get("severity") or "info").lower()
-        if mod == "process" and sev in ("info", "low") and "可疑" not in str(ev.get("summary") or ""):
-            continue
-        item = dict(detail)
-        if not item.get("name") and ev.get("summary"):
-            # 从摘要兜底一点可读字段
-            item.setdefault("summary", ev.get("summary"))
-        if et and not item.get("etype"):
-            item["etype"] = et
-        by_mod.setdefault(mod, []).append(item)
-    written = 0
-    for mod, items in by_mod.items():
-        if not items:
-            continue
-        try:
-            r = agent_rules.apply_snapshot_rules(agent_id, mod, items, hostname=host) or {}
-            written += int(r.get("events") or 0)
-        except Exception:
-            continue
-    if lol_items:
-        # 非 info 的进程已在 apply_snapshot_rules(process) 里跑过 LOLBin；这里补 info 进程，dedup 由 report_event 处理
-        try:
-            r = agent_rules.apply_lolbin(agent_id, lol_items, hostname=host) or {}
-            written += int(r.get("events") or 0)
-        except Exception as e:
-            print("[lolbin]", e)
-    return written
 
 
 # 挂钩：时间线入库后做 IOC + 序列 + 规则
-_orig_ingest = ingest_timeline
+from .agent_timeline_service import ingest_timeline as _ingest_timeline_base
+_orig_ingest = _ingest_timeline_base
 
 
 def ingest_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:  # type: ignore[no-redef]
@@ -2898,410 +1391,75 @@ def ingest_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:  # type: ignore[
         corr_n = correlation_engine.apply_correlations(agent_id, host, events)
     except Exception as e:
         print("[correlation_engine]", e)
+    log_rule_n = 0
+    try:
+        log_rule_n = apply_log_rules(agent_id, host, events)
+    except Exception as e:
+        print("[log_rules]", e)
     out["ioc_hits"] = ioc_n
     out["seq_hits"] = seq_n
     out["rule_hits"] = rule_n
     out["correlation_hits"] = corr_n
+    out["log_rule_hits"] = log_rule_n
     out["sensor_alerts"] = _promote_sensor_alerts(agent_id, host, events)
     return out
 
 
-# 允许晋升为威胁事件的传感器 etype（明确白名单；不在表内的一律只留时间线）
-_ALERT_ETYPES = {
-    "remote_thread_kernel", "protect_block_kernel", "remote_thread",
-    "image_load_etw", "image_load_kernel", "driver_load_kernel",
-    "persist_add", "persist_modify", "registry_set", "registry_delete", "registry_write",
-    "fim_add", "fim_modify", "fim_rename",
-    "dns_nx_burst", "win_audit_clear",
-    "win_account_create", "win_group_add", "win_service_install", "win_task_create",
-    "win_service_config",     "win_ps_scriptblock", "process_access",
-    "file_create", "priv_escalation", "memory_scan_hit",
-    "device_mount", "api_amsi", "amsi_hit", "api_call", "api_hit",
-    "evm_hit", "ptm_hit", "memory_rule", "memory_yara",
-}
-_SCRIPT_DROP_EXTS = {".ps1", ".vbs", ".js", ".jse", ".hta", ".bat", ".cmd", ".scr", ".wsf"}
-_SIGNED_BAD = {"notsigned", "hashmismatch", "nottrusted", "incompatible"}
-_SKIP_PROMOTE_ETYPES = {"sensor_status", "etw_status", "winevent_status"}
-# 外联 / DNS：时间线照常入库，威胁事件只由 IOC 命中产出
-_IOC_ONLY_ETYPES = {
-    "network_connect", "network_connect_etw",
-    "dns_query", "dns_summary",
-}
-
-# Windows 更新常改启动类型的系统服务（7040），不当作威胁
-_WIN_SVC_NOISE = {
-    "background intelligent transfer service", "bits",
-    "windows update", "wuauserv",
-    "update orchestrator service", "usosvc",
-    "delivery optimization", "dosvc",
-    "windows modules installer", "trustedinstaller",
-    "waasmedicSvc", "waasmedicsvc",
-    "microsoft account sign-in assistant", "wlidsvc",
-    "system events broker", "systemeventsbroker",
-    "connected user experiences and telemetry", "diagtrack",
-    "windows push notifications system service", "wpnservice",
+_CHANNEL_FROM_SOURCE = {
+    "security": "Security",
+    "system": "System",
+    "sysmon": "Microsoft-Windows-Sysmon/Operational",
+    "powershell": "Microsoft-Windows-PowerShell/Operational",
+    "bits": "Microsoft-Windows-Bits-Client/Operational",
+    "smb": "Microsoft-Windows-SMBClient/Operational",
+    "terminalservices": "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
 }
 
 
-def _is_noisy_service_config(detail: Dict[str, Any], summary: str = "") -> bool:
-    name = str(detail.get("name") or detail.get("service") or "").strip().lower()
-    blob = f"{name} {summary}".lower()
-    if not blob.strip():
-        return False
-    for n in _WIN_SVC_NOISE:
-        if n in blob:
-            return True
-    return False
-
-
-_MODULE_PREFIXES = (
-    (("registry_", "persist_"), "registry"),
-    (("image_load", "driver_load"), "image"),
-    (("remote_thread", "process_access", "protect_block"), "inject"),
-    (("process_",), "process"),
-    (("file_", "fim_"), "file"),
-    (("network_",), "network"),
-    (("dns_",), "dns"),
-    (("device_",), "file"),
-    (("win_logon", "win_explicit_logon", "win_account", "win_password", "win_group", "win_special_priv"), "account"),
-    (("win_service",), "service"),
-    (("win_task",), "task"),
-    (("win_ps_",), "script"),
-    (("win_audit",), "audit"),
-)
-
-
-def alert_module_for(etype: str) -> str:
-    """按事件语义归类告警模块（来源 etw/kernel/sysmon 保留在 detail.source）。"""
-    et = str(etype or "").lower()
-    for prefixes, mod in _MODULE_PREFIXES:
-        if et.startswith(prefixes):
-            return mod
-    return "timeline"
-
-
-_TIMELINE_HIT_COPY_KEYS = (
-    "command_line", "command", "name", "process_name", "path", "image", "parent_name",
-    "pid", "ppid", "user", "key", "reg_key", "hive", "value", "value_name", "old_value",
-    "label", "category", "change", "watch", "remote", "remote_ip", "domain", "local",
-    "proto", "query", "entity_id", "parent_entity_id", "signed", "signer", "sha256",
-    "ext", "size", "task_name", "task_execute", "payload_path", "script_block", "payload",
-)
-
-
-def _timeline_rule_hit_detail(
-    ev: Dict[str, Any],
-    *,
-    rule_id: Any,
-    rule_title: str,
-    rule_source: str,
-    building_block: bool = False,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """把时间线事件的进程/注册表/网络等关键字段带进 EVM/Elastic 告警 detail。"""
-    det = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
-    et = str(ev.get("etype") or "")
-    summary = str(ev.get("summary") or "")
-    out: Dict[str, Any] = {
-        "rule_id": rule_id,
-        "rule_title": rule_title,
-        "rule_source": rule_source,
-        "etype": et,
-        "summary": summary,
-        "building_block": bool(building_block),
+def _timeline_to_eventlog_shape(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """把 Agent 时间线事件转成 eventlog_rules.match_events 可吃的结构。"""
+    if not isinstance(ev, dict):
+        return None
+    d = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
+    eid = d.get("event_id") if d.get("event_id") is not None else d.get("EventID")
+    if eid is None:
+        return None
+    try:
+        eid_i = int(eid)
+    except Exception:
+        return None
+    if eid_i <= 0:
+        return None
+    ch = str(d.get("channel") or "").strip()
+    if not ch:
+        src = str(d.get("source") or "").strip().lower()
+        ch = _CHANNEL_FROM_SOURCE.get(src, src)
+    fields: Dict[str, Any] = {}
+    for k, v in d.items():
+        if v is None or isinstance(v, (dict, list)):
+            continue
+        fields[str(k)] = v
+    flat = {
+        "event_id": eid_i,
+        "EventID": eid_i,
+        "channel": ch,
+        "time": str(ev.get("ts") or d.get("time") or ""),
+        "provider": str(d.get("provider") or ""),
+        "message": str(ev.get("summary") or ""),
+        "fields": fields,
     }
-    for k in _TIMELINE_HIT_COPY_KEYS:
-        v = det.get(k)
-        if v not in (None, "", [], {}):
-            out[k] = v
-    if not out.get("path") and det.get("image"):
-        out["path"] = det.get("image")
-    if not out.get("reg_key") and det.get("key"):
-        out["reg_key"] = det.get("key")
-    if not out.get("key") and out.get("reg_key"):
-        # 值名挂在 key 末段时保留完整键；否则用 reg_key
-        out["key"] = out.get("reg_key")
-    cmd = str(out.get("command_line") or out.get("command") or "").strip()
-    matched = str(det.get("matched") or "").strip()
-    if not matched:
-        if cmd:
-            matched = cmd[:400]
-        else:
-            rk = str(out.get("key") or out.get("reg_key") or "")
-            vn = str(out.get("value_name") or "")
-            val = str(out.get("value") or "")
-            if rk and (vn or val):
-                matched = f"{rk} → {vn}={val}"[:500] if (vn or val) else rk[:500]
-            elif rk:
-                matched = rk[:500]
-            elif summary:
-                matched = summary[:500]
-    out["matched"] = matched
-    if isinstance(extra, dict):
-        for k, v in extra.items():
-            if v not in (None, "", [], {}):
-                out[k] = v
-    return out
+    for k, v in fields.items():
+        flat.setdefault(k, v)
+    return flat
 
 
-def _timeline_rule_hit_module(ev: Dict[str, Any], detail: Dict[str, Any]) -> str:
-    et = str((ev or {}).get("etype") or (detail or {}).get("etype") or "").lower()
-    if et.startswith("persist") or et.startswith("registry") or _detail_looks_registry(detail or {}):
-        return "registry"
-    cmd = str((detail or {}).get("command_line") or (detail or {}).get("command") or "")
-    if cmd and re.search(
-        r"powershell|pwsh|wscript|cscript|mshta|scriptblock|\.ps1|\.vbs",
-        cmd,
-        re.I,
-    ):
-        return "script"
-    if et.startswith("network") or et.startswith("dns"):
-        return "network"
-    if et.startswith("process"):
-        return "process"
-    return alert_module_for(et)
 
 
-def _detail_looks_registry(detail: Dict[str, Any]) -> bool:
-    if not isinstance(detail, dict):
-        return False
-    if str(detail.get("source_etype") or "").startswith("registry"):
-        return True
-    chain = detail.get("chain")
-    if isinstance(chain, list):
-        for c in chain:
-            if isinstance(c, dict) and str(c.get("etype") or "").startswith("registry"):
-                return True
-            if isinstance(c, dict) and (c.get("reg_key") or c.get("key")):
-                return True
-    return bool(detail.get("reg_key") or detail.get("key"))
-
-
-def _ptm_detail_matched_hint(detail: Dict[str, Any]) -> str:
-    if not isinstance(detail, dict):
-        return ""
-    if detail.get("matched"):
-        return str(detail["matched"])[:500]
-    chain = detail.get("chain")
-    if not isinstance(chain, list):
-        tr = detail.get("trigger")
-        if isinstance(tr, dict):
-            chain = [tr]
-        else:
-            return ""
-    parts: List[str] = []
-    for i, c in enumerate(chain[:6]):
-        if not isinstance(c, dict):
-            continue
-        s = str(c.get("summary") or c.get("etype") or "").strip()
-        rk = str(c.get("reg_key") or c.get("key") or c.get("path") or "").strip()
-        if rk and rk not in s:
-            s = f"{rk} {s}".strip()
-        if s:
-            parts.append(f"{i + 1}) {s}")
-    return " | ".join(parts)[:500]
-
-
-def _sensor_detail_matched_hint(detail: Dict[str, Any]) -> str:
-    if not isinstance(detail, dict):
-        return ""
-    parts = [
-        str(detail.get("source_summary") or "").strip(),
-        str(detail.get("remote") or detail.get("remote_ip") or "").strip(),
-        str(detail.get("domain") or "").strip(),
-        str(detail.get("reg_key") or detail.get("key") or detail.get("path") or "").strip(),
-        str(detail.get("command_line") or "").strip(),
-    ]
-    return " · ".join(p for p in parts if p)[:500]
-
-
-def _promote_sensor_alerts(agent_id: str, host: str, events: List[Any]) -> int:
-    n = 0
-    for ev in events[:200]:
-        if not isinstance(ev, dict):
-            continue
-        et = str(ev.get("etype") or "")
-        sev = str(ev.get("severity") or "").lower()
-        if et in _SKIP_PROMOTE_ETYPES or et in _IOC_ONLY_ETYPES:
-            continue
-        # 只晋升白名单 etype，且必须 medium+（不再把 info 抬成 medium）
-        if et not in _ALERT_ETYPES:
-            continue
-        if sev not in ("medium", "high", "critical"):
-            continue
-        use_sev = sev
-        detail_obj = {"etype": et}
-        if isinstance(ev.get("detail"), dict):
-            detail_obj.update(ev.get("detail") or {})
-        title = str(ev.get("summary") or et)[:200]
-        mod = alert_module_for(et)
-        if et in ("evm_hit", "ptm_hit", "memory_rule", "memory_yara"):
-            rt = str(detail_obj.get("rule_title") or detail_obj.get("title") or "").strip()
-            if rt:
-                prefix = "EVM" if et == "evm_hit" else "PTM" if et == "ptm_hit" else "内存规则"
-                title = f"{prefix}：{rt}"[:200]
-            detail_obj.setdefault("rule_title", rt or detail_obj.get("title"))
-            if et == "evm_hit" and not detail_obj.get("matched"):
-                detail_obj["matched"] = _sensor_detail_matched_hint(detail_obj)
-            if et == "ptm_hit" and not detail_obj.get("matched"):
-                detail_obj["matched"] = _ptm_detail_matched_hint(detail_obj)
-            mod = "script" if et in ("evm_hit", "memory_rule", "memory_yara") else "process"
-            if et == "ptm_hit" and _detail_looks_registry(detail_obj):
-                mod = "registry"
-            if et == "evm_hit" and str(detail_obj.get("source_etype") or "").startswith("network"):
-                mod = "network"
-        if ev.get("ts") and not detail_obj.get("event_ts"):
-            detail_obj["event_ts"] = ev.get("ts")
-        signed = str(detail_obj.get("signed") or "").strip().lower()
-        # FIM：有签名字段时只认明确未签名/损坏；Valid 与未知均不晋升（hosts 等无签名字段的照常）
-        if et.startswith("fim_") and signed and signed not in _SIGNED_BAD:
-            continue
-        # DLL / 内核模块：必须明确未签名
-        if et in ("image_load_etw", "image_load_kernel") and signed not in _SIGNED_BAD:
-            continue
-        # 文件落地：仅投放区脚本类
-        if et == "file_create":
-            ext = str(detail_obj.get("ext") or "").lower()
-            if ext not in _SCRIPT_DROP_EXTS:
-                continue
-        # BITS / Windows Update 等系统服务启动类型变更不晋升
-        if et == "win_service_config" and _is_noisy_service_config(detail_obj, str(ev.get("summary") or "")):
-            continue
-        # 脚本块仅可疑特征（Agent 已标 high）
-        if et == "win_ps_scriptblock" and sev != "high":
-            continue
-        # 规则管理里关闭的传感器不再晋升告警
-        try:
-            from . import agent_rules as _ar
-            if not _ar.sensor_event_allowed(et, str(ev.get("summary") or ""), detail_obj):
-                continue
-        except Exception:
-            pass
-        try:
-            from . import event_detail_enrich as _ede
-            with agent_protocol._lock:
-                conn = agent_protocol._connect()
-                try:
-                    detail_obj, _ = _ede.enrich_detail_from_timeline(
-                        conn,
-                        agent_id=agent_id,
-                        title=title,
-                        detail=detail_obj,
-                        created_at=str(ev.get("ts") or ""),
-                    )
-                finally:
-                    conn.close()
-        except Exception:
-            pass
-        r = agent_protocol.report_event({
-            "agent_id": agent_id,
-            "hostname": host,
-            "module": mod,
-            "severity": use_sev,
-            "title": title,
-            "detail": detail_obj,
-        })
-        if r.get("ok") and not r.get("deduped") and not r.get("suppressed"):
-            n += 1
-        if n >= 120:
-            break
-    return n
-
-
+# 允许晋升为威胁事件的传感器 etype（明确白名单；不在表内的一律只留时间线）
 _LAST_THREAT_SYNC_AT = 0.0
 _THREAT_SYNC_MIN_INTERVAL = 45.0
 
 
-def sync_threats_from_timeline(*, limit: int = 300, force: bool = False) -> Dict[str, Any]:
-    """把近期中危+时间线补晋升为威胁事件（修复首页有数据、威胁事件为空）。"""
-    global _LAST_THREAT_SYNC_AT
-    ensure()
-    from . import agent_protocol as ap
-
-    now_ts = time.time()
-    if not force and (now_ts - _LAST_THREAT_SYNC_AT) < _THREAT_SYNC_MIN_INTERVAL:
-        return {
-            "ok": True,
-            "skipped": True,
-            "reason": "throttled",
-            "retry_after_sec": int(_THREAT_SYNC_MIN_INTERVAL - (now_ts - _LAST_THREAT_SYNC_AT)),
-        }
-    _LAST_THREAT_SYNC_AT = now_ts
-
-    purged = purge_agent_self_noise_events()
-    orphans = purge_orphan_agent_data()
-    lim = max(50, min(int(limit or 300), 800))
-    with ap._lock:
-        conn = ap._connect()
-        try:
-            rows = conn.execute(
-                """SELECT t.agent_id, t.hostname, t.etype, t.summary, t.severity, t.detail_json, t.ts
-                   FROM agent_timeline t JOIN agents a ON a.agent_id = t.agent_id
-                   LEFT JOIN agent_event_deletions d ON d.agent_id = t.agent_id AND d.title = t.summary
-                   WHERE lower(t.severity) IN ('medium','high','critical')
-                     AND (d.deleted_at IS NULL OR t.created_at > d.deleted_at)
-                     AND NOT EXISTS (
-                         SELECT 1 FROM agent_events e
-                         WHERE e.agent_id = t.agent_id AND e.title = substr(t.summary, 1, 200)
-                     )
-                   ORDER BY t.id DESC LIMIT ?""",
-                (lim,),
-            ).fetchall()
-        finally:
-            conn.close()
-    by_agent: Dict[str, List[Dict[str, Any]]] = {}
-    for r in rows:
-        d = dict(r)
-        aid = str(d.get("agent_id") or "")
-        if not aid:
-            continue
-        detail = d.get("detail_json")
-        if isinstance(detail, str):
-            try:
-                detail = json.loads(detail) if detail else {}
-            except Exception:
-                # 解析失败的旧截断数据不再包成 raw 晋升（会把告警详情盖成「命中对象 —」）
-                continue
-        if not isinstance(detail, dict):
-            continue
-        by_agent.setdefault(aid, []).append({
-            "etype": d.get("etype"),
-            "summary": d.get("summary"),
-            "severity": d.get("severity"),
-            "detail": detail,
-            "ts": d.get("ts"),
-        })
-    total = 0
-    for aid, evs in by_agent.items():
-        host = ""
-        try:
-            host = ap._host_of(aid)
-        except Exception:
-            host = str((evs[0] or {}).get("hostname") or "")
-        # hostname 在 timeline 行上
-        if not host:
-            for row in rows:
-                if str(row["agent_id"]) == aid and row["hostname"]:
-                    host = str(row["hostname"])
-                    break
-        # 晋升前再滤一遍自噪声，避免历史 fa-watch / fa-ps 回灌
-        clean = [e for e in evs if not _is_agent_self_noise(
-            str(e.get("etype") or ""), str(e.get("summary") or ""), e.get("detail") if isinstance(e.get("detail"), dict) else {}
-        )]
-        total += _promote_sensor_alerts(aid, host, clean)
-    try:
-        repaired = ap.repair_broken_event_details()
-    except Exception:
-        repaired = 0
-    return {
-        "ok": True,
-        "promoted": total,
-        "agents": len(by_agent),
-        "scanned": len(rows),
-        "purged": purged,
-        "orphans": orphans,
-        "repaired": repaired,
-    }
 
 
 # ---------- ATT&CK 看板 / 攻击故事 ----------
@@ -3365,422 +1523,14 @@ def _tech_label(tid: str) -> str:
     return f"{tid} · {name}" if name else tid
 
 
-def threat_process_tree(agent_id: str = "", *, event_id: int = 0, max_nodes: int = 56) -> Dict[str, Any]:
-    """威胁视图：从告警证据 + 进程实体表还原进程树（祖先链 + 子进程展开）。"""
-    ensure()
-    aid = str(agent_id or "").strip()
-    seed_eid = ""
-    seed_pid: Any = None
-    hit_title = ""
-    event_item: Optional[Dict[str, Any]] = None
-
-    if event_id:
-        try:
-            got = agent_protocol.get_event(int(event_id))
-            ev = (got or {}).get("item") if (got or {}).get("ok") else None
-        except Exception:
-            ev = None
-        if ev:
-            event_item = ev
-            aid = aid or str(ev.get("agent_id") or "")
-            hit_title = str(ev.get("title") or "")
-            raw = ev.get("detail_obj") or ev.get("detail") or {}
-            if isinstance(raw, str):
-                try:
-                    raw = json.loads(raw)
-                except Exception:
-                    raw = {}
-            if not isinstance(raw, dict):
-                raw = {}
-            evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else raw
-            inner = evidence.get("evidence") if isinstance(evidence.get("evidence"), dict) else evidence
-            if isinstance(inner, dict):
-                seed_eid = str(inner.get("entity_id") or evidence.get("entity_id") or "").strip()
-                seed_pid = inner.get("pid") if inner.get("pid") not in (None, "") else evidence.get("pid")
-
-    if not aid:
-        return {"ok": False, "error": "缺少 agent_id 或无效事件"}
-
-    max_nodes = max(8, min(int(max_nodes or 56), 120))
-    with _lock:
-        conn = _connect()
-        try:
-            rows = conn.execute(
-                "SELECT * FROM agent_processes WHERE agent_id=? ORDER BY last_seen DESC LIMIT 800",
-                (aid,),
-            ).fetchall()
-            procs = [dict(r) for r in rows]
-        finally:
-            conn.close()
-
-    by_eid: Dict[str, Dict[str, Any]] = {}
-    by_parent: Dict[str, List[Dict[str, Any]]] = {}
-    for p in procs:
-        eid = str(p.get("entity_id") or "").strip()
-        if not eid:
-            continue
-        by_eid[eid] = p
-        pe = str(p.get("parent_entity_id") or "").strip()
-        if pe:
-            by_parent.setdefault(pe, []).append(p)
-
-    seed = by_eid.get(seed_eid) if seed_eid else None
-    if not seed and seed_pid not in (None, ""):
-        try:
-            want = int(seed_pid)
-            for p in procs:
-                if int(p.get("pid") or 0) == want:
-                    seed = p
-                    seed_eid = str(p.get("entity_id") or "")
-                    break
-        except (TypeError, ValueError):
-            pass
-
-    if not seed:
-        drop_chain = _build_threat_drop_chain(aid, event_item, None, [], seed_pid)
-        return {
-            "ok": True,
-            "agent_id": aid,
-            "nodes": [],
-            "edges": [],
-            "root_id": "",
-            "hit_id": seed_eid,
-            "title": hit_title,
-            "drop_chain": drop_chain,
-        }
-
-    if not str(seed.get("command_line") or "").strip():
-        try:
-            from . import event_detail_enrich as _ede
-            info = _ede._find_process_command(
-                conn, aid,
-                pid=int(seed.get("pid") or 0),
-                entity_id=str(seed.get("entity_id") or ""),
-            )
-            if info and str(info.get("command_line") or "").strip():
-                seed["command_line"] = info["command_line"]
-        except Exception:
-            pass
-    if event_item and not str(seed.get("command_line") or "").strip():
-        raw = event_item.get("detail_obj") or event_item.get("detail") or {}
-        if isinstance(raw, str):
-            try:
-                raw = json.loads(raw)
-            except Exception:
-                raw = {}
-        if isinstance(raw, dict):
-            cmd = str(raw.get("command_line") or raw.get("command") or "").strip()
-            if cmd:
-                seed["command_line"] = cmd
-
-    chain: List[Dict[str, Any]] = []
-    cur: Optional[Dict[str, Any]] = seed
-    seen_chain: set = set()
-    while cur and len(chain) < 14:
-        eid = str(cur.get("entity_id") or "")
-        if not eid or eid in seen_chain:
-            break
-        seen_chain.add(eid)
-        chain.append(cur)
-        pe = str(cur.get("parent_entity_id") or "").strip()
-        cur = by_eid.get(pe) if pe else None
-    chain.reverse()
-
-    hit_id = str(seed.get("entity_id") or "")
-    include: set = set()
-    for p in chain:
-        eid = str(p.get("entity_id") or "")
-        if eid:
-            include.add(eid)
-    if hit_id:
-        include.add(hit_id)
-    # 命中进程的直接子进程 + 同父兄弟（避免把 explorer 下数百进程全拉进图）
-    for child in by_parent.get(hit_id, [])[:20]:
-        ce = str(child.get("entity_id") or "")
-        if ce:
-            include.add(ce)
-    parent_eid = str(seed.get("parent_entity_id") or "").strip()
-    if parent_eid:
-        include.add(parent_eid)
-        for sib in by_parent.get(parent_eid, [])[:14]:
-            ce = str(sib.get("entity_id") or "")
-            if ce:
-                include.add(ce)
-    # 祖先链上每层少量上下文子进程
-    for p in chain:
-        pe = str(p.get("entity_id") or "")
-        for child in by_parent.get(pe, [])[:5]:
-            ce = str(child.get("entity_id") or "")
-            if ce and len(include) < max_nodes:
-                include.add(ce)
-
-    def _node_of(p: Dict[str, Any], *, is_hit: bool) -> Dict[str, Any]:
-        eid = str(p.get("entity_id") or "")
-        return {
-            "id": eid,
-            "name": p.get("name") or "?",
-            "pid": p.get("pid"),
-            "ppid": p.get("ppid"),
-            "parent_id": str(p.get("parent_entity_id") or ""),
-            "path": p.get("path") or "",
-            "command_line": str(p.get("command_line") or "")[:2000],
-            "is_hit": is_hit,
-            "exit_time": p.get("exit_time") or "",
-        }
-
-    nodes = [_node_of(by_eid[eid], is_hit=(eid == hit_id)) for eid in include if eid in by_eid]
-    edges = []
-    node_ids = {n["id"] for n in nodes}
-    by_pid: Dict[int, str] = {}
-    for n in nodes:
-        try:
-            by_pid[int(n.get("pid") or 0)] = n["id"]
-        except (TypeError, ValueError):
-            pass
-    for n in nodes:
-        pid = n.get("parent_id")
-        if pid and pid in node_ids:
-            edges.append({"from": pid, "to": n["id"], "label": "子进程"})
-    # PPID 补链 / 父进程不可见时插入占位节点
-    for n in list(nodes):
-        if n.get("parent_id") and n["parent_id"] in node_ids:
-            continue
-        ppid = n.get("ppid")
-        try:
-            pp = int(ppid) if ppid not in (None, "") else 0
-        except (TypeError, ValueError):
-            pp = 0
-        if pp and pp in by_pid and by_pid[pp] != n["id"]:
-            n["parent_id"] = by_pid[pp]
-            n["link_repaired"] = True
-            if n["parent_id"] not in node_ids:
-                continue
-            edges.append({"from": n["parent_id"], "to": n["id"], "label": "PPID 关联", "repaired": True})
-        elif pp and n["id"] == hit_id:
-            syn = f"syn-parent-{pp}"
-            if syn not in node_ids:
-                nodes.append({
-                    "id": syn,
-                    "name": f"父进程 PID {pp}",
-                    "pid": pp,
-                    "ppid": None,
-                    "parent_id": "",
-                    "path": "",
-                    "command_line": "",
-                    "is_hit": False,
-                    "exit_time": "",
-                    "synthetic": True,
-                    "missing": True,
-                })
-                node_ids.add(syn)
-            n["parent_id"] = syn
-            n["link_repaired"] = True
-            edges.append({"from": syn, "to": n["id"], "label": "断链推断", "repaired": True})
-    for n in nodes:
-        pid = n.get("parent_id")
-        if pid and pid in node_ids and not any(e["from"] == pid and e["to"] == n["id"] for e in edges):
-            edges.append({"from": pid, "to": n["id"], "label": "子进程"})
-    root_id = str(chain[0].get("entity_id") or hit_id) if chain else hit_id
-    if root_id.startswith("syn-parent-"):
-        root_id = hit_id or root_id
-    drop_chain = _build_threat_drop_chain(aid, event_item, seed, chain, seed_pid)
-    return {
-        "ok": True,
-        "agent_id": aid,
-        "root_id": root_id,
-        "hit_id": hit_id,
-        "nodes": nodes,
-        "edges": edges,
-        "title": hit_title,
-        "drop_chain": drop_chain,
-    }
 
 
-def attack_story(agent_id: str = "", *, event_id: int = 0, limit: int = 80) -> Dict[str, Any]:
-    """单主机 / 单事件的攻击故事链：时间升序节点 + ATT&CK 标注。"""
-    ensure()
-    aid = str(agent_id or "").strip()
-    nodes: List[Dict[str, Any]] = []
-    host = ""
-
-    if event_id:
-        try:
-            got = agent_protocol.get_event(int(event_id))
-            ev = (got or {}).get("item") if (got or {}).get("ok") else None
-        except Exception:
-            ev = None
-        if ev and ev.get("id"):
-            aid = aid or str(ev.get("agent_id") or "")
-            host = str(ev.get("hostname") or "")
-            mapped = _map_attck(str(ev.get("title") or ""), str(ev.get("module") or ""))
-            nodes.append({
-                "kind": "threat",
-                "ts": ev.get("created_at") or ev.get("updated_at"),
-                "title": ev.get("title"),
-                "severity": ev.get("severity"),
-                "module": ev.get("module"),
-                "technique": mapped["technique"],
-                "tactic": mapped["tactic"],
-                "technique_label": _tech_label(mapped["technique"]),
-                "id": ev.get("id"),
-            })
-
-    if aid:
-        tl = list_timeline(aid, limit=limit).get("items") or []
-        for t in reversed(tl):
-            mapped = _map_attck(str(t.get("summary") or ""), etype=str(t.get("etype") or ""))
-            host = host or str(t.get("hostname") or "")
-            nodes.append({
-                "kind": "timeline",
-                "ts": t.get("ts") or t.get("created_at"),
-                "title": t.get("summary"),
-                "severity": t.get("severity"),
-                "etype": t.get("etype"),
-                "technique": mapped["technique"],
-                "tactic": mapped["tactic"],
-                "technique_label": _tech_label(mapped["technique"]),
-                "detail": t.get("detail"),
-            })
-        try:
-            evs = agent_protocol.list_events(agent_id=aid, limit=40)
-            for e in (evs.get("items") or []):
-                mapped = _map_attck(str(e.get("title") or ""), str(e.get("module") or ""))
-                nodes.append({
-                    "kind": "threat",
-                    "ts": e.get("created_at"),
-                    "title": e.get("title"),
-                    "severity": e.get("severity"),
-                    "module": e.get("module"),
-                    "technique": mapped["technique"],
-                    "tactic": mapped["tactic"],
-                    "technique_label": _tech_label(mapped["technique"]),
-                    "id": e.get("id"),
-                })
-        except Exception:
-            pass
-
-    nodes.sort(key=lambda x: str(x.get("ts") or ""))
-    uniq: List[Dict[str, Any]] = []
-    seen = set()
-    for n in nodes:
-        k = (n.get("kind"), n.get("title"), n.get("ts"))
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append(n)
-    techniques = []
-    tseen = set()
-    for n in uniq:
-        tid = n.get("technique")
-        if tid and tid not in tseen:
-            tseen.add(tid)
-            techniques.append({
-                "id": tid,
-                "label": n.get("technique_label") or tid,
-                "tactic": n.get("tactic"),
-            })
-    return {
-        "ok": True,
-        "agent_id": aid,
-        "hostname": host,
-        "nodes": uniq[-limit:],
-        "techniques": techniques,
-        "tactics": [{"id": a, "name": b} for a, b in _ATTCK_TACTICS],
-    }
 
 
-def attck_board(*, limit_events: int = 2000, agent_id: str = "", days: int = 0) -> Dict[str, Any]:
-    """全局 ATT&CK 看板：按战术聚合近期威胁；可按主机 / 天数过滤，附技术热力矩阵。"""
-    ensure()
-    cells: Dict[str, List[Dict[str, Any]]] = {t[0]: [] for t in _ATTCK_TACTICS}
-    tech_count: Dict[str, int] = {}
-    matrix: Dict[str, Dict[str, int]] = {t[0]: {} for t in _ATTCK_TACTICS}
-    hosts: Dict[str, int] = {}
-    tactic_names = dict(_ATTCK_TACTICS)
-    tactic_count: Dict[str, int] = {t[0]: 0 for t in _ATTCK_TACTICS}
-    tactic_high: Dict[str, int] = {t[0]: 0 for t in _ATTCK_TACTICS}
-    tech_tactic: Dict[str, str] = {}
-    host_aid: Dict[str, str] = {}
-    rows: List[Dict[str, Any]] = []
-    high = open_n = unmapped = 0
-    items = _attck_source_events(agent_id=agent_id, days=days, limit=limit_events)
-    for e in items:
-        mapped = _map_attck(str(e.get("title") or ""), str(e.get("module") or ""))
-        tid = mapped.get("technique") or ""
-        tactic = mapped.get("tactic") or ""
-        if tactic not in tactic_names:
-            tactic = ""
-        sev = str(e.get("severity") or "").lower()
-        is_high = sev in ("high", "critical")
-        high += is_high
-        open_n += str(e.get("status") or "open") == "open"
-        if tid and tactic:
-            tech_count[tid] = tech_count.get(tid, 0) + 1
-            tech_tactic.setdefault(tid, tactic)
-            matrix[tactic][tid] = matrix[tactic].get(tid, 0) + 1
-            tactic_count[tactic] += 1
-            tactic_high[tactic] += is_high
-        else:
-            unmapped += 1
-        hn = str(e.get("hostname") or e.get("agent_id") or "")
-        if hn:
-            hosts[hn] = hosts.get(hn, 0) + 1
-            host_aid.setdefault(hn, str(e.get("agent_id") or ""))
-        row = {
-            "id": e.get("id"),
-            "title": e.get("title"),
-            "severity": e.get("severity"),
-            "hostname": e.get("hostname"),
-            "agent_id": e.get("agent_id"),
-            "ts": e.get("created_at"),
-            "technique": tid,
-            "technique_label": _tech_label(tid) if tid else "",
-            "technique_name": _tech_name(tid),
-            "tactic": tactic,
-            "tactic_name": tactic_names.get(tactic, "未映射"),
-            "status": e.get("status"),
-        }
-        rows.append(row)
-        if tactic:
-            cells[tactic].append(row)
 
-    columns = [
-        {"id": tac, "name": name, "count": tactic_count[tac], "items": cells[tac][:30]}
-        for tac, name in _ATTCK_TACTICS
-    ]
-    top_tech = sorted(
-        [{"id": k, "count": v, "label": _tech_label(k), "name": _tech_name(k), "tactic": tech_tactic.get(k, ""),
-          "tactic_name": tactic_names.get(tech_tactic.get(k, ""), "")} for k, v in tech_count.items()],
-        key=lambda x: (-x["count"], x["id"]),
-    )
-    heat = []
-    for tac, name in _ATTCK_TACTICS:
-        techs = sorted(
-            [{"id": k, "count": v, "label": _tech_label(k), "name": _tech_name(k)}
-             for k, v in (matrix.get(tac) or {}).items()],
-            key=lambda x: (-x["count"], x["id"]),
-        )
-        heat.append({"tactic": tac, "name": name, "count": tactic_count[tac],
-                     "high": tactic_high[tac], "techniques": techs})
-    top_hosts = sorted(
-        [{"host": k, "agent_id": host_aid.get(k, ""), "count": v} for k, v in hosts.items()],
-        key=lambda x: -x["count"],
-    )[:10]
-    covered = sum(1 for h in heat if h["techniques"])
-    rows.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
-    return {
-        "ok": True,
-        "columns": columns,
-        "top_techniques": top_tech,
-        "heat": heat,
-        "top_hosts": top_hosts,
-        "tactics_covered": covered,
-        "event_total": len(items),
-        "high_total": high,
-        "open_total": open_n,
-        "unmapped_total": unmapped,
-        "items": rows,
-    }
+
+
+
 
 
 def _attck_source_events(*, agent_id: str = "", days: int = 0, limit: int = 2000) -> List[Dict[str, Any]]:
@@ -3930,8 +1680,20 @@ def save_upgrade_package(
     pid = uuid.uuid4().hex
     sha = hashlib.sha256(content).hexdigest()
     safe_name = Path(filename or "forensic-agent.exe").name
-    if not safe_name.lower().endswith(".exe"):
-        safe_name += ".exe"
+    # 仅允许 Agent 发布件扩展名，并剥离路径成分
+    low = safe_name.lower()
+    if not any(low.endswith(ext) for ext in (".exe", ".msi", ".zip", ".pkg", ".deb", ".rpm")):
+        return {"ok": False, "error": "仅允许 exe/msi/zip/pkg/deb/rpm 发布件"}
+    if ".." in safe_name or "/" in safe_name or "\\" in safe_name or "\x00" in safe_name:
+        return {"ok": False, "error": "文件名非法"}
+    # PE/ZIP 魔数抽检，避免上传脚本伪装扩展名
+    head = content[:8]
+    if low.endswith(".exe") and not (head.startswith(b"MZ") or head.startswith(b"\x7fELF")):
+        return {"ok": False, "error": "可执行文件魔数不匹配"}
+    if low.endswith(".zip") and not head.startswith(b"PK"):
+        return {"ok": False, "error": "ZIP 魔数不匹配"}
+    if low.endswith(".msi") and not head.startswith(b"\xd0\xcf\x11\xe0"):
+        return {"ok": False, "error": "MSI 魔数不匹配"}
     dest = _upgrade_dir() / f"{pid}_{safe_name}"
     dest.write_bytes(content)
     sig = sign_upgrade_package(sha, ver, len(content))
@@ -4047,3 +1809,36 @@ def push_upgrade(
     )
     return {"ok": True, "package_id": package_id, "version": meta["version"], "results": results}
 
+
+
+from .agent_policy_store import (
+    _num, get_policy, list_policy_history, policy_rollout, rollback_policy,
+    set_policy, validate_policy,
+)
+
+
+from .agent_policy_entities import (
+    add_whitelist, assign_agent_to_group, delete_group, delete_whitelist,
+    list_groups, list_whitelist, set_whitelist_enabled, update_whitelist, upsert_group,
+)
+
+from .agent_log_analysis import diagnose_log_rules, investigate_logs, get_log_detail
+
+from .agent_process_tree import _build_threat_drop_chain, threat_process_tree
+
+
+from .agent_commands import (
+    ACTIONS, HIGH_RISK_ACTIONS,
+    COMMAND_LEASE_DEFAULT_SEC, COMMAND_LEASE_SEC, COMMAND_MAX_ATTEMPTS,
+    COMMAND_TTL_DEFAULT_SEC, COMMAND_TTL_SEC,
+    create_command, poll_commands, command_owner, ack_command, list_commands,
+    _validate_remote_ops_command, _remote_ops_policy_cfg, _memscan_to_events,
+)
+from .agent_ioc_ops import (
+    list_ioc, add_ioc, import_iocs, delete_ioc,
+    match_iocs_against_text, ioc_lib_status, lookup_ioc_lib, _IOC_TYPE_CN,
+)
+
+from .agent_detection_analytics import match_iocs, apply_timeline_rules, sync_threats_from_timeline, attack_story, attck_board
+
+from .agent_timeline_service import list_timeline, apply_log_rules, match_sequences

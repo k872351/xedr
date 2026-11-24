@@ -8,6 +8,7 @@ from . import config
 from . import paths as P
 from . import mysql_db
 from .iputil import pick_primary_ip
+from .report_index_rows import report_index_view
 
 SCHEMA_SQL = [
     """
@@ -548,7 +549,7 @@ def list_reports_mysql(limit: int = 100, user: Optional[Dict[str, Any]] = None) 
                     """
                     SELECT * FROM reports
                     WHERE (owner_id<>'' AND owner_id=%s)
-                       OR (owner_username<>'' AND owner_username=%s)
+                       OR (COALESCE(TRIM(owner_id),'')='' AND owner_username<>'' AND owner_username=%s)
                     ORDER BY collect_time DESC, file DESC
                     LIMIT %s
                     """,
@@ -564,29 +565,7 @@ def list_reports_mysql(limit: int = 100, user: Optional[Dict[str, Any]] = None) 
                     (int(limit),),
                 )
             rows = cur.fetchall() or []
-        out = []
-        for r in rows:
-            rid = r["file"]
-            out.append({
-                "file": rid,
-                "db": r.get("db_path") or "",
-                "hostname": r.get("hostname") or "",
-                "time": r.get("collect_time") or "",
-                "ip": r.get("ip") or "",
-                "issues": r.get("issues") or 0,
-                "raw_issues": r.get("raw_issues") or 0,
-                "analyzed": bool(r.get("analyzed")),
-                "processes": r.get("processes") or 0,
-                "services": r.get("services") or 0,
-                "files": r.get("files") or 0,
-                "host_id": r.get("host_id") or "",
-                "folder": r.get("folder") or P.report_stem(rid),
-                "owner_id": r.get("owner_id") or "",
-                "owner_username": r.get("owner_username") or "",
-                "os_family": r.get("os_family") or "",
-                "os": r.get("os") or "",
-            })
-        return out
+        return [report_index_view(row) for row in rows]
     except Exception as e:
         print(f"[mysql_store] list_reports_mysql: {e}")
         return None

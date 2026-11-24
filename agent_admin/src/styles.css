@@ -1,36 +1,95 @@
-@import url("https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap");
+/* Local system fonts keep the console usable in isolated networks. */
 
 :root {
-  --ink: #152033;
-  --ink-2: #3d4f66;
-  --muted: #6b7a90;
-  --line: #c9d4e3;
-  --line-2: #eef2f7;
-  --bg: #e8eef5;
+  --ink: #1c2430;
+  --ink-2: #445263;
+  --muted: #6b7a8c;
+  --line: #dfe5ec;
+  --line-2: #eef2f6;
+  --bg: #eef2f6;
+  --bg-elevated: #f7f9fc;
   --panel: #ffffff;
-  --rail: #0f1724;
-  --rail-2: #162033;
-  --menu: #ffffff;
-  --accent: #1aa6c8;
-  --accent-soft: #e8f6fb;
-  --orange: #c56a00;
-  --online: #2fbf71;
-  --danger: #e11d2e;
-  --warn: #f79009;
-  --radius: 8px;
-  --shadow: 0 4px 18px rgba(15, 30, 55, 0.07);
-  font-family: "Noto Sans SC", "DM Sans", "Microsoft YaHei", sans-serif;
+  --rail: #1a1d22;
+  --rail-2: #23262c;
+  --menu: #1e2228;
+  --accent: #e2562c;
+  --accent-2: #c9431d;
+  --accent-soft: #fdefe8;
+  --orange: #e2562c;
+  --online: #16b981;
+  --danger: #d92d20;
+  --warn: #f59e0b;
+  /* Semantic threat-severity palette (independent of the brick-red brand) */
+  --sev-critical: #b42318;
+  --sev-critical-bg: #fef3f2;
+  --sev-high: #e2562c;
+  --sev-high-bg: #fff4ee;
+  --sev-medium: #dc8608;
+  --sev-medium-bg: #fffaeb;
+  --sev-low: #3b82c4;
+  --sev-low-bg: #eff6ff;
+  --sev-info: #667085;
+  --sev-info-bg: #f2f4f7;
+  --radius: 10px;
+  --radius-sm: 6px;
+  --shadow: 0 1px 2px rgba(28, 36, 48, 0.04), 0 6px 18px rgba(28, 36, 48, 0.05);
+  --shadow-lg: 0 18px 48px rgba(20, 22, 28, 0.22);
+  --fs-title: 22px;
+  --fs-body: 13.5px;
+  --fs-meta: 12px;
+  --fs-metric: 26px;
+  font-family: system-ui, "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
   color: var(--ink);
   font-size: 14px;
   line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 * { box-sizing: border-box; }
-html, body, #app { height: 100%; margin: 0; background: var(--bg); }
-button, input, select { font: inherit; }
+html, body, #app {
+  height: 100%;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+}
+button, input, select, textarea { font: inherit; }
 button { cursor: pointer; }
-a { color: var(--accent); text-decoration: none; }
-code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+a { color: var(--accent-2); text-decoration: none; }
+code { font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 12px; }
+
+:focus-visible { outline: 2px solid #e2562c; outline-offset: 3px; }
+/* 左侧栏点击后不要留焦点描边（否则像整栏变色） */
+.rail-item:focus,
+.rail-item:focus-visible,
+.rail-user:focus,
+.rail-user:focus-visible,
+.menu-item:focus,
+.menu-item:focus-visible {
+  outline: none !important;
+}
+button:disabled { cursor: not-allowed; }
+::selection { background: #f8d9c9; color: #3a1810; }
+
+/* Slim, unobtrusive scrollbars shared by every scroll region. */
+* { scrollbar-width: thin; scrollbar-color: #c8ccd3 transparent; }
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: #c8ccd3; border-radius: 8px; border: 2px solid transparent; background-clip: content-box; }
+*::-webkit-scrollbar-thumb:hover { background: #a7adb8; background-clip: content-box; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
 
 .warn-line { color: var(--warn); }
 .btn-text.warn { color: var(--warn); font-weight: 600; }
+.page-chunk-state { min-height: 100%; display: grid; place-content: center; justify-items: center; gap: 10px; color: var(--muted); }
+.page-chunk-state h2, .page-chunk-state p { margin: 0; }

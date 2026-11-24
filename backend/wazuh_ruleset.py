@@ -25,6 +25,12 @@ _BUNDLE_CONFIG = Path(config.ROOT) / "config" / "agent_sca_bundle.json"
 
 _RE_RULE_PREFIX = re.compile(r"^\s*(not\s+)?([rcfdp]:)", re.I)
 
+# Wazuh SCA 合规框架键白名单（见 wazuh tests/integration/test_sca/.../cases_compliance_format.yaml）
+ALLOWED_COMPLIANCE_KEYS = frozenset({
+    "cmmc", "fedramp", "gdpr", "hipaa", "iso_27001", "nis2",
+    "nist_800_171", "nist_800_53", "pci_dss", "tsc",
+})
+
 
 def iter_sca_yml(*, platform: str = "") -> Iterable[Path]:
     if not SCA_ROOT.is_dir():
@@ -86,6 +92,37 @@ def _mitre_summary(block: Any) -> List[str]:
     return out[:6]
 
 
+def _mitre_detail(block: Any) -> Dict[str, List[str]]:
+    """保留战术/技术的 id 与 name 双数组，供合规视图与覆盖度分析使用。"""
+    out: Dict[str, List[str]] = {}
+    if not isinstance(block, dict):
+        return out
+    for key in ("tactic", "technique", "subtechnique"):
+        sub = block.get(key)
+        if isinstance(sub, dict):
+            out[key] = [str(x) for x in (sub.get("id") or [])]
+            names = [str(x) for x in (sub.get("name") or [])]
+            if names:
+                out[key + "_names"] = names
+    return out
+
+
+def _compliance_summary(block: Any) -> Dict[str, List[str]]:
+    """只保留白名单内的合规框架键，避免非法键污染下游。"""
+    if not isinstance(block, dict):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for key, val in block.items():
+        k = str(key or "").strip()
+        if k not in ALLOWED_COMPLIANCE_KEYS:
+            continue
+        if isinstance(val, list):
+            out[k] = [str(x) for x in val]
+        elif isinstance(val, str) and val.strip():
+            out[k] = [val.strip()]
+    return out
+
+
 def parse_sca_file(path: Path) -> Optional[Dict[str, Any]]:
     try:
         doc = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -111,10 +148,15 @@ def parse_sca_file(path: Path) -> Optional[Dict[str, Any]]:
         checks_out.append({
             "id": ch.get("id"),
             "name": str(ch.get("name") or "")[:240],
+            "description": str(ch.get("description") or "")[:600],
+            "rationale": str(ch.get("rationale") or "")[:600],
+            "remediation": str(ch.get("remediation") or "")[:1200],
             "condition": str(ch.get("condition") or "all").lower(),
             "rule_kinds": kinds,
             "agent_capable": capable,
             "mitre": _mitre_summary(ch.get("mitre")),
+            "mitre_detail": _mitre_detail(ch.get("mitre")),
+            "compliance": _compliance_summary(ch.get("compliance")),
         })
     req_rules = _normalize_rules(reqs.get("rules"))
     return {
@@ -126,6 +168,7 @@ def parse_sca_file(path: Path) -> Optional[Dict[str, Any]]:
         "agent_capable_checks": sum(1 for c in checks_out if c.get("agent_capable")),
         "requirement_rules": len(req_rules),
         "stats": stats,
+        "compliance_frameworks": sorted({k for c in checks_out for k in (c.get("compliance") or {})}),
         "checks_preview": checks_out[:8],
     }
 
@@ -147,6 +190,7 @@ def scan_catalog(*, platform: str = "", max_files: int = 0) -> Dict[str, Any]:
         "stats": {
             "policies": len(items),
             "agent_capable_checks": sum(int(x.get("agent_capable_checks") or 0) for x in items),
+            "compliance_frameworks": sorted({k for x in items for k in (x.get("compliance_frameworks") or [])}),
         },
         "items": items,
     }

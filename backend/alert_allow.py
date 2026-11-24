@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 import sqlite3
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -24,16 +25,34 @@ KIND_LABELS = {
 _FIELD_KEYS: Dict[str, Tuple[str, ...]] = {
     "hash": ("sha256", "hash", "md5", "sha1", "file_sha256", "image_sha256", "process_sha256"),
     "path": ("path", "image", "image_path", "exe", "file_path", "process_path", "target_path",
-             "target", "dll", "dll_path", "module_path", "file"),
-    "process": ("process_name", "name", "image_name", "process"),
+             "target", "dll", "dll_path", "module_path", "file", "Image", "OriginalFileName"),
+    "process": ("process_name", "name", "image_name", "process", "OriginalFileName"),
     "signer": ("signer", "publisher"),
-    "cmdline": ("command_line", "cmdline", "command"),
+    "cmdline": ("command_line", "cmdline", "command", "CommandLine"),
     "registry": ("key", "reg_key", "registry_key"),
     "domain": ("domain", "query", "qname"),
     "ip": ("remote_ip", "dst_ip", "ip", "remote", "remote_addr"),
 }
 
 _PATH_LIKE = ("path", "registry")
+# 仅匹配盘符路径，避免从 matched 文本里把 \SOFTWARE\...\xxx.exe 误当成 UNC
+_WIN_PATH_RE = re.compile(
+    r'(?P<p>[a-zA-Z]:\\[^"<>|\r\n→]+?\.(?:exe|dll|sys|bat|cmd|ps1|vbs|js|msi|com))',
+    re.I,
+)
+_ENV_PATH_RE = re.compile(
+    r'(?P<p>%(?:windir|systemroot)%\\[^"<>|\r\n→]+?\.(?:exe|dll|sys|bat|cmd|ps1|vbs|js|msi|com))',
+    re.I,
+)
+_EXE_EXT = (".exe", ".dll", ".sys", ".ps1", ".bat", ".cmd", ".vbs", ".js", ".msi", ".com")
+
+
+def _expand_env_path(p: str) -> str:
+    s = str(p or "")
+    low = s.lower()
+    if low.startswith("%windir%\\") or low.startswith("%systemroot%\\"):
+        return "C:\\Windows\\" + s.split("\\", 1)[1]
+    return s
 
 
 def _now() -> str:
@@ -47,6 +66,54 @@ def _norm(s: Any) -> str:
 def _basename(p: str) -> str:
     p = str(p or "").replace("/", "\\").rstrip("\\")
     return p.rsplit("\\", 1)[-1]
+
+
+def _looks_like_win_path(v: str) -> bool:
+    s = str(v or "").strip().strip('"')
+    if not s:
+        return False
+    low = s.replace("/", "\\").lower()
+    if re.match(r"^[a-z]:\\", low) or low.startswith("\\\\"):
+        return True
+    if low.startswith("\\device\\harddiskvolume"):
+        return True
+    return False
+
+
+def coerce_kind_value(kind: str, value: str) -> Tuple[str, str]:
+    """纠正常见误选：完整路径被建成 process/registry → 改成 path。"""
+    k = str(kind or "").strip().lower()
+    v = str(value or "").strip()
+    if not k or not v:
+        return k, v
+    if k == "process" and _looks_like_win_path(v):
+        return "path", v.strip('"')
+    if k == "registry" and _looks_like_win_path(v) and not re.match(r"^hk(ey_|[lcmu])", v, re.I):
+        return "path", v.strip('"')
+    if k == "path":
+        v2 = v.strip('"')
+        # 通配目录：*\Foo\Bar\ → *\Foo\Bar\*（否则 fnmatch 要求精确以 \ 结尾，盖不住目录下文件）
+        if ("*" in v2 or "?" in v2) and v2.endswith("\\"):
+            v2 = v2 + "*"
+        # 目录加白：无后缀且未以 \ 结尾时自动加 \，按前缀匹配
+        elif _looks_like_win_path(v2) and not v2.endswith("\\"):
+            base = _basename(v2).lower()
+            if "." not in base or not any(base.endswith(ext) for ext in _EXE_EXT):
+                v2 = v2.rstrip("\\") + "\\"
+        return k, v2
+    return k, v
+
+
+def _path_from_cmdline(cmd: str) -> str:
+    s = str(cmd or "").strip()
+    if not s:
+        return ""
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        if end > 1:
+            return s[1:end]
+    m = _WIN_PATH_RE.search(s)
+    return m.group("p") if m else ""
 
 
 def _strip_port(v: str) -> str:
@@ -67,7 +134,15 @@ def _flatten(detail: Any) -> Dict[str, Any]:
             for k2, v2 in v.items():
                 if not isinstance(v2, (dict, list)):
                     out.setdefault(str(k2), v2)
-        elif not isinstance(v, list):
+        elif isinstance(v, list):
+            # PTM chain 等：从列表元素里抽出 path/value，便于加白
+            for it in v[:30]:
+                if not isinstance(it, dict):
+                    continue
+                for k2, v2 in it.items():
+                    if not isinstance(v2, (dict, list)) and v2 not in (None, ""):
+                        out.setdefault(str(k2), v2)
+        else:
             out[str(k)] = v
     # 顶层优先于嵌套（evidence 等）
     for k, v in detail.items():
@@ -109,7 +184,7 @@ def extract_fields(title: str, detail: Any) -> Dict[str, List[str]]:
             v = flat.get(k)
             if v in (None, "") or isinstance(v, bool):
                 continue
-            sv = str(v).strip()
+            sv = str(v).strip().strip('"')
             if not sv:
                 continue
             if kind == "ip":
@@ -117,10 +192,39 @@ def extract_fields(title: str, detail: Any) -> Dict[str, List[str]]:
             if kind == "path" and "\\" not in sv and "/" not in sv:
                 continue
             fields[kind].append(sv)
-    for p in list(fields["path"]):
+    # 命令行 / 注册表 value / matched 串里常带映像路径，补进 path（PTM 注册表告警尤其如此）
+    blob_srcs: List[str] = list(fields["cmdline"])
+    for k in ("value", "matched", "summary", "evidence", "Details", "details", "data"):
+        v = flat.get(k)
+        if v not in (None, "") and not isinstance(v, (dict, list, bool)):
+            blob_srcs.append(str(v))
+    raw_detail = detail if isinstance(detail, str) else json.dumps(parse_detail(detail), ensure_ascii=False)
+    if raw_detail:
+        blob_srcs.append(raw_detail)
+    for blob in blob_srcs:
+        p = _path_from_cmdline(blob)
+        if p:
+            fields["path"].append(_expand_env_path(p))
+        for m in _WIN_PATH_RE.finditer(str(blob)):
+            fields["path"].append(m.group("p"))
+        for m in _ENV_PATH_RE.finditer(str(blob)):
+            fields["path"].append(_expand_env_path(m.group("p")))
+    # 注册表键误入 path 时挪回 registry，避免 path 加白对不上真正的 exe
+    cleaned_paths: List[str] = []
+    for p in fields["path"]:
+        low = _norm(p)
+        if low.startswith(("hklm\\", "hkcu\\", "hkcr\\", "hku\\", "hkey_")):
+            fields["registry"].append(p)
+            continue
+        cleaned_paths.append(p)
         b = _basename(p)
-        if b.lower().endswith((".exe", ".dll", ".sys", ".ps1", ".bat", ".cmd", ".vbs", ".js")):
+        if b.lower().endswith(_EXE_EXT):
             fields["process"].append(b)
+    fields["path"] = cleaned_paths
+    # 标题里偶发带路径
+    for m in _WIN_PATH_RE.finditer(str(title or "")):
+        fields["path"].append(m.group("p"))
+        fields["process"].append(_basename(m.group("p")))
     vn = str(flat.get("value_name") or "").strip()
     if vn:
         for k in list(fields["registry"]):
@@ -151,16 +255,78 @@ def _glob(pattern: str, value: str) -> bool:
 
 
 def match_value(kind: str, pattern: str, value: str) -> bool:
-    p, v = _norm(pattern), _norm(value)
+    p = _norm(pattern).strip('"')
+    raw = str(value or "")
+    v = _norm(raw).strip('"')
     if not p or not v:
         return False
     if "*" in p or "?" in p:
-        return _glob(p, v)
-    if kind in _PATH_LIKE and p.endswith("\\"):
-        return v.startswith(p)
+        return _glob(p, v) or (kind == "cmdline" and _glob(p, _norm(raw)))
+    if kind in _PATH_LIKE:
+        if p.endswith("\\"):
+            if v.startswith(p):
+                return True
+            extracted = _norm(_path_from_cmdline(raw))
+            if extracted and extracted.startswith(p):
+                return True
+            # 命令行未抽出路径时，仍允许目录前缀出现在整串中
+            return p in _norm(raw)
+        # 完整文件路径：精确，或其目录下的文件，或出现在命令行
+        if v == p or v.startswith(p + "\\"):
+            return True
+        if kind == "path" and p in _norm(raw):
+            return True
+        return False
     if kind == "cmdline":
-        return p in v
+        return p in v or p in _norm(raw)
     return v == p
+
+
+def _candidate_values(kind: str, value: str, fields: Dict[str, List[str]]) -> List[str]:
+    """按条目类型收集待匹配值；path 同时看命令行抽出的映像路径。"""
+    vals = list(fields.get(kind) or [])
+    if kind == "path":
+        for c in fields.get("cmdline") or []:
+            vals.append(c)
+            p = _path_from_cmdline(c)
+            if p:
+                vals.append(p)
+    if kind == "process" and _looks_like_win_path(value):
+        # 历史误建：process=完整路径 → 按 path + 进程名双通道
+        vals.extend(fields.get("path") or [])
+        vals.extend(fields.get("cmdline") or [])
+        bn = _basename(value)
+        if bn:
+            vals.extend(fields.get("process") or [])
+    if kind == "registry" and _looks_like_win_path(value):
+        vals.extend(fields.get("path") or [])
+        vals.extend(fields.get("cmdline") or [])
+    # 去重保序
+    seen, out = set(), []
+    for x in vals:
+        n = _norm(x)
+        if n and n not in seen:
+            seen.add(n)
+            out.append(x)
+    return out
+
+
+_TRUSTED_PATH_PREFIXES = (
+    "c:\\program files\\",
+    "c:\\program files (x86)\\",
+    "c:\\windows\\",
+)
+
+
+def normalize_rule(rule: Any) -> str:
+    """UI「全部」/空/* 均视为不限定告警标题。"""
+    r = str(rule or "").strip()
+    if not r:
+        return ""
+    low = r.lower()
+    if low in ("*", "全部", "全部告警", "全部告警标题", "all", "any"):
+        return ""
+    return r
 
 
 def entry_matches(entry: Dict[str, Any], agent_id: str, title: str, fields: Dict[str, List[str]]) -> bool:
@@ -169,16 +335,36 @@ def entry_matches(entry: Dict[str, Any], agent_id: str, title: str, fields: Dict
     scope = str(entry.get("agent_id") or "").strip()
     if scope and scope != str(agent_id or ""):
         return False
-    rule = str(entry.get("rule") or "").strip()
+    rule = normalize_rule(entry.get("rule"))
     if rule and not match_value("title", rule, title):
         return False
     kind = str(entry.get("kind") or "").strip().lower()
     value = str(entry.get("value") or "")
+    kind, value = coerce_kind_value(kind, value)
     if kind not in KINDS:
         return False
-    return any(match_value(kind, value, v) for v in fields.get(kind) or [])
-
-
+    # 误建成 process/registry 的路径：匹配时按 path
+    match_kind = kind
+    if kind in ("process", "registry") and _looks_like_win_path(str(entry.get("value") or "")):
+        match_kind = "path"
+        value = str(entry.get("value") or "").strip().strip('"')
+        _, value = coerce_kind_value("path", value)
+    cands = _candidate_values(match_kind, value, fields)
+    if any(match_value(match_kind, value, v) for v in cands):
+        return True
+    # IOC 等告警有时只有进程名、没有路径：对 Program Files / Windows 下的 path 加白
+    # 允许用映像名兜底（避免 Edge 路径加白了仍被纯进程名 IOC 打出）
+    if match_kind == "path":
+        pn = _norm(value)
+        if any(pn.startswith(pref) for pref in _TRUSTED_PATH_PREFIXES):
+            bn = _basename(value.rstrip("\\"))
+            if bn.lower().endswith(_EXE_EXT):
+                if any(match_value("process", bn, v) for v in fields.get("process") or []):
+                    return True
+            elif pn.endswith("\\"):
+                # 目录前缀：进程名无法可靠判断，跳过
+                pass
+    return False
 def _entries(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     try:
         rows = conn.execute("SELECT * FROM agent_whitelist WHERE enabled=1").fetchall()
@@ -275,8 +461,35 @@ def default_allow_pick_indices(items: List[Dict[str, str]], event: Dict[str, Any
     return [0]
 
 
+def repair_misclassified_entries(conn: sqlite3.Connection) -> int:
+    """把已入库的错误类型（完整路径写成 process/registry）改成 path，并规范目录前缀。"""
+    try:
+        rows = conn.execute("SELECT id, kind, value FROM agent_whitelist").fetchall()
+    except sqlite3.Error:
+        return 0
+    fixed = 0
+    for r in rows:
+        old_k = str(r["kind"] or "")
+        old_v = str(r["value"] or "")
+        new_k, new_v = coerce_kind_value(old_k, old_v)
+        if new_k == old_k and new_v == old_v:
+            continue
+        try:
+            conn.execute("UPDATE agent_whitelist SET kind=?, value=? WHERE id=?", (new_k, new_v, r["id"]))
+            fixed += 1
+        except sqlite3.Error:
+            pass
+    if fixed:
+        try:
+            conn.commit()
+        except sqlite3.Error:
+            pass
+    return fixed
+
+
 def apply_all_enabled(conn: sqlite3.Connection, *, limit: int = 5000) -> int:
     """把当前全部启用的加白条目套到未处置告警上。"""
+    repair_misclassified_entries(conn)
     n = 0
     for entry in _entries(conn):
         n += apply_to_open_events(conn, entry, limit=limit)
